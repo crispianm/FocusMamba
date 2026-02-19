@@ -1,0 +1,13 @@
+# FocusMamba Python dependencies
+# NOTE:
+# Install PyTorch (cu128) first using the commands in the setup steps,
+# then run: pip install -r requirements.txt
+
+numpy>=1.26
+matplotlib>=3.8
+pyyaml>=6.0
+torchvision>=0.16
+pytorch-msssim>=1.0.0
+fvcore>=0.1.5.post20221221
+lpips>=0.1.4
+tensorboard>=2.15
