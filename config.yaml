@@ -1,0 +1,51 @@
+# FocusMamba Configuration
+# ========================
+
+# Data pipeline
+batch_size: 4
+window_length: 8          # T = number of frames per clip
+clip_stride: 4            # stride for sliding window sampling
+patch_size: 4             # tubelet spatial patch size
+t_patch: 2                # tubelet temporal patch size
+resolution: [256, 256]    # training crop size [H, W]
+
+# Circle of Confusion parameters
+focal_length_range: [24.0, 85.0]   # mm, sampled uniformly
+aperture_range: [1.4, 8.0]         # f-number, sampled log-uniform
+max_coc: 0.05                       # normalisation scalar (calibrate with inspect_coc_distribution.py)
+beta_alpha: 2.0                     # Beta distribution alpha for focus plane sampling
+beta_beta: 2.0                      # Beta distribution beta for focus plane sampling
+
+# Model architecture
+embed_dim: 96             # base embedding dimension
+encoder_depths: [2, 2, 4, 2]  # number of Spatial+Temporal block pairs per stage
+d_state: 16               # Mamba SSM state dimension
+d_conv: 4                 # Mamba local convolution width
+expand: 2                 # Mamba inner dimension expansion factor
+
+# Training
+learning_rate: 1.0e-4
+warmup_steps: 500
+max_epochs: 50
+grad_clip: 1.0
+precision: bf16
+
+# Loss weights
+lambda_l1: 1.0
+lambda_ssim: 0.5
+lambda_grad: 0.5
+lambda_tgm: 0.2
+
+# Validation
+val_every_n_epochs: 2
+
+# Data splits (scene-level, deterministic)
+train_ratio: 0.8
+val_ratio: 0.1
+test_ratio: 0.1
+split_seed: 42
+
+# Paths
+data_root: ./data
+log_dir: ./runs
+checkpoint_dir: ./checkpoints
