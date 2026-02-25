@@ -29,10 +29,10 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 import yaml
+from tqdm import tqdm
 
 from dataloader.focus_dataset import build_dataloaders
 from models.focus_mamba import FocusMamba
@@ -91,7 +91,7 @@ class BaselineUNet2D(nn.Module):
         d1 = self.dec1(torch.cat([self.up1(d2), e1], 1))
         return torch.sigmoid(self.head(d1))
 
-    def forward(self, frames: torch.Tensor, roi: torch.Tensor) -> torch.Tensor:
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
         """(B, C, T, H, W) → (B, 1, T, H, W) by processing each frame independently."""
         B, C, T, H, W = frames.shape
         out = []
@@ -134,48 +134,73 @@ def train_one_epoch(
     loader,
     criterion: FocusLoss,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler,
     scheduler,
     device: torch.device,
     grad_clip: float,
     use_amp: bool,
     writer: SummaryWriter,
     global_step: int,
-) -> tuple[float, int]:
+) -> tuple[float, float, int, int, int]:
     model.train()
     running_loss = 0.0
+    running_l1 = 0.0
 
-    for batch in loader:
+    # Progress bar showing iterations/sec; disappears after epoch completes.
+    for batch in tqdm(loader, desc="Train", unit="it", leave=False, total=len(loader)):
         frames = batch["frames"].to(device)          # (B,C,T,H,W)
         focus_gt = batch["focus_maps"].to(device)     # (B,1,T,H,W)
-        roi = batch["roi"].to(device)                 # (B,4)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            pred = model(frames, roi)
+            pred = model(frames)
+            # Guard: skip this batch if model produced non-finite predictions
+            # (can happen when SSM state recurrence overflows for an unlucky batch).
+            if not torch.isfinite(pred).all():
+                optimizer.zero_grad(set_to_none=True)
+                continue
             losses = criterion(pred, focus_gt)
 
-        scaler.scale(losses["total"]).backward()
+        if not torch.isfinite(losses):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        scaler.scale(losses).backward()
         scaler.unscale_(optimizer)
+
+        # Guard: if the backward pass through selective_scan_cuda produced
+        # non-finite gradients, skip this update entirely rather than letting
+        # NaN weights corrupt all future forward passes.
+        grads_ok = all(
+            p.grad is None or torch.isfinite(p.grad).all()
+            for p in model.parameters()
+        )
+        if not grads_ok:
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
 
-        running_loss += losses["total"].item()
+        running_loss += losses.item()
+        running_l1 += losses.item()
         global_step += 1
 
         # TensorBoard logging
         if global_step % 20 == 0:
-            writer.add_scalar("train/loss_total", losses["total"].item(), global_step)
-            writer.add_scalar("train/loss_l1", losses["l1"].item(), global_step)
-            writer.add_scalar("train/loss_ssim", losses["ssim"].item(), global_step)
-            writer.add_scalar("train/loss_grad", losses["grad"].item(), global_step)
-            writer.add_scalar("train/loss_tgm", losses["tgm"].item(), global_step)
+            writer.add_scalar("train/loss_total", losses.item(), global_step)
+            # writer.add_scalar("train/loss_l1", losses["l1"].item(), global_step)
+            # writer.add_scalar("train/loss_ssim", losses["ssim"].item(), global_step)
+            # writer.add_scalar("train/loss_grad", losses["grad"].item(), global_step)
+            # writer.add_scalar("train/loss_tgm", losses["tgm"].item(), global_step)
             writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
 
-    avg_loss = running_loss / max(len(loader), 1)
+    avg_loss = running_loss / len(loader)
+
     return avg_loss, global_step
 
 
@@ -195,16 +220,19 @@ def validate(
     metric_accum: Dict[str, float] = {}
     n_batches = 0
 
-    for batch in loader:
+    # Progress bar for validation that also disappears after completion.
+    for batch in tqdm(loader, desc=f"Val {epoch}", unit="it", leave=False, total=len(loader)):
         frames = batch["frames"].to(device)
         focus_gt = batch["focus_maps"].to(device)
-        roi = batch["roi"].to(device)
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            pred = model(frames, roi)
+            pred = model(frames)
             losses = criterion(pred, focus_gt)
 
-        total_loss += losses["total"].item()
+        if not torch.isfinite(losses):
+            continue
+
+        total_loss += losses.item()
 
         # Metrics
         m = metrics_fn(pred.float(), focus_gt.float())
@@ -212,8 +240,18 @@ def validate(
             metric_accum[k] = metric_accum.get(k, 0.0) + v.item()
         n_batches += 1
 
-    avg_loss = total_loss / max(n_batches, 1)
-    avg_metrics = {k: v / max(n_batches, 1) for k, v in metric_accum.items()}
+    if n_batches == 0:
+        avg_loss = float("inf")
+        avg_metrics = {
+            "mae": float("inf"),
+            "ssim": 0.0,
+            "psnr": 0.0,
+            "weighted_f": 0.0,
+            "tss": float("inf"),
+        }
+    else:
+        avg_loss = total_loss / n_batches
+        avg_metrics = {k: v / n_batches for k, v in metric_accum.items()}
 
     # Log to TensorBoard
     writer.add_scalar("val/loss_total", avg_loss, epoch)
@@ -240,7 +278,12 @@ def main():
         cfg = yaml.safe_load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # NOTE: bfloat16 AMP causes the Mamba selective_scan_cuda kernel to produce
+    # NaN because the exp(delta*A) recurrence overflows in bf16's 7-bit mantissa.
+    # The default config ships with precision=fp32.  Only enable bf16 if you have
+    # verified your selective_scan_cuda build is numerically stable at that dtype.
     use_amp = cfg.get("precision", "bf16") == "bf16" and device.type == "cuda"
+
 
     # Dataloaders
     loaders = build_dataloaders(
@@ -282,14 +325,15 @@ def main():
     print(f"Model: {model_tag}  |  Parameters: {n_params:,}")
 
     # Loss, optimizer, scheduler
-    criterion = FocusLoss(
-        lambda_l1=cfg["lambda_l1"],
-        lambda_ssim=cfg["lambda_ssim"],
-        lambda_grad=cfg["lambda_grad"],
-        lambda_tgm=cfg["lambda_tgm"],
-    )
+    # criterion = FocusLoss(
+    #     lambda_l1=cfg["lambda_l1"],
+    #     lambda_ssim=cfg["lambda_ssim"],
+    #     lambda_grad=cfg["lambda_grad"],
+    #     lambda_tgm=cfg["lambda_tgm"],
+    # )
+    criterion = torch.nn.L1Loss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"], weight_decay=0.01)
-    scaler = GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     total_steps = cfg["max_epochs"] * max(len(train_loader), 1)
     scheduler = WarmupCosineScheduler(
@@ -308,6 +352,7 @@ def main():
     start_epoch = 0
     best_mae = float("inf")
     global_step = 0
+    resumed_from = None
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -320,6 +365,7 @@ def main():
 
     # Training loop
     val_every = cfg.get("val_every_n_epochs", 2)
+    target_train_l1 = cfg.get("target_train_l1", None)
     t_start = time.time()
 
     for epoch in range(start_epoch, cfg["max_epochs"]):
@@ -342,6 +388,7 @@ def main():
             f"time={epoch_time:.1f}s  "
             f"ETA={eta_m:.1f}min"
         )
+        writer.add_scalar("train/epoch_loss_total", avg_loss, epoch)
 
         # Validation
         if (epoch + 1) % val_every == 0 or epoch == cfg["max_epochs"] - 1:

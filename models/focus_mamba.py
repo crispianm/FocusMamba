@@ -6,7 +6,6 @@ Assembles TubeletEmbedding → Encoder → Decoder → Head.
 
 Inputs:
     frames: (B, C, T, H, W) — video clip (RGB, float [0,1])
-    roi:    (B, 4)           — normalised [x1, y1, x2, y2]
 
 Outputs:
     focus_map: (B, 1, T, H, W) — soft focus map in [0, 1]
@@ -73,17 +72,16 @@ class FocusMamba(nn.Module):
         self.t_patch = t_patch
 
     def forward(
-        self, frames: torch.Tensor, roi: torch.Tensor
+        self, frames: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
             frames: (B, C, T, H, W) float32 in [0,1].
-            roi: (B, 4) normalised ROI box.
         Returns:
             focus_map: (B, 1, T, H, W) in [0,1].
         """
         B, C, T, H, W = frames.shape
-        skips, bottleneck = self.encoder(frames, roi)
+        skips, bottleneck = self.encoder(frames)
         focus_map = self.decoder(skips, bottleneck)
 
         # Ensure output matches input spatial/temporal resolution
@@ -111,9 +109,7 @@ class FocusMamba(nn.Module):
         try:
             from fvcore.nn import FlopCountAnalysis
             dummy_frames = torch.zeros(input_shape, device=next(self.parameters()).device)
-            dummy_roi = torch.tensor([[0.25, 0.25, 0.75, 0.75]], device=dummy_frames.device)
-            dummy_roi = dummy_roi.expand(input_shape[0], -1)
-            flops = FlopCountAnalysis(self, (dummy_frames, dummy_roi)).total()
+            flops = FlopCountAnalysis(self, (dummy_frames)).total()
             return int(flops)
         except Exception:
             # Heuristic: ~2 MACs per parameter per spatial-temporal token
@@ -132,9 +128,8 @@ if __name__ == "__main__":
     print(f"Estimated FLOPs: {model.estimate_flops():,}")
 
     x = torch.randn(1, 3, 8, 256, 256)
-    roi = torch.tensor([[0.2, 0.2, 0.8, 0.8]])
     with torch.no_grad():
-        out = model(x, roi)
+        out = model(x)
     print(f"Input:  {x.shape}")
     print(f"Output: {out.shape}")
     assert out.shape == (1, 1, 8, 256, 256), f"Shape mismatch: {out.shape}"

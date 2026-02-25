@@ -3,7 +3,7 @@ FocusMamba Encoder
 ===================
 
 Components:
-- ``TubeletEmbedding``: 3-D Conv → sinusoidal positional encoding → add ROI bias.
+- ``TubeletEmbedding``: 3-D Conv → sinusoidal positional encoding.
 - ``EncoderStage``: Stack of alternating SpatialMamba + TemporalMamba blocks.
 - ``FocusMambaEncoder``: Multi-scale encoder with skip connections.
 
@@ -23,7 +23,6 @@ import torch
 import torch.nn as nn
 
 from .mamba_block import SpatialMambaBlock, TemporalMambaBlock
-from .roi_conditioning import ROIConditioner
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ def sinusoidal_pos_encoding_3d(
 # ---------------------------------------------------------------------------
 
 class TubeletEmbedding(nn.Module):
-    """3-D convolutional tubelet embedding with positional encoding and ROI bias.
+    """3-D convolutional tubelet embedding with positional encoding.
 
     Maps (B, C_in, T, H, W) → (B, T', H', W', embed_dim) where
     T' = T // t_patch, H' = H // patch_size, W' = W // patch_size.
@@ -93,15 +92,13 @@ class TubeletEmbedding(nn.Module):
             kernel_size=(t_patch, patch_size, patch_size),
             stride=(t_patch, patch_size, patch_size),
         )
-        self.roi_cond = ROIConditioner(embed_dim, patch_size)
 
     def forward(
-        self, x: torch.Tensor, roi: torch.Tensor
+        self, x: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
             x: (B, C, T, H, W) input video frames.
-            roi: (B, 4) normalised ROI.
         Returns:
             (B, T', H', W', embed_dim)
         """
@@ -113,10 +110,6 @@ class TubeletEmbedding(nn.Module):
         # Sinusoidal 3-D positional encoding
         pe = sinusoidal_pos_encoding_3d(Tp, Hp, Wp, self.embed_dim, x.device)
         tokens = tokens + pe
-
-        # ROI conditioning (spatial only — broadcast over T')
-        roi_bias = self.roi_cond(roi, Hp, Wp)  # (B, embed_dim, Hp, Wp)
-        tokens = tokens + roi_bias.permute(0, 2, 3, 1).unsqueeze(1)  # broadcast T'
 
         return tokens
 
@@ -220,17 +213,16 @@ class FocusMambaEncoder(nn.Module):
                 dim = next_dim
 
     def forward(
-        self, x: torch.Tensor, roi: torch.Tensor
+        self, x: torch.Tensor
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Args:
             x: (B, C, T, H, W) input video.
-            roi: (B, 4).
         Returns:
             skips: list of (B, T', H_i, W_i, C_i), high-res first.
             bottleneck: (B, T', H_last, W_last, C_last).
         """
-        tokens = self.embed(x, roi)  # (B, T', H', W', embed_dim)
+        tokens = self.embed(x)  # (B, T', H', W', embed_dim)
 
         skips: List[torch.Tensor] = []
         for i, stage in enumerate(self.stages):
