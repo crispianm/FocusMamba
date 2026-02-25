@@ -170,6 +170,24 @@ def lpips_metric(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     return total / T
 
 
+def noise_robustness_score(
+    clean_mae: float,
+    noisy_mae: float,
+) -> float:
+    """Noise Robustness Score (NRS).
+
+    Measures the relative degradation in MAE when moving from clean to noisy
+    evaluation.  Lower is better (model is more robust to noise).
+
+    NRS = (noisy_MAE - clean_MAE) / max(clean_MAE, eps)
+
+    Returns:
+        Scalar NRS value.  0 = perfectly robust, >0 = degrades under noise.
+    """
+    eps = 1e-8
+    return (noisy_mae - clean_mae) / max(clean_mae, eps)
+
+
 # ---------------------------------------------------------------------------
 # Metric Suite (all-in-one)
 # ---------------------------------------------------------------------------

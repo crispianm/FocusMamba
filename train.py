@@ -35,7 +35,9 @@ import yaml
 from tqdm import tqdm
 
 from dataloader.focus_dataset import build_dataloaders
-from models.focus_mamba import FocusMamba
+from dataloader.degradation import build_degradation
+from models import build_model, FocusMamba
+from models.focus_transformer import FocusTransformer
 from utils.loss import FocusLoss
 from utils.metrics import MetricSuite
 
@@ -284,6 +286,13 @@ def main():
     # verified your selective_scan_cuda build is numerically stable at that dtype.
     use_amp = cfg.get("precision", "bf16") == "bf16" and device.type == "cuda"
 
+    # Build degradation pipeline (if configured)
+    lowlight_deg = build_degradation(cfg)
+    if lowlight_deg is not None:
+        deg_cfg = cfg.get("degradation", {})
+        print(f"Low-light degradation ENABLED  (lux={deg_cfg.get('lux_level', 10.0)})")
+    else:
+        print("Low-light degradation disabled")
 
     # Dataloaders
     loaders = build_dataloaders(
@@ -300,26 +309,23 @@ def main():
         train_ratio=cfg.get("train_ratio", 0.8),
         val_ratio=cfg.get("val_ratio", 0.1),
         split_seed=cfg.get("split_seed", 42),
+        lowlight_degradation=lowlight_deg,
     )
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 
     # Model
+    model_type = cfg.get("model_type", "mamba")
     if args.baseline:
         model = BaselineUNet2D(in_channels=3).to(device)
         model_tag = "baseline_unet2d"
     else:
-        model = FocusMamba(
-            in_channels=3,
-            embed_dim=cfg["embed_dim"],
-            depths=cfg["encoder_depths"],
-            patch_size=cfg["patch_size"],
-            t_patch=cfg["t_patch"],
-            d_state=cfg.get("d_state", 16),
-            d_conv=cfg.get("d_conv", 4),
-            expand=cfg.get("expand", 2),
-        ).to(device)
-        model_tag = "focus_mamba"
+        model = build_model(cfg).to(device)
+        model_tag = f"focus_{model_type}"
+
+    # Build descriptive noise tag for logging
+    deg_cfg = cfg.get("degradation", {})
+    noise_tag = f"lux{deg_cfg.get('lux_level', 'off')}" if deg_cfg.get("enabled", False) else "clean"
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {model_tag}  |  Parameters: {n_params:,}")
@@ -342,9 +348,12 @@ def main():
 
     metrics_fn = MetricSuite(compute_lpips=False)
 
-    # Logging
-    log_dir = Path(cfg.get("log_dir", "./runs")) / model_tag
+    # Logging — tag runs with model type and noise level
+    log_dir = Path(cfg.get("log_dir", "./runs")) / f"{model_tag}_{noise_tag}"
     writer = SummaryWriter(str(log_dir))
+    # Log config metadata for reproducibility
+    writer.add_text("config/model_type", model_type if not args.baseline else "baseline", 0)
+    writer.add_text("config/noise_level", noise_tag, 0)
     ckpt_dir = Path(cfg.get("checkpoint_dir", "./checkpoints")) / model_tag
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -365,7 +374,6 @@ def main():
 
     # Training loop
     val_every = cfg.get("val_every_n_epochs", 2)
-    target_train_l1 = cfg.get("target_train_l1", None)
     t_start = time.time()
 
     for epoch in range(start_epoch, cfg["max_epochs"]):
