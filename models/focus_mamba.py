@@ -1,14 +1,15 @@
 """
-FocusMamba — Full Model
-========================
+"""FocusMamba — Degradation-Robust Metric Video Depth Estimation
+================================================================
 
-Assembles TubeletEmbedding → Encoder → Decoder → Head.
+Assembles TubeletEmbedding → Encoder → Decoder → Metric Depth Head.
 
 Inputs:
     frames: (B, C, T, H, W) — video clip (RGB, float [0,1])
 
 Outputs:
-    focus_map: (B, 1, T, H, W) — soft focus map in [0, 1]
+    depth: (B, 1, T, H, W) — metric depth in metres (positive, via exp(log_depth))
+    uncertainty: (B, 1, T, H, W) — per-pixel aleatoric uncertainty (optional)
 """
 
 from __future__ import annotations
@@ -23,7 +24,11 @@ from .decoder import FocusMambaDecoder
 
 
 class FocusMamba(nn.Module):
-    """End-to-end FocusMamba model.
+    """End-to-end FocusMamba depth estimation model.
+
+    Predicts metric depth (in metres) from degraded video input.
+    The decoder predicts log-depth which is exponentiated to enforce positivity.
+    Optionally predicts per-pixel aleatoric uncertainty.
 
     Args:
         in_channels: Number of input channels (3 for RGB).
@@ -34,6 +39,7 @@ class FocusMamba(nn.Module):
         d_state: Mamba SSM state dimension.
         d_conv: Mamba local convolution width.
         expand: Mamba inner expansion factor.
+        predict_uncertainty: If True, also predict per-pixel uncertainty.
     """
 
     def __init__(
@@ -46,10 +52,13 @@ class FocusMamba(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        predict_uncertainty: bool = False,
     ):
         super().__init__()
         if depths is None:
             depths = [2, 2, 4, 2]
+
+        self.predict_uncertainty = predict_uncertainty
 
         self.encoder = FocusMambaEncoder(
             in_channels=in_channels,
@@ -66,6 +75,7 @@ class FocusMamba(nn.Module):
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
+            predict_uncertainty=predict_uncertainty,
         )
 
         self.patch_size = patch_size
@@ -73,23 +83,26 @@ class FocusMamba(nn.Module):
 
     def forward(
         self, frames: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """
         Args:
             frames: (B, C, T, H, W) float32 in [0,1].
         Returns:
-            focus_map: (B, 1, T, H, W) in [0,1].
+            dict with:
+                'depth': (B, 1, T, H, W) metric depth in metres (always positive)
+                'uncertainty': (B, 1, T, H, W) aleatoric uncertainty (if enabled)
         """
         B, C, T, H, W = frames.shape
         skips, bottleneck = self.encoder(frames)
-        focus_map = self.decoder(skips, bottleneck)
+        outputs = self.decoder(skips, bottleneck)
 
         # Ensure output matches input spatial/temporal resolution
-        if focus_map.shape[2:] != (T, H, W):
-            focus_map = torch.nn.functional.interpolate(
-                focus_map, size=(T, H, W), mode="trilinear", align_corners=False,
-            )
-        return focus_map
+        for key in outputs:
+            if outputs[key].shape[2:] != (T, H, W):
+                outputs[key] = torch.nn.functional.interpolate(
+                    outputs[key], size=(T, H, W), mode="trilinear", align_corners=False,
+                )
+        return outputs
 
     # ------------------------------------------------------------------
     # Utilities

@@ -1,0 +1,43 @@
+# Experiment: Distillation V1
+# ============================
+# First full distillation run — all 4 teachers, base model, synthetic degradation.
+# Inherits from base.yaml.
+
+training:
+  max_epochs: 300
+  batch_size: 4
+  grad_clip: 1.0
+  precision: bf16
+
+model:
+  type: mamba
+  embed_dim: 96
+  encoder_depths: [2, 2, 4, 2]
+
+distillation:
+  enabled: true
+  teachers:
+    - name: depth_anything_v3
+      weight: 0.25
+      loss: si_log
+    - name: depth_pro
+      weight: 0.25
+      loss: si_log
+    - name: metric3d_v2
+      weight: 0.25
+      loss: si_log
+    - name: video_depth_anything
+      weight: 0.25
+      loss: si_log_plus_temporal
+  ensemble_method: fixed
+  confidence_weighted: true
+
+degradation:
+  enabled: true
+  curriculum: true
+
+loss:
+  si_log_weight: 1.0
+  gradient_weight: 0.5
+  temporal_weight: 0.2
+  uncertainty_nll_weight: 0.1

@@ -203,7 +203,8 @@ class TransformerDecoderStage(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FocusTransformerDecoder(nn.Module):
-    """UNet decoder using Transformer blocks.  Mirrors FocusMambaDecoder exactly."""
+    """UNet decoder using Transformer blocks.  Mirrors FocusMambaDecoder exactly.
+    Outputs metric depth via exp(log_depth) and optional uncertainty."""
 
     def __init__(
         self,
@@ -213,8 +214,10 @@ class FocusTransformerDecoder(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        predict_uncertainty: bool = False,
     ):
         super().__init__()
+        self.predict_uncertainty = predict_uncertainty
         dims = [embed_dim * (2 ** i) for i in range(4)]
 
         self.stages = nn.ModuleList([
@@ -230,13 +233,19 @@ class FocusTransformerDecoder(nn.Module):
             padding=(1, 0, 0),
             groups=dims[0],
         )
-        self.head = nn.Conv3d(dims[0], 1, kernel_size=1)
+
+        # Metric depth head: predict log-depth, exponentiate for positivity
+        self.depth_head = nn.Conv3d(dims[0], 1, kernel_size=1)
+
+        # Optional uncertainty head
+        if predict_uncertainty:
+            self.uncertainty_head = nn.Conv3d(dims[0], 1, kernel_size=1)
 
     def forward(
         self,
         skips: List[torch.Tensor],
         bottleneck: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         x = bottleneck
         reversed_skips = list(reversed(skips))
 
@@ -248,8 +257,15 @@ class FocusTransformerDecoder(nn.Module):
 
         x = x.permute(0, 4, 1, 2, 3)
         x = self.temporal_smooth(x)
-        out = torch.sigmoid(self.head(x))
-        return out
+
+        # Metric depth: exp(log_depth)
+        log_depth = self.depth_head(x)
+        depth = torch.exp(log_depth)
+
+        outputs = {"depth": depth}
+        if self.predict_uncertainty:
+            outputs["uncertainty"] = self.uncertainty_head(x)
+        return outputs
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +273,13 @@ class FocusTransformerDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FocusTransformer(nn.Module):
-    """End-to-end bidirectional Transformer model for focus map prediction.
+    """End-to-end bidirectional Transformer model for metric depth estimation.
 
     Architecture mirrors FocusMamba exactly — same tubelet embedding, same
-    multi-scale UNet hierarchy, same temporal smoothing head.  Only the
-    sequence modelling core differs (MHSA vs Mamba SSM).
+    multi-scale UNet hierarchy, same metric depth head (exp(log_depth)).
+    Only the sequence modelling core differs (MHSA vs Mamba SSM).
+
+    Serves as the conv_baseline / transformer ablation.
 
     Args:
         in_channels: Number of input channels (3 for RGB).
@@ -274,6 +292,7 @@ class FocusTransformer(nn.Module):
         d_state: Unused (kept for config compatibility).
         d_conv: Unused (kept for config compatibility).
         expand: Unused (kept for config compatibility).
+        predict_uncertainty: If True, also predict per-pixel uncertainty.
     """
 
     def __init__(
@@ -288,6 +307,7 @@ class FocusTransformer(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        predict_uncertainty: bool = False,
     ):
         super().__init__()
         if depths is None:
@@ -306,27 +326,30 @@ class FocusTransformer(nn.Module):
             embed_dim=embed_dim,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
+            predict_uncertainty=predict_uncertainty,
         )
 
         self.patch_size = patch_size
         self.t_patch = t_patch
 
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+    def forward(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
             frames: (B, C, T, H, W) float32 in [0,1].
         Returns:
-            focus_map: (B, 1, T, H, W) in [0,1].
+            dict with 'depth': (B, 1, T, H, W) metric depth in metres.
+                      'uncertainty': (B, 1, T, H, W) if enabled.
         """
         B, C, T, H, W = frames.shape
         skips, bottleneck = self.encoder(frames)
-        focus_map = self.decoder(skips, bottleneck)
+        outputs = self.decoder(skips, bottleneck)
 
-        if focus_map.shape[2:] != (T, H, W):
-            focus_map = F.interpolate(
-                focus_map, size=(T, H, W), mode="trilinear", align_corners=False,
-            )
-        return focus_map
+        for key in outputs:
+            if outputs[key].shape[2:] != (T, H, W):
+                outputs[key] = F.interpolate(
+                    outputs[key], size=(T, H, W), mode="trilinear", align_corners=False,
+                )
+        return outputs
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -353,9 +376,10 @@ if __name__ == "__main__":
 
     x = torch.randn(1, 3, 8, 256, 256)
     with torch.no_grad():
-        out = model(x)
+        outputs = model(x)
+    depth = outputs["depth"]
     print(f"Input:  {x.shape}")
-    print(f"Output: {out.shape}")
-    assert out.shape == (1, 1, 8, 256, 256), f"Shape mismatch: {out.shape}"
-    assert out.min() >= 0 and out.max() <= 1, "Output out of [0,1] range"
+    print(f"Output depth: {depth.shape}")
+    assert depth.shape == (1, 1, 8, 256, 256), f"Shape mismatch: {depth.shape}"
+    assert depth.min() > 0, "Depth must be positive (exp output)"
     print("Smoke test passed!")
