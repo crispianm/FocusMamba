@@ -1,0 +1,9 @@
+# Mamba Depth — Small variant
+# Inherits from base.yaml, overrides model config
+model:
+  type: mamba
+  embed_dim: 64
+  encoder_depths: [2, 2, 2, 2]
+  d_state: 16
+  d_conv: 4
+  expand: 2

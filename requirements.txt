@@ -1,13 +1,47 @@
-# FocusMamba Python dependencies
-# NOTE:
-# Install PyTorch (cu128) first using the commands in the setup steps,
-# then run: pip install -r requirements.txt
+# FocusMamba — Degradation-Robust Metric Video Depth Estimation
+# =================================================================
+# Install PyTorch (cu128+) first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Then:
+#   pip install -r requirements.txt
 
+# ---- Core deep learning ----
+torch>=2.2
+torchvision>=0.17
+einops>=0.7
+
+# ---- Mamba / SSM (vendored in repo, but listed for reference) ----
+# mamba-ssm        # pip install mamba-ssm (requires CUDA)
+# causal-conv1d
+
+# ---- Data / vision ----
 numpy>=1.26
-matplotlib>=3.8
-pyyaml>=6.0
-torchvision>=0.16
+opencv-python>=4.8
+imageio[ffmpeg]>=2.33
+albumentations>=1.3
+kornia>=0.7
+
+# ---- Losses / metrics ----
 pytorch-msssim>=1.0.0
-fvcore>=0.1.5.post20221221
-lpips>=0.1.4
+
+# ---- Logging & experiment tracking ----
 tensorboard>=2.15
+matplotlib>=3.8
+seaborn>=0.13
+
+# ---- Configuration ----
+pyyaml>=6.0
+
+# ---- Export (optional) ----
+onnx>=1.15
+onnxruntime>=1.17
+
+# ---- Evaluation / reporting ----
+pandas>=2.1
+tqdm>=4.66
+
+# ---- Profiling ----
+fvcore>=0.1.5.post20221221
+
+# ---- Testing ----
+pytest>=7.4

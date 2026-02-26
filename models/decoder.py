@@ -1,8 +1,10 @@
 """
-FocusMamba Decoder
-===================
+"""FocusMamba Decoder — Metric Depth
+======================================
 
 A 4-stage UNet decoder that mirrors the encoder's multi-scale hierarchy.
+Outputs metric depth (via exp(log_depth) for positivity enforcement) and
+optionally per-pixel aleatoric uncertainty.
 
 Each decoder stage:
     1. Upsample by 2x (trilinear + 1×1×1 conv to halve channels).
@@ -17,7 +19,8 @@ Channel dims per stage:
     Stage 1:                   192 → concat(192+96)=288    → project → 96
     Stage 0:                   96  → (no skip at input res) → 96
 
-Final head includes a 1-D temporal smoothing conv before sigmoid.
+Final head predicts log-depth (exponentiated for metric output) and
+optionally per-pixel uncertainty via separate head.
 """
 
 from __future__ import annotations
@@ -132,11 +135,15 @@ class DecoderStage(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FocusMambaDecoder(nn.Module):
-    """UNet decoder for FocusMamba.
+    """UNet decoder for FocusMamba — metric depth output.
+
+    Predicts log-depth which is exponentiated to enforce positive metric depth.
+    Optionally predicts per-pixel aleatoric uncertainty.
 
     Args:
         embed_dim: Base embedding dimension (same as encoder stage-0 dim).
         d_state, d_conv, expand: Mamba SSM hyper-params.
+        predict_uncertainty: If True, adds a separate uncertainty head.
     """
 
     def __init__(
@@ -145,8 +152,11 @@ class FocusMambaDecoder(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        predict_uncertainty: bool = False,
     ):
         super().__init__()
+        self.predict_uncertainty = predict_uncertainty
+
         # Channel dims: stage-0=96, stage-1=192, stage-2=384, bottleneck=768
         dims = [embed_dim * (2 ** i) for i in range(4)]  # [96, 192, 384, 768]
 
@@ -170,20 +180,26 @@ class FocusMambaDecoder(nn.Module):
             groups=dims[0],
         )
 
-        # Final prediction head
-        self.head = nn.Conv3d(dims[0], 1, kernel_size=1)
+        # Metric depth head: predicts log-depth, exponentiated for positivity
+        self.depth_head = nn.Conv3d(dims[0], 1, kernel_size=1)
+
+        # Optional uncertainty head: predicts log-variance
+        if predict_uncertainty:
+            self.uncertainty_head = nn.Conv3d(dims[0], 1, kernel_size=1)
 
     def forward(
         self,
         skips: List[torch.Tensor],
         bottleneck: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """
         Args:
             skips: list of encoder skips [stage0, stage1, stage2], high-res first.
             bottleneck: (B, T, H_b, W_b, C_b).
         Returns:
-            focus_map: (B, 1, T, H_out, W_out) in [0, 1].
+            dict with:
+                'depth': (B, 1, T, H_out, W_out) metric depth in metres (positive).
+                'uncertainty': (B, 1, T, H_out, W_out) log-variance (if enabled).
         """
         x = bottleneck  # (B, T, H, W, 768)
 
@@ -203,6 +219,15 @@ class FocusMambaDecoder(nn.Module):
         # Temporal smoothing
         x = self.temporal_smooth(x)
 
-        # Head → sigmoid
-        out = torch.sigmoid(self.head(x))  # (B, 1, T, H, W)
-        return out
+        # Metric depth head: predict log-depth, exponentiate for positivity
+        log_depth = self.depth_head(x)  # (B, 1, T, H, W)
+        depth = torch.exp(log_depth)    # always positive, in metres
+
+        outputs = {"depth": depth}
+
+        # Optional uncertainty head
+        if self.predict_uncertainty:
+            log_variance = self.uncertainty_head(x)  # (B, 1, T, H, W)
+            outputs["uncertainty"] = log_variance
+
+        return outputs
