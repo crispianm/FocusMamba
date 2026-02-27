@@ -49,68 +49,35 @@ def check_file(path: str, label: str) -> bool:
 
 
 def check_da3_sys_path() -> bool:
-    da3_src = os.path.join(_ROOT, "teachers", "Depth-Anything-3", "src")
-    if not os.path.isdir(da3_src):
-        _fail(f"DA3 src not found at {da3_src}")
-        return False
-    if da3_src not in sys.path:
-        sys.path.insert(0, da3_src)
-    # DA3 eagerly imports pycolmap and gsplat (heavy C++ deps used only for 3D
-    # export, not inference).  Stub them out so the import chain succeeds.
-    from unittest.mock import MagicMock
-    for _stub in ("pycolmap", "gsplat"):
-        if _stub not in sys.modules:
-            sys.modules[_stub] = MagicMock()
+    """Check that the vendored DA3 model can be imported."""
     try:
-        from depth_anything_3.api import DepthAnything3  # noqa: F401
-        _ok("depth_anything_3.api importable")
+        from models.teachers.vendor.depth_anything_v3 import DepthAnything3Net  # noqa: F401
+        _ok("depth_anything_v3 (vendored) importable")
         return True
     except ImportError as e:
-        _fail(f"Cannot import depth_anything_3.api — {e}")
+        _fail(f"Cannot import vendored depth_anything_v3 — {e}")
         return False
 
 
 def check_vda_sys_path() -> bool:
-    vda_root = os.path.join(_ROOT, "teachers", "Video-Depth-Anything")
-    if not os.path.isdir(vda_root):
-        _fail(f"Video-Depth-Anything root not found at {vda_root}")
-        return False
-    if vda_root not in sys.path:
-        sys.path.insert(0, vda_root)
-    # VDA's video_depth.py does `from utils.util import ...` which collides with
-    # FocusMamba's own utils/ package.  Temporarily remove it from the module
-    # cache so Python searches sys.path (where VDA's utils/ comes first).
-    # Also evict any previously cached (error-state) VDA module entries so
-    # Python re-executes the import rather than replaying the cached failure.
-    _stash_keys = ["utils", "utils.util"]
-    _evict_keys = [k for k in sys.modules if k.startswith("video_depth_anything")]
-    _stash = {k: sys.modules.pop(k) for k in _stash_keys if k in sys.modules}
-    for k in _evict_keys:
-        sys.modules.pop(k, None)
+    """Check that the vendored Video Depth Anything model can be imported."""
     try:
-        from video_depth_anything.video_depth import VideoDepthAnything  # noqa: F401
-        _ok("VideoDepthAnything importable")
+        from models.teachers.vendor.video_depth_anything import VideoDepthAnything  # noqa: F401
+        _ok("VideoDepthAnything (vendored) importable")
         return True
     except ImportError as e:
-        _fail(f"Cannot import VideoDepthAnything — {e}")
+        _fail(f"Cannot import vendored VideoDepthAnything — {e}")
         return False
-    finally:
-        sys.modules.update(_stash)
 
 
 def check_depth_pro_sys_path() -> bool:
-    dp_src = os.path.join(_ROOT, "teachers", "ml-depth-pro", "src")
-    if not os.path.isdir(dp_src):
-        _fail(f"ml-depth-pro src not found at {dp_src}")
-        return False
-    if dp_src not in sys.path:
-        sys.path.insert(0, dp_src)
+    """Check that the vendored Depth Pro model can be imported."""
     try:
-        from depth_pro import create_model_and_transforms  # noqa: F401
-        _ok("depth_pro.create_model_and_transforms importable")
+        from models.teachers.vendor.depth_pro import DepthPro  # noqa: F401
+        _ok("depth_pro (vendored) importable")
         return True
     except ImportError as e:
-        _fail(f"Cannot import depth_pro — {e}  (did you run: uv pip install -e teachers/ml-depth-pro?)")
+        _fail(f"Cannot import vendored depth_pro — {e}")
         return False
 
 

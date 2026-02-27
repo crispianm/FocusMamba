@@ -1,13 +1,12 @@
 """
-Video Depth Anything — Video Teacher Wrapper
-==============================================
+Video Depth Anything — Video Teacher Wrapper (Vendored)
+========================================================
 
-Wraps Video Depth Anything for use as a frozen video-level teacher.
-Unlike image teachers, this processes temporal sequences natively,
-providing temporally consistent depth predictions.
+Wraps the vendored Video Depth Anything model for use as a frozen video-level
+teacher.  Calls forward() directly with ImageNet-normalised tensors — no
+sys.path manipulation, no module stashing.
 
-Repository: https://github.com/DepthAnything/Video-Depth-Anything
-Checkpoint: checkpoints/metric_video_depth_anything_vitl.pth (already present)
+Checkpoint: checkpoints/metric_video_depth_anything_vitl.pth
 
 Usage:
     teacher = VideoDepthAnythingTeacher(
@@ -19,18 +18,11 @@ Usage:
 
 from __future__ import annotations
 
-import os
-import sys
 from typing import Optional
 
 import torch
 
 from .teacher_base import TeacherBase
-
-# Path to the Video-Depth-Anything repo root (script-only, no setup.py).
-_VDA_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "teachers", "Video-Depth-Anything")
-)
 
 # ImageNet normalisation used by DINOv2 backbone in Video-Depth-Anything.
 _VDA_MEAN = (0.485, 0.456, 0.406)
@@ -66,25 +58,8 @@ class VideoDepthAnythingTeacher(TeacherBase):
         return True
 
     def _load_model(self) -> None:
-        """Load Video Depth Anything (metric vitl) from teachers/Video-Depth-Anything."""
-        if _VDA_ROOT not in sys.path:
-            sys.path.insert(0, _VDA_ROOT)
-
-        # VDA does `from utils.util import ...` at module level.  FocusMamba also
-        # has a `utils/` package at the project root.  If it was imported first,
-        # Python's module cache returns it instead of VDA's utils/ directory.
-        # Temporarily pop both from sys.modules so VDA's copy is discovered first,
-        # then restore the originals.  Also evict any previously cached (error-state)
-        # VDA module entries so Python re-executes them.
-        _stash_keys = ["utils", "utils.util"]
-        _evict_keys = [k for k in sys.modules if k.startswith("video_depth_anything")]
-        _stash = {k: sys.modules.pop(k) for k in _stash_keys if k in sys.modules}
-        for k in _evict_keys:
-            sys.modules.pop(k, None)
-        try:
-            from video_depth_anything.video_depth import VideoDepthAnything
-        finally:
-            sys.modules.update(_stash)
+        """Load Video Depth Anything (metric vitl) from vendored code."""
+        from .vendor.video_depth_anything import VideoDepthAnything
 
         self.model = VideoDepthAnything(
             encoder="vitl",
@@ -92,11 +67,13 @@ class VideoDepthAnythingTeacher(TeacherBase):
             out_channels=[256, 512, 1024, 1024],
             use_bn=False,
             use_clstoken=False,
-            num_frames=self.temporal_window,
+            # Build with num_frames=32 to match the checkpoint's positional
+            # encoding buffer shape.  temporal_window controls chunking only.
+            num_frames=32,
             pe="ape",
             metric=True,
         )
-        state_dict = torch.load(self.checkpoint_path, map_location="cpu")
+        state_dict = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
         self.model.load_state_dict(state_dict)
         self.model = self.model.to(self.target_device).eval()
 
@@ -186,4 +163,5 @@ class VideoDepthAnythingTeacher(TeacherBase):
 
             depths.append(clip_depth)
 
-        return torch.cat(depths, dim=0)  # (B, 1, T, H, W)
+        result = torch.cat(depths, dim=0)  # (B, 1, T, H, W)
+        return result.to(self.target_device)

@@ -126,14 +126,11 @@ def main():
     # Loss, optimizer, scheduler
     # -----------------------------------------------------------------------
     loss_cfg = train_cfg.get("loss", {})
-    criterion = CombinedLoss(
-        si_log_weight=loss_cfg.get("si_log_weight", 1.0),
-        distillation_weight=loss_cfg.get("distillation_weight", 1.0),
-        gradient_weight=loss_cfg.get("gradient_weight", 0.5),
-        temporal_weight=loss_cfg.get("temporal_weight", 0.1),
-        uncertainty_nll_weight=loss_cfg.get("uncertainty_nll_weight", 0.0),
-        teacher_names=list(teachers.keys()) if teachers else [],
-    )
+    distillation_cfg = train_cfg.get("distillation", {})
+    if teachers and not distillation_cfg.get("enabled"):
+        distillation_cfg["enabled"] = True
+        distillation_cfg.setdefault("teachers", list(teachers.keys()))
+    criterion = CombinedLoss(cfg=loss_cfg, distillation_cfg=distillation_cfg)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),

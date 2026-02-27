@@ -65,8 +65,8 @@ cd "$PROJECT_DIR" || { echo "ERROR: Cannot cd into $PROJECT_DIR"; exit 1; }
 # Sync all dependencies from uv.lock into .venv (creates .venv if missing)
 uv sync --locked
 
-# Install ml-depth-pro (not in pyproject.toml — teacher repo has its own setup)
-uv pip install -e teachers/ml-depth-pro --quiet
+# Depth Pro and other teachers are now vendored in models/teachers/vendor/.
+# No separate pip install is needed.
 
 # Activate the venv so plain `python` calls use it for the rest of the script
 source .venv/bin/activate

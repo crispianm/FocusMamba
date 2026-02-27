@@ -131,6 +131,7 @@ def distillation_l1(
     for name, t_depth in teacher_depths.items():
         w = teacher_weights.get(name, 1.0)
         _B, _C, _T, _Ht, _Wt = t_depth.shape
+        t_depth = t_depth.to(pred.device)
         if (_Ht, _Wt) != (H, W):
             t_depth = t_depth.reshape(B * T, 1, _Ht, _Wt)
             t_depth = F.interpolate(t_depth, size=(H, W), mode="bilinear", align_corners=False)

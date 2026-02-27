@@ -100,7 +100,8 @@ class TeacherBase(ABC, nn.Module):
                 frame_depths.append(d)
             depths.append(torch.stack(frame_depths, dim=2))  # (1, 1, T, H, W)
 
-        return torch.cat(depths, dim=0)  # (B, 1, T, H, W)
+        result = torch.cat(depths, dim=0)  # (B, 1, T, H, W)
+        return result.to(self.target_device)
 
     @property
     def is_video_teacher(self) -> bool:
