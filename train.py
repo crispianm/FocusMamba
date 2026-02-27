@@ -84,13 +84,16 @@ def main():
     # -----------------------------------------------------------------------
     teachers: Dict[str, nn.Module] = {}
     distill_cfg = cfg.get("distillation", {})
-    teacher_cfgs = distill_cfg.get("teachers", {})
-    for t_name, t_cfg in teacher_cfgs.items():
+    # YAML stores teachers as a list: [{name, weight, loss, enabled?, ...}, ...]
+    teacher_cfgs = distill_cfg.get("teachers", [])
+    for t_cfg in teacher_cfgs:
+        t_name = t_cfg.get("name")
+        if not t_name:
+            continue
         if not t_cfg.get("enabled", True):
             continue
         try:
-            teacher = build_teacher(t_name, t_cfg)
-            teacher = teacher.to(device)
+            teacher = build_teacher(t_name, t_cfg, device=str(device))
             teachers[t_name] = teacher
             print(f"Teacher loaded: {t_name}")
         except (NotImplementedError, Exception) as e:

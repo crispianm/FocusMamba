@@ -20,12 +20,15 @@ TEACHER_REGISTRY = {
 }
 
 
-def build_teacher(name: str, **kwargs) -> TeacherBase:
+def build_teacher(name: str, cfg: dict = None, **kwargs) -> TeacherBase:
     """Instantiate a teacher by name.
 
     Args:
         name: One of the registered teacher names.
-        **kwargs: Passed to the teacher constructor.
+        cfg: Optional config dict (e.g. from YAML). Distillation-specific keys
+             (``name``, ``weight``, ``loss``, ``enabled``) are stripped out
+             automatically; the rest are forwarded to the constructor.
+        **kwargs: Additional overrides (take precedence over ``cfg``).
 
     Returns:
         TeacherBase instance.
@@ -34,7 +37,13 @@ def build_teacher(name: str, **kwargs) -> TeacherBase:
         raise ValueError(
             f"Unknown teacher '{name}'. Available: {list(TEACHER_REGISTRY.keys())}"
         )
-    return TEACHER_REGISTRY[name](**kwargs)
+    # Keys used only by the training loop, never by teacher constructors.
+    _SKIP_KEYS = {"name", "weight", "loss", "enabled"}
+    constructor_kwargs = {}
+    if cfg:
+        constructor_kwargs = {k: v for k, v in cfg.items() if k not in _SKIP_KEYS}
+    constructor_kwargs.update(kwargs)
+    return TEACHER_REGISTRY[name](**constructor_kwargs)
 
 
 __all__ = [

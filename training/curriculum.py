@@ -5,7 +5,7 @@ Degradation Severity Curriculum Scheduler
 Increases degradation severity over training epochs, starting with
 mild degradations and ramping up to full severity.
 
-Interfaces with the DegradationPipeline in data/degradation/pipeline.py.
+Interfaces with the DegradationPipeline in dataloader/degradation/pipeline.py.
 """
 
 from __future__ import annotations

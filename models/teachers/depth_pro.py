@@ -16,11 +16,18 @@ Usage:
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Optional
 
 import torch
 
 from .teacher_base import TeacherBase
+
+# Path to the ml-depth-pro package (src/ layout).
+_DEPTH_PRO_SRC = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "teachers", "ml-depth-pro", "src")
+)
 
 
 class DepthProTeacher(TeacherBase):
@@ -44,21 +51,22 @@ class DepthProTeacher(TeacherBase):
         self.model = None
 
     def _load_model(self) -> None:
-        """Load Apple Depth Pro model.
+        """Load Apple Depth Pro model from teachers/ml-depth-pro."""
+        if _DEPTH_PRO_SRC not in sys.path:
+            sys.path.insert(0, _DEPTH_PRO_SRC)
 
-        TODO: Implement actual model loading.
-        Expected steps:
-            1. Import depth_pro package
-            2. cfg = depth_pro.DepthProConfig(...)
-            3. model = depth_pro.create_model(cfg)
-            4. model.load_state_dict(torch.load(self.checkpoint_path))
-            5. self.model = model.to(self.target_device).eval()
-        """
-        raise NotImplementedError(
-            "Implement Depth Pro model loading. "
-            "Install from: https://github.com/apple/ml-depth-pro "
-            f"Checkpoint expected at: {self.checkpoint_path}"
+        from depth_pro import create_model_and_transforms
+        from depth_pro.depth_pro import DEFAULT_MONODEPTH_CONFIG_DICT
+
+        cfg = DEFAULT_MONODEPTH_CONFIG_DICT
+        cfg.checkpoint_uri = self.checkpoint_path
+
+        self.model, _transform = create_model_and_transforms(
+            config=cfg,
+            device=torch.device(self.target_device),
+            precision=torch.float16,
         )
+        self.model.eval()
 
     def _predict_single_frame(self, frame: torch.Tensor) -> torch.Tensor:
         """Predict metric depth for a single frame.
@@ -69,8 +77,17 @@ class DepthProTeacher(TeacherBase):
         Returns:
             depth: (1, 1, H, W) float32 metric depth in metres.
         """
-        # TODO: Implement inference
-        # prediction = self.model.infer(frame)
-        # depth = prediction["depth"]  # shape depends on Depth Pro API
-        # return depth.unsqueeze(0).unsqueeze(0) if needed
-        raise NotImplementedError
+        # Depth Pro expects the input normalised to [-1, 1]
+        # (its own transform: Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
+        frame = frame.to(self.target_device, dtype=torch.float16)
+        frame_norm = frame * 2.0 - 1.0  # [0,1] → [-1,1]
+
+        result = self.model.infer(frame_norm)
+        depth = result["depth"]  # shape: (H, W) or (1, H, W) or (1, 1, H, W)
+
+        if depth.dim() == 2:
+            depth = depth.unsqueeze(0).unsqueeze(0)
+        elif depth.dim() == 3:
+            depth = depth.unsqueeze(0)
+
+        return depth.float()

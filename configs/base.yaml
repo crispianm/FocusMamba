@@ -64,9 +64,6 @@ distillation:
     - name: depth_pro
       weight: 0.25
       loss: si_log
-    - name: metric3d_v2
-      weight: 0.25
-      loss: si_log
     - name: video_depth_anything
       weight: 0.25
       loss: si_log_plus_temporal

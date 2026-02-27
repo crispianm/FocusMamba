@@ -19,7 +19,37 @@ dependencies = [
     "pyyaml>=6.0",
     "seaborn>=0.13",
     "tensorboard>=2.15",
-    "torch>=2.2",
+    "torch>=2.7",
     "torchvision>=0.17",
     "tqdm>=4.66",
+    # Teacher runtime deps (minimal — no heavy extras like open3d, pycolmap, xformers)
+    "addict>=2.4",             # Depth-Anything-3 config (omegaconf transitive dep)
+    "e3nn>=0.5",               # Depth-Anything-3 pose utils
+    "easydict>=1.10",          # Video-Depth-Anything
+    "evo>=1.28",               # Depth-Anything-3 trajectory evaluation (eagerly imported)
+    "huggingface-hub>=0.20",   # Depth-Anything-3 from_pretrained
+    "moviepy==1.0.3",          # Depth-Anything-3 export utils (2.x removed moviepy.editor)
+    "omegaconf>=2.3",          # Depth-Anything-3 config loader
+    "pillow-heif>=0.13",       # ml-depth-pro
+    "plyfile>=1.0",            # Depth-Anything-3 export utils
+    "safetensors>=0.4",        # Depth-Anything-3 weights
+    "timm>=0.9",               # ml-depth-pro (also installed via uv pip install -e)
+    "trimesh>=4.0",            # Depth-Anything-3 mesh export (eagerly imported)
+]
+
+# ── PyTorch index ─────────────────────────────────────────────────────────────
+[tool.uv.sources]
+torch       = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url  = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# ── Cross-Architecture Lock configuration ─────────────────────────────────────
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'"
 ]
