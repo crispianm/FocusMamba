@@ -145,14 +145,17 @@ def train_one_epoch(
     writer: SummaryWriter,
     global_step: int,
     ema: Optional[EMAModel] = None,
+    teacher_weights: Optional[Dict[str, float]] = None,
+    log_img_every: int = 50,
+    log_img_max_B: int = 2,
 ) -> tuple[float, int]:
     """Run one training epoch.
 
-    For each batch:
-        1. Student processes DEGRADED frames → predicted depth
-        2. Teachers (frozen) process CLEAN frames → teacher depths
-        3. Compute combined loss (distillation + others)
-        4. Backprop to student only
+    Supports two data modes:
+        1. No degradation: batch has ``frames`` (clean RGB) + optional ``depth`` (GT).
+           Student and teachers both run on ``frames``.
+        2. Degradation: batch has ``degraded_frames`` + ``clean_frames``.
+           Student runs on degraded, teachers on clean.
 
     Returns:
         (avg_loss, updated_global_step)
@@ -162,8 +165,15 @@ def train_one_epoch(
     n_batches = 0
 
     for batch in tqdm(loader, desc="Train", unit="it", leave=False):
-        degraded_frames = batch["degraded_frames"].to(device)  # (B, C, T, H, W)
-        clean_frames = batch["clean_frames"].to(device)        # (B, C, T, H, W)
+        # ── Resolve input frames ────────────────────────────────────────
+        if "degraded_frames" in batch:
+            student_input = batch["degraded_frames"].to(device)
+            teacher_input = batch["clean_frames"].to(device)
+        else:
+            # No degradation — both see the same (clean) frames
+            student_input = batch["frames"].to(device)
+            teacher_input = student_input
+
         gt_depth = batch.get("depth")
         if gt_depth is not None:
             gt_depth = gt_depth.to(device)  # (B, 1, T, H, W)
@@ -171,8 +181,8 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-            # Student forward on degraded input
-            student_outputs = model(degraded_frames)
+            # Student forward
+            student_outputs = model(student_input)
             student_depth = student_outputs["depth"]
 
             # Guard: skip if non-finite
@@ -185,7 +195,10 @@ def train_one_epoch(
             if teachers:
                 with torch.no_grad():
                     for name, teacher in teachers.items():
-                        teacher_depths[name] = teacher.predict(clean_frames)
+                        try:
+                            teacher_depths[name] = teacher.predict(teacher_input)
+                        except Exception:
+                            pass
 
             # Compute combined loss
             losses = criterion(
@@ -225,13 +238,41 @@ def train_one_epoch(
         n_batches += 1
         global_step += 1
 
-        # TensorBoard logging
+        # TensorBoard logging — scalars
         if global_step % 50 == 0:
             writer.add_scalar("train/loss_total", total_loss.item(), global_step)
             for k, v in losses.items():
                 if k != "total" and isinstance(v, torch.Tensor):
                     writer.add_scalar(f"train/{k}", v.item(), global_step)
             writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+
+        # TensorBoard logging — image grids (matching test_training.py style)
+        if global_step % log_img_every == 0:
+            with torch.no_grad():
+                from training.callbacks.visualise_depth import colorise_depth
+                pred_d = student_depth.detach()
+                B_vis = min(pred_d.shape[0], log_img_max_B)
+                rows = []
+                for b in range(B_vis):
+                    t_mid = pred_d.shape[2] // 2
+                    rgb = student_input[b, :, t_mid].cpu()  # (3, H, W)
+                    s_d = pred_d[b, 0, t_mid].cpu()
+                    col = [rgb, colorise_depth(s_d)]
+                    if gt_depth is not None:
+                        gt_d = gt_depth[b, 0, t_mid].cpu()
+                        col.append(colorise_depth(gt_d))
+                    for t_name, td in teacher_depths.items():
+                        col.append(colorise_depth(td[b, 0, t_mid].cpu()))
+                    rows.append(torch.cat(col, dim=1))
+                grid = torch.cat(rows, dim=2).clamp(0.0, 1.0)
+                writer.add_image("train/depth_grid", grid, global_step)
+
+                # Per-teacher and student depth scale
+                writer.add_scalar("student/mean_depth", pred_d.mean().item(), global_step)
+                for t_name, td in teacher_depths.items():
+                    writer.add_scalar(f"teacher/{t_name}_mean_depth", td.mean().item(), global_step)
+                if gt_depth is not None:
+                    writer.add_scalar("gt/mean_depth", gt_depth.mean().item(), global_step)
 
     avg_loss = running_loss / max(n_batches, 1)
     return avg_loss, global_step
@@ -250,16 +291,24 @@ def validate(
     use_amp: bool,
     writer: SummaryWriter,
     epoch: int,
+    teachers: Optional[Dict[str, nn.Module]] = None,
+    teacher_weights: Optional[Dict[str, float]] = None,
+    log_img_max_B: int = 2,
 ) -> Dict[str, float]:
     """Run validation and compute depth metrics."""
     model.eval()
     total_loss = 0.0
     metric_accum: Dict[str, float] = {}
     n_batches = 0
+    logged_image = False
 
     for batch in tqdm(loader, desc=f"Val {epoch}", unit="it", leave=False):
-        # For validation, use clean frames (no degradation)
-        frames = batch.get("clean_frames", batch.get("degraded_frames")).to(device)
+        # Resolve input frames (same logic as train_one_epoch)
+        if "clean_frames" in batch:
+            frames = batch["clean_frames"].to(device)
+        else:
+            frames = batch["frames"].to(device)
+
         gt_depth = batch.get("depth")
         if gt_depth is not None:
             gt_depth = gt_depth.to(device)
@@ -268,19 +317,58 @@ def validate(
             outputs = model(frames)
             pred_depth = outputs["depth"]
 
+            # Teacher inference for distillation validation
+            teacher_depths = {}
+            if teachers:
+                for name, teacher in teachers.items():
+                    try:
+                        teacher_depths[name] = teacher.predict(frames)
+                    except Exception:
+                        pass
+
             if gt_depth is not None:
                 losses = criterion(
                     student_outputs=outputs,
+                    teacher_depths=teacher_depths if teacher_depths else None,
                     gt_depth=gt_depth,
                 )
                 if torch.isfinite(losses["total"]):
                     total_loss += losses["total"].item()
+            elif teacher_depths:
+                losses = criterion(
+                    student_outputs=outputs,
+                    teacher_depths=teacher_depths,
+                )
+                if torch.isfinite(losses["total"]):
+                    total_loss += losses["total"].item()
 
-        # Metrics
+        # Metrics (against GT if available)
         if gt_depth is not None:
             m = compute_depth_metrics(pred_depth.float(), gt_depth.float())
             for k, v in m.items():
                 metric_accum[k] = metric_accum.get(k, 0.0) + v
+            n_batches += 1
+
+            # Log one image grid per validation
+            if not logged_image:
+                from training.callbacks.visualise_depth import colorise_depth
+                B_vis = min(pred_depth.shape[0], log_img_max_B)
+                rows = []
+                for b in range(B_vis):
+                    t_mid = pred_depth.shape[2] // 2
+                    rgb = frames[b, :, t_mid].cpu()
+                    s_d = pred_depth[b, 0, t_mid].cpu()
+                    col = [rgb, colorise_depth(s_d)]
+                    gt_d = gt_depth[b, 0, t_mid].cpu()
+                    col.append(colorise_depth(gt_d))
+                    for t_name, td in teacher_depths.items():
+                        col.append(colorise_depth(td[b, 0, t_mid].cpu()))
+                    rows.append(torch.cat(col, dim=1))
+                grid = torch.cat(rows, dim=2).clamp(0.0, 1.0)
+                writer.add_image("val/depth_grid", grid, epoch)
+                logged_image = True
+        elif teacher_depths:
+            # No GT — count batches by teacher availability
             n_batches += 1
 
     if n_batches == 0:

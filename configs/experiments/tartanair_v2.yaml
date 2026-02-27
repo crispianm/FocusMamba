@@ -1,0 +1,89 @@
+# TartanAir v2 — supervised training with ground-truth depth.
+#
+# No degradations. No teachers (optional — add below to enable distillation).
+# GT depth supervision via SI-log loss.
+#
+# Usage:
+#   python train.py --config configs/experiments/tartanair_v2.yaml
+#
+# Quick sanity check (CPU, 2 trajectories, 1 epoch):
+#   python train.py --config configs/experiments/tartanair_v2.yaml \
+#       --device cpu
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  type: mamba
+  embed_dim: 96
+  encoder_depths: [2, 2, 4, 2]
+  d_state: 16
+  d_conv: 4
+  expand: 2
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  dataset: tartanair_v2
+  root: /projects/b5dh/data/tartanair-v2
+  num_frames: 8
+  image_size: [512, 512]
+  max_trajectories: null     # null = use all; set a small int (e.g. 10) for quick tests
+  clip_stride: 8             # clips start every 8th frame within a trajectory
+  frame_stride: 1            # consecutive frames
+  val_fraction: 0.1          # 10 % of trajectories held out for validation
+  seed: 42
+  difficulty: Data_easy      # Data_easy or Data_hard
+  camera: lcam_front
+  max_depth: 80.0            # depths > max_depth are masked (set to 0)
+  envs: null                 # null = all environments; or list e.g. [AbandonedFactory, ocean]
+
+# ── Teachers ──────────────────────────────────────────────────────────────
+# Leave empty for GT-only supervised training.
+# Uncomment / add entries to enable distillation on top of GT supervision.
+teachers:
+  - name: video_depth_anything
+    enabled: true
+    checkpoint_path: checkpoints/metric_video_depth_anything_vitl.pth
+    device: cuda
+    temporal_window: 8
+    weight: 1.0
+  - name: depth_anything_v3
+    enabled: true
+    checkpoint_path: checkpoints/da3_metric.safetensors  # needs config.json in same dir
+    model_name: da3metric-large
+    device: cuda
+    weight: 1.0
+  - name: depth_pro
+    enabled: true
+    checkpoint_path: checkpoints/depth_pro.pt
+    device: cuda
+    weight: 1.0
+  
+
+# ── Training ──────────────────────────────────────────────────────────────
+training:
+  max_epochs: 2
+  batch_size: 2              # per GPU; with 8 frames × 256×256 this fits on GH200
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  precision: bf16            # bf16 on CUDA; falls back to fp32 on CPU
+  val_every_n_epochs: 5
+  ema_decay: 0.999
+  num_workers: 4
+
+  log_dir: runs/tartanair_v2
+  checkpoint_dir: checkpoints/tartanair_v2
+
+  # TensorBoard image logging
+  log_images_every_n_steps: 50   # log depth image grids every N training steps
+  log_images_max_batch: 2        # how many samples per grid
+
+# ── Loss ──────────────────────────────────────────────────────────────────
+# GT supervision via SI-log loss. Distillation and other terms off by default.
+loss:
+  si_log_weight: 1.0
+  l1_weight: 1.0
+  distillation_weight: 1.0
+  gradient_weight: 0.0
+  temporal_weight: 0.0
+  uncertainty_nll_weight: 0.0

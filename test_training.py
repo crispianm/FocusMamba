@@ -28,9 +28,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from tqdm import tqdm
+
+import tartanair as ta
 
 import torch
 import torch.nn as nn
@@ -304,14 +309,39 @@ def main() -> None:
     # -----------------------------------------------------------------------
     grad_clip = train_cfg.get("grad_clip", 1.0)
     val_every = train_cfg.get("val_every_n_epochs", 5)
-    t0 = time.time()
 
-    for epoch in range(start_epoch, max_epochs):
+    # tqdm settings — use fast refresh in a real terminal, slow in SLURM .out files
+    # (non-TTY: tqdm prints each update on its own line, so throttle to avoid spam)
+    _is_tty = sys.stdout.isatty()
+    _TQDM = dict(
+        file=sys.stdout,
+        dynamic_ncols=False,
+        ncols=100,
+        ascii=True,
+        mininterval=1.0 if _is_tty else 60.0,
+    )
+
+    epoch_bar = tqdm(
+        range(start_epoch, max_epochs),
+        desc="epochs",
+        unit="epoch",
+        initial=start_epoch,
+        total=max_epochs,
+        **_TQDM,
+    )
+
+    for epoch in epoch_bar:
         model.train()
         epoch_losses: List[float] = []
-        epoch_t0 = time.time()
 
-        for batch in train_loader:
+        batch_bar = tqdm(
+            train_loader,
+            desc=f"E{epoch + 1:03d} train",
+            unit="batch",
+            leave=False,
+            **_TQDM,
+        )
+        for batch in batch_bar:
             frames = batch["frames"].to(device)  # (B, 3, T, H, W)
 
             # ── Teacher inference (frozen, no grad) ─────────────────────────
@@ -325,7 +355,7 @@ def main() -> None:
                     # Teacher not yet implemented — skip silently
                     pass
                 except Exception as e:
-                    print(f"  Teacher '{t_name}' error (step {global_step}): {e}")
+                    tqdm.write(f"  Teacher '{t_name}' error (step {global_step}): {e}")
 
             if not pseudo_depths:
                 # No teachers available yet — skip this batch
@@ -351,6 +381,10 @@ def main() -> None:
             epoch_losses.append(loss_val)
             writer.add_scalar("train/l1_loss", loss_val, global_step)
             writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+            batch_bar.set_postfix(
+                loss=f"{loss_val:.4f}",
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+            )
 
             # ── TensorBoard image grid ───────────────────────────────────────
             if global_step % log_img_every == 0 and pseudo_depths:
@@ -374,17 +408,8 @@ def main() -> None:
             global_step += 1
 
         avg_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-        elapsed = time.time() - t0
-        epochs_done = epoch - start_epoch + 1
-        eta_min = elapsed / epochs_done * (max_epochs - epoch - 1) / 60.0
-        epoch_secs = time.time() - epoch_t0
-
-        print(
-            f"Epoch {epoch + 1}/{max_epochs}  "
-            f"train_l1={avg_loss:.5f}  "
-            f"time={epoch_secs:.1f}s  "
-            f"ETA={eta_min:.1f}min"
-        )
+        epoch_bar.set_postfix(train_l1=f"{avg_loss:.5f}")
+        tqdm.write(f"Epoch {epoch + 1}/{max_epochs}  train_l1={avg_loss:.5f}")
         writer.add_scalar("train/epoch_l1", avg_loss, epoch)
 
         # ── Validation ──────────────────────────────────────────────────────
@@ -420,7 +445,8 @@ def main() -> None:
                         val_frames_log = frames[:log_img_max_B]
 
             avg_val = sum(val_losses) / max(len(val_losses), 1)
-            print(f"  Val  l1={avg_val:.5f}")
+            tqdm.write(f"  Val  l1={avg_val:.5f}")
+            epoch_bar.set_postfix(train_l1=f"{avg_loss:.5f}", val_l1=f"{avg_val:.5f}")
             writer.add_scalar("val/epoch_l1", avg_val, epoch)
 
             if val_pseudo is not None:
@@ -434,7 +460,7 @@ def main() -> None:
                     ckpt_dir / "best.pt",
                     epoch, model, optimizer, scaler, scheduler, global_step, best_val_loss, cfg,
                 )
-                print(f"  → Best saved (val_l1={best_val_loss:.5f})")
+                tqdm.write(f"  → Best saved (val_l1={best_val_loss:.5f})")
 
         # Save latest checkpoint every epoch
         _save_ckpt(

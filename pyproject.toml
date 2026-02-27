@@ -35,12 +35,14 @@ dependencies = [
     "safetensors>=0.4",        # Depth-Anything-3 weights
     "timm>=0.9",               # ml-depth-pro (also installed via uv pip install -e)
     "trimesh>=4.0",            # Depth-Anything-3 mesh export (eagerly imported)
+    "tartanair",
 ]
 
 # ── PyTorch index ─────────────────────────────────────────────────────────────
 [tool.uv.sources]
 torch       = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
+tartanair = { git = "https://github.com/castacks/tartanairpy.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

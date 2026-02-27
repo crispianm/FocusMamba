@@ -30,9 +30,14 @@ class CurriculumScheduler:
         warmup_epochs: int = 10,
         max_severity_epoch: int = 100,
         schedule: str = "linear",
+        total_epochs: int | None = None,
     ):
         self.warmup_epochs = warmup_epochs
-        self.max_severity_epoch = max_severity_epoch
+        # Allow total_epochs as alias for max_severity_epoch
+        if total_epochs is not None and max_severity_epoch == 100:
+            self.max_severity_epoch = total_epochs
+        else:
+            self.max_severity_epoch = max_severity_epoch
         self.schedule = schedule
 
     def get_scale(self, epoch: int) -> float:
