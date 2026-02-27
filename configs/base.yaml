@@ -44,6 +44,14 @@ data:
   resolution: [256, 256]     # training crop size [H, W]
   patch_size: 4              # tubelet spatial patch size
   t_patch: 2                 # tubelet temporal patch size
+  train_ratio: 0.9           # fraction of clips used for training
+  split_seed: 42
+  # Datasets to train on (add / remove entries as needed)
+  datasets:
+    - path: /mnt/DATA/tartanairv2
+      type: tartanair         # has GT depth (depth_left/*.npy)
+    - path: /mnt/DATA/youtube-vos/train/JPEGImages
+      type: youtube_vos       # no GT depth; distillation signal only
 
 # ── Model ──────────────────────────────────────────────────────────────────
 model:

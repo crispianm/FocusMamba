@@ -47,6 +47,7 @@ from training.curriculum import CurriculumScheduler
 from training.ema import EMAModel
 from training.callbacks.visualise_depth import log_depth_visualisation
 from training.callbacks.latency_profiler import LatencyProfiler
+from dataloader.live_distill_dataset import build_live_distill_dataloaders
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,9 @@ def main():
     teachers: Dict[str, nn.Module] = {}
     distill_cfg = cfg.get("distillation", {})
     teacher_cfgs = distill_cfg.get("teachers", {})
+    # Support both list format [{name: ..., weight: ...}, ...] and dict format
+    if isinstance(teacher_cfgs, list):
+        teacher_cfgs = {t.get("name", f"teacher_{i}"): t for i, t in enumerate(teacher_cfgs)}
     for t_name, t_cfg in teacher_cfgs.items():
         if not t_cfg.get("enabled", True):
             continue
@@ -104,56 +108,60 @@ def main():
     # -----------------------------------------------------------------------
     # Build dataloaders
     # -----------------------------------------------------------------------
-    # NOTE: Connect your dataset here. The datamodule expects the new
-    # BaseDepthDataset interface returning dict with:
+    # LiveDistillDataset returns batches with keys:
     #   'clean_frames' (B,C,T,H,W), 'degraded_frames' (B,C,T,H,W),
-    #   'depth' (B,1,T,H,W), 'metadata' (dict)
+    #   'depth' (B,1,T,H,W) or None, 'metadata' (list of dicts)
     try:
-        from data.datamodule import build_dataloaders
-        loaders = build_dataloaders(cfg)
+        loaders = build_live_distill_dataloaders(cfg)
         train_loader = loaders["train"]
         val_loader = loaders.get("val")
-    except NotImplementedError:
-        print("WARNING: build_dataloaders not yet implemented.")
-        print("Please implement data/datamodule.py to continue training.")
+    except RuntimeError as e:
+        print(f"WARNING: Could not build dataloaders: {e}")
+        print("Please configure 'data.datasets' paths in your config YAML.")
         print("Exiting.")
         return
 
     # -----------------------------------------------------------------------
     # Loss, optimizer, scheduler
     # -----------------------------------------------------------------------
-    loss_cfg = train_cfg.get("loss", {})
-    criterion = CombinedLoss(
-        si_log_weight=loss_cfg.get("si_log_weight", 1.0),
-        distillation_weight=loss_cfg.get("distillation_weight", 1.0),
-        gradient_weight=loss_cfg.get("gradient_weight", 0.5),
-        temporal_weight=loss_cfg.get("temporal_weight", 0.1),
-        uncertainty_nll_weight=loss_cfg.get("uncertainty_nll_weight", 0.0),
-        teacher_names=list(teachers.keys()) if teachers else [],
-    )
+    # Read loss config: prefer nested `training.loss`; fall back to top-level `loss`
+    # (base.yaml uses top-level `loss`, some experiment configs nest it under `training`)
+    loss_cfg = train_cfg.get("loss", cfg.get("loss", {}))
+    distill_cfg = cfg.get("distillation", {})
+    # Inject active teacher names into distillation config for distillation loss
+    if teachers and "teachers" not in distill_cfg:
+        distill_cfg = dict(distill_cfg)
+        distill_cfg["teachers"] = [{"name": n} for n in teachers]
+    criterion = CombinedLoss(cfg=loss_cfg, distillation_cfg=distill_cfg)
 
+    optimizer_cfg = cfg.get("optimizer", {})
+    scheduler_cfg = cfg.get("scheduler", {})
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=train_cfg.get("learning_rate", 2e-4),
-        weight_decay=train_cfg.get("weight_decay", 0.01),
+        lr=optimizer_cfg.get("lr", train_cfg.get("learning_rate", 2e-4)),
+        weight_decay=optimizer_cfg.get("weight_decay", train_cfg.get("weight_decay", 0.01)),
+        betas=tuple(optimizer_cfg.get("betas", [0.9, 0.999])),
+        eps=optimizer_cfg.get("eps", 1e-8),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     total_steps = train_cfg.get("max_epochs", 200) * max(len(train_loader), 1)
     scheduler = WarmupCosineScheduler(
         optimizer,
-        warmup_steps=train_cfg.get("warmup_steps", 1000),
+        warmup_steps=scheduler_cfg.get("warmup_steps", train_cfg.get("warmup_steps", 1000)),
         total_steps=total_steps,
-        min_lr=1e-6,
+        min_lr=scheduler_cfg.get("min_lr", 1e-6),
     )
 
     # -----------------------------------------------------------------------
     # Curriculum scheduler for degradation severity
     # -----------------------------------------------------------------------
     deg_cfg = cfg.get("degradation", {}).get("curriculum", {})
+    if isinstance(deg_cfg, bool):
+        deg_cfg = {}
     curriculum = CurriculumScheduler(
-        total_epochs=train_cfg.get("max_epochs", 200),
         warmup_epochs=deg_cfg.get("warmup_epochs", 10),
+        max_severity_epoch=deg_cfg.get("max_severity_epoch", train_cfg.get("max_epochs", 200)),
         schedule=deg_cfg.get("schedule", "linear"),
     )
 
@@ -168,11 +176,16 @@ def main():
     # -----------------------------------------------------------------------
     # Logging & checkpoints
     # -----------------------------------------------------------------------
-    log_dir = Path(train_cfg.get("log_dir", "./runs")) / f"{model_type}_depth"
+    log_cfg = cfg.get("logging", {})
+    log_dir = Path(
+        log_cfg.get("log_dir", train_cfg.get("log_dir", "./runs"))
+    ) / f"{model_type}_depth"
     writer = SummaryWriter(str(log_dir))
     writer.add_text("config", yaml.dump(cfg), 0)
 
-    ckpt_dir = Path(train_cfg.get("checkpoint_dir", "./checkpoints")) / f"{model_type}_depth"
+    ckpt_dir = Path(
+        log_cfg.get("checkpoint_dir", train_cfg.get("checkpoint_dir", "./checkpoints"))
+    ) / f"{model_type}_depth"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------------------------
