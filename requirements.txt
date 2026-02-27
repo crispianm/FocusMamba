@@ -6,8 +6,8 @@
 #   pip install -r requirements.txt
 
 # ---- Core deep learning ----
-torch>=2.2
-torchvision>=0.17
+# torch>=2.2
+# torchvision>=0.17 # should be installed from above
 einops>=0.7
 
 # ---- Mamba / SSM (vendored in repo, but listed for reference) ----
@@ -31,10 +31,6 @@ seaborn>=0.13
 
 # ---- Configuration ----
 pyyaml>=6.0
-
-# ---- Export (optional) ----
-onnx>=1.15
-onnxruntime>=1.17
 
 # ---- Evaluation / reporting ----
 pandas>=2.1
