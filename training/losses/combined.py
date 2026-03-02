@@ -32,6 +32,7 @@ class CombinedLoss(nn.Module):
         super().__init__()
 
         self.si_log_weight = cfg.get("si_log_weight", 1.0)
+        self.distillation_weight = cfg.get("distillation_weight", 1.0)
         self.gradient_weight = cfg.get("gradient_weight", 0.0)
         self.temporal_weight = cfg.get("temporal_weight", 0.0)
         self.uncertainty_weight = cfg.get("uncertainty_nll_weight", 0.0)
@@ -95,7 +96,7 @@ class CombinedLoss(nn.Module):
         if self.distillation is not None and teacher_depths:
             distill_losses = self.distillation(student_depth, teacher_depths, mask)
             distill_total = distill_losses.get("total", torch.tensor(0.0))
-            total = total + self.si_log_weight * distill_total
+            total = total + self.distillation_weight * distill_total
             losses.update(distill_losses)
 
         # 2. Direct SI-log loss against GT (if available)

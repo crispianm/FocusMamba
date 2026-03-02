@@ -173,8 +173,9 @@ def main():
 
     train_cfg = cfg.get("training", {})
     data_cfg = cfg.get("data", {})
-    use_amp = train_cfg.get("precision", "bf16") == "bf16" and device.type == "cuda"
-    logger.info("Runtime settings: use_amp=%s precision=%s", use_amp, train_cfg.get("precision", "bf16"))
+    use_fp16 = train_cfg.get("precision", "bf16") == "fp16" and device.type == "cuda"
+    use_amp  = train_cfg.get("precision", "bf16") in ("bf16", "fp16") and device.type == "cuda"
+    logger.info("Runtime settings: use_amp=%s use_fp16=%s precision=%s", use_amp, use_fp16, train_cfg.get("precision", "bf16"))
     logger.debug("Training config:\n%s", pformat(train_cfg, sort_dicts=False))
     logger.debug("Data config:\n%s", pformat(data_cfg, sort_dicts=False))
 
@@ -332,6 +333,10 @@ def main():
         prefetch_factor=_prefetch,
     )
 
+    # Compute batch count before optionally wrapping in CPUPrefetchLoader,
+    # which may not implement __len__.
+    n_train_batches = len(train_loader)
+
     # Optional CPU prefetch queue on top of DataLoader worker prefetch.
     # Useful on shared filesystems where producer jitter can still stall the
     # training loop despite prefetch_factor.
@@ -368,11 +373,11 @@ def main():
         lr=lr,
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)  # bf16 has fp32 exponent range; no loss scaling needed
 
     max_epochs = train_cfg.get("max_epochs", 50)
     warmup_steps = train_cfg.get("warmup_steps", 200)
-    total_steps = max_epochs * max(len(train_loader), 1)
+    total_steps = max_epochs * max(n_train_batches, 1)
 
     scheduler = WarmupCosineScheduler(
         optimizer,
@@ -434,7 +439,15 @@ def main():
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
-        best_val_loss = ckpt.get("best_val_loss", ckpt.get("best_abs_rel", float("inf")))
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        # Sanity-check: old checkpoints stored AbsRel (e.g. 0.083) under a
+        # different key; a combined loss is always >> 0.01.
+        if best_val_loss < 0.01:
+            logger.warning(
+                "Suspicious best_val_loss=%.5f from checkpoint (likely old AbsRel), resetting to inf",
+                best_val_loss,
+            )
+            best_val_loss = float("inf")
         global_step = ckpt.get("global_step", 0)
         if ema is not None and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])

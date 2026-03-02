@@ -194,6 +194,10 @@ def train_one_epoch(
         if gt_depth is not None:
             gt_depth = gt_depth.to(device)  # (B, 1, T, H, W)
 
+        mask = batch.get("mask")
+        if mask is not None:
+            mask = mask.to(device)
+
         # Mark the start of a new CUDAGraph step so that torch.compile
         # (mode="reduce-overhead") knows it is safe to overwrite the output
         # buffers recorded from the previous iteration.  Without this call,
@@ -206,11 +210,13 @@ def train_one_epoch(
             student_outputs = model(student_input)
             student_depth = student_outputs["depth"]
 
-            # # Guard: skip if non-finite
-            # if not torch.isfinite(student_depth).all():
-            #     if not is_accum_step:
-            #         optimizer.zero_grad(set_to_none=True)
-            #     continue
+            # Guard: skip if non-finite
+            if not torch.isfinite(student_depth).all():
+                if logger is not None:
+                    logger.warning("step=%d non-finite student depth, skipping", global_step)
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
 
             # ── Teacher depths ────────────────────────────────────────
             # Priority 1: cached pseudo-labels from disk (fast, no GPU cost).
@@ -241,13 +247,16 @@ def train_one_epoch(
                 student_outputs=student_outputs,
                 teacher_depths=teacher_depths if teacher_depths else None,
                 gt_depth=gt_depth,
+                mask=mask,
             )
 
         total_loss = losses["total"]
-        # if not torch.isfinite(total_loss):
-        #     if not is_accum_step:
-        #         optimizer.zero_grad(set_to_none=True)
-        #     continue
+        if not torch.isfinite(total_loss):
+            if logger is not None:
+                logger.warning("step=%d non-finite loss=%s, skipping", global_step, total_loss.item())
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
 
         scaled_loss = total_loss / grad_accum_steps
         scaler.scale(scaled_loss).backward()
