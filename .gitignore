@@ -10,3 +10,8 @@ youtube-vos/
 models/__pycache__/__init__.cpython-310.pyc
 models/__pycache__/decoder.cpython-310.pyc
 logs/focusmamba_trial_2503263.out
+zz_dataset.ipynb
+core
+*.err
+*.log
+*.out

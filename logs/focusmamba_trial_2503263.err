@@ -1,6 +1,0 @@
-Resolved 132 packages in 35ms
-Uninstalled 1 package in 23ms
-Installed 1 package in 361ms
- ~ nvidia-cusparselt-cu12==0.7.1
-/lus/lfs1aip2/projects/b5dh/FocusMamba/test_training.py:376: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
-  scheduler.step()

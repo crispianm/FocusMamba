@@ -84,6 +84,13 @@ class CombinedLoss(nn.Module):
         losses: Dict[str, torch.Tensor] = {}
         total = torch.tensor(0.0, device=student_depth.device, requires_grad=True)
 
+        # Auto-derive a validity mask from GT depth when none is supplied.
+        # TartanAir encodes invalid/sky pixels as depth=0; excluding them prevents
+        # sky pixels in teacher outputs (e.g. DepthPro ~10 000 m) from corrupting
+        # the SI-log loss.  A mask provided by the caller always takes precedence.
+        if mask is None and gt_depth is not None:
+            mask = (gt_depth > 0).float()
+
         # 1. Distillation loss (primary training signal)
         if self.distillation is not None and teacher_depths:
             distill_losses = self.distillation(student_depth, teacher_depths, mask)

@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -107,6 +107,7 @@ class TartanAirV2Dataset(Dataset):
         camera: str = "lcam_front",
         max_depth: float = 80.0,
         envs: Optional[List[str]] = None,
+        teacher_cache_dir: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -116,6 +117,7 @@ class TartanAirV2Dataset(Dataset):
         self.frame_stride = frame_stride
         self.max_depth = max_depth
         self.camera = camera
+        self.teacher_cache_dir = Path(teacher_cache_dir) if teacher_cache_dir else None
 
         # --- Discover all trajectories with both image and depth -----------
         all_trajectories: List[Tuple[Path, Path]] = []  # (image_dir, depth_dir)
@@ -228,9 +230,41 @@ class TartanAirV2Dataset(Dataset):
                 mode="nearest",
             ).permute(1, 0, 2, 3)  # (1, T, H, W)
 
-        return {
+        result: Dict = {
             "frames": frames,
             "depth": depth,
             "video_id": video_id,
             "start_frame": start,
         }
+
+        # ── Load pre-cached teacher pseudo-labels (if available) ────────────
+        # This eliminates the need to run expensive teacher forward passes
+        # during training.  Run tools/cache_teacher_labels.py to populate.
+        if self.teacher_cache_dir is not None:
+            clip_cache = self.teacher_cache_dir / video_id / str(start)
+            cached: Dict[str, torch.Tensor] = {}
+            if clip_cache.is_dir():
+                for npy_file in clip_cache.glob("*.npy"):
+                    teacher_name = npy_file.stem
+                    try:
+                        # mmap_mode='r' memory-maps the file — the OS shares pages
+                        # across all DataLoader worker processes and skips pickle
+                        # deserialization, giving faster multi-worker throughput.
+                        arr = np.load(str(npy_file), mmap_mode="r")  # (1, T, H_c, W_c) f16
+                        td = torch.from_numpy(arr.astype(np.float32))  # copy out of mmap
+                        H, W = self.image_size
+                        if td.shape[-2:] != (H, W):
+                            # Resize to training resolution if cache was built at a different res
+                            td = F.interpolate(
+                                td,              # (1, T, H_c, W_c)
+                                size=(H, W),
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        cached[teacher_name] = td  # (1, T, H, W)
+                    except Exception:
+                        pass  # corrupt / partial file — skip gracefully
+            if cached:
+                result["cached_teacher_depths"] = cached
+
+        return result

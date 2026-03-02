@@ -32,10 +32,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
+from pprint import pformat
 from typing import Dict, List, Optional
 
 from tqdm import tqdm
@@ -58,6 +61,7 @@ from training.trainer import (
 from training.curriculum import CurriculumScheduler
 from training.ema import EMAModel
 from training.callbacks.latency_profiler import LatencyProfiler
+from training.prefetch import CPUPrefetchLoader
 
 
 
@@ -91,6 +95,37 @@ def _save_ckpt(
         save_dict["ema"] = ema.state_dict()
     torch.save(save_dict, path)
 
+def _setup_logger(debug: bool = False, verbose: bool = False, log_file: str = "runs/train_verbose.log") -> logging.Logger:
+    level = logging.DEBUG if debug else logging.INFO
+    logger = logging.getLogger("focusmamba.train")
+    logger.setLevel(level)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(handler)
+
+    if verbose or debug:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_log_path = str(log_path.resolve())
+        has_file_handler = any(
+            isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == abs_log_path
+            for h in logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(abs_log_path, mode="a")
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+            )
+            logger.addHandler(file_handler)
+
+    for handler in logger.handlers:
+        handler.setLevel(level)
+    return logger
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -101,20 +136,47 @@ def main():
     parser.add_argument("--config", type=str, default="configs/experiments/tartanair_v2.yaml")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--device", type=str, default=None, help="Override device")
+    parser.add_argument("--verbose", action="store_true", help="Enable additional runtime logging")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--verbose-log-file",
+        type=str,
+        default="runs/train_verbose.log",
+        help="Path for verbose/debug file logging",
+    )
     args = parser.parse_args()
+
+    logger = _setup_logger(debug=args.debug, verbose=args.verbose, log_file=args.verbose_log_file)
+    logger.info("Starting training script")
+    logger.info(
+        "Args: config=%s resume=%s device=%s verbose=%s debug=%s verbose_log_file=%s",
+        args.config,
+        args.resume,
+        args.device,
+        args.verbose,
+        args.debug,
+        args.verbose_log_file,
+    )
+    if args.verbose or args.debug:
+        logger.info("Verbose/debug logs are being written to: %s", args.verbose_log_file)
 
     # Load config
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
+    logger.debug("Loaded config:\n%s", pformat(cfg, sort_dicts=False))
 
     device = torch.device(
         args.device if args.device else
         ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    print(f"Device: {device}")
+    logger.info("Device: %s", device)
 
     train_cfg = cfg.get("training", {})
+    data_cfg = cfg.get("data", {})
     use_amp = train_cfg.get("precision", "bf16") == "bf16" and device.type == "cuda"
+    logger.info("Runtime settings: use_amp=%s precision=%s", use_amp, train_cfg.get("precision", "bf16"))
+    logger.debug("Training config:\n%s", pformat(train_cfg, sort_dicts=False))
+    logger.debug("Data config:\n%s", pformat(data_cfg, sort_dicts=False))
 
     # -----------------------------------------------------------------------
     # Build student model
@@ -122,7 +184,16 @@ def main():
     model = build_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_type = cfg.get("model", {}).get("type", "mamba")
-    print(f"Student: {model_type}  |  Parameters: {n_params:,}")
+    logger.info("Student: %s | Parameters: %s", model_type, f"{n_params:,}")
+
+    # torch.compile — fuses kernels and eliminates Python overhead.
+    # Gives ~20-40 % throughput improvement on modern CUDA GPUs including GH200.
+    if device.type == "cuda" and train_cfg.get("compile", True):
+        try:
+            model = torch.compile(model)
+            logger.info("torch.compile OK")
+        except Exception as e:
+            logger.warning("torch.compile failed (%s), continuing without compilation", e)
 
     # -----------------------------------------------------------------------
     # Build teacher models (frozen, for distillation)
@@ -131,33 +202,47 @@ def main():
     teacher_weights: Dict[str, float] = {}
     teacher_cfgs: List[dict] = cfg.get("teachers", [])
 
-    for t_cfg in teacher_cfgs:
-        t_name = t_cfg.get("name", "")
-        if not t_name or not t_cfg.get("enabled", True):
-            continue
-        w = float(t_cfg.get("weight", 1.0))
-        try:
-            teacher = build_teacher(t_name, t_cfg, device=str(device))
-            active_teachers[t_name] = teacher
-            teacher_weights[t_name] = w
-            print(f"Teacher registered: {t_name}  (weight={w})")
-        except Exception as e:
-            print(f"Warning: could not register teacher '{t_name}': {e}")
+    # When a pre-built teacher cache exists (data.teacher_cache_dir is set) and
+    # training.skip_live_teachers is true, skip loading the heavy teacher models
+    # entirely.  The trainer will read pseudo-labels from disk; any rare cache
+    # miss simply won't have a distillation term that step.
+    _has_cache = bool(data_cfg.get("teacher_cache_dir"))
+    _skip_live = train_cfg.get("skip_live_teachers", _has_cache)
+
+    if _skip_live and _has_cache:
+        logger.info("Teacher cache found — skipping live teacher loading (skip_live_teachers=True).")
+        logger.info("Run tools/cache_teacher_labels.py to rebuild the cache if needed.")
+    else:
+        for t_cfg in teacher_cfgs:
+            t_name = t_cfg.get("name", "")
+            if not t_name or not t_cfg.get("enabled", True):
+                continue
+            w = float(t_cfg.get("weight", 1.0))
+            try:
+                teacher = build_teacher(t_name, t_cfg, device=str(device))
+                active_teachers[t_name] = teacher
+                teacher_weights[t_name] = w
+                logger.info("Teacher registered: %s (weight=%s)", t_name, w)
+            except Exception as e:
+                logger.warning("Could not register teacher '%s': %s", t_name, e)
 
     if active_teachers:
-        print(f"Active teachers: {list(active_teachers.keys())}")
+        logger.info("Active teachers: %s", list(active_teachers.keys()))
     else:
-        print("No teachers loaded — training with GT depth only")
+        if not _has_cache:
+            logger.info("No teachers loaded — training with GT depth only")
 
     # -----------------------------------------------------------------------
     # Build dataloaders
     # -----------------------------------------------------------------------
-    data_cfg = cfg.get("data", {})
     dataset_type = data_cfg.get("dataset", "tartanair_v2")
 
     if dataset_type == "tartanair_v2":
         from dataloader.tartanair_v2 import TartanAirV2Dataset
 
+        _teacher_cache_dir = data_cfg.get("teacher_cache_dir", None)
+        if _teacher_cache_dir:
+            logger.info("Teacher cache: %s", _teacher_cache_dir)
         train_dataset = TartanAirV2Dataset(
             root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
             num_frames=data_cfg.get("num_frames", 8),
@@ -172,6 +257,7 @@ def main():
             camera=data_cfg.get("camera", "lcam_front"),
             max_depth=data_cfg.get("max_depth", 80.0),
             envs=data_cfg.get("envs", None),
+            teacher_cache_dir=_teacher_cache_dir,
         )
         val_dataset = TartanAirV2Dataset(
             root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
@@ -187,6 +273,7 @@ def main():
             camera=data_cfg.get("camera", "lcam_front"),
             max_depth=data_cfg.get("max_depth", 80.0),
             envs=data_cfg.get("envs", None),
+            teacher_cache_dir=_teacher_cache_dir,
         )
     elif dataset_type == "youtube_vos":
         from dataloader.youtube_vos import YouTubeVOSDataset
@@ -218,6 +305,11 @@ def main():
 
     batch_size = train_cfg.get("batch_size", 2)
     num_workers = train_cfg.get("num_workers", 4)
+    # persistent_workers keeps worker processes alive between epochs, saving
+    # the fork overhead (~1-3 s per epoch on disk-heavy datasets).
+    # prefetch_factor lets workers queue up batches while the GPU is busy.
+    _persistent = num_workers > 0
+    _prefetch = 2 if num_workers > 0 else None
 
     train_loader = DataLoader(
         train_dataset,
@@ -226,6 +318,8 @@ def main():
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
+        persistent_workers=_persistent,
+        prefetch_factor=_prefetch,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -234,8 +328,26 @@ def main():
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
+        persistent_workers=_persistent,
+        prefetch_factor=_prefetch,
     )
-    print(f"Train clips: {len(train_dataset)}  |  Val clips: {len(val_dataset)}")
+
+    # Optional CPU prefetch queue on top of DataLoader worker prefetch.
+    # Useful on shared filesystems where producer jitter can still stall the
+    # training loop despite prefetch_factor.
+    if train_cfg.get("cpu_prefetch", True):
+        cpu_prefetch_batches = int(train_cfg.get("cpu_prefetch_batches", 2))
+        train_loader = CPUPrefetchLoader(train_loader, prefetch=cpu_prefetch_batches)
+        val_loader = CPUPrefetchLoader(val_loader, prefetch=cpu_prefetch_batches)
+    logger.info("Train clips: %d | Val clips: %d", len(train_dataset), len(val_dataset))
+    logger.info(
+        "Dataloader settings: batch_size=%d num_workers=%d persistent_workers=%s prefetch_factor=%s cpu_prefetch=%s",
+        batch_size,
+        num_workers,
+        _persistent,
+        _prefetch,
+        train_cfg.get("cpu_prefetch", True),
+    )
 
     # -----------------------------------------------------------------------
     # Loss, optimizer, scheduler
@@ -287,7 +399,7 @@ def main():
     ema: Optional[EMAModel] = None
     if train_cfg.get("ema_decay", 0) > 0:
         ema = EMAModel(model, decay=train_cfg["ema_decay"])
-        print(f"EMA enabled (decay={train_cfg['ema_decay']})")
+        logger.info("EMA enabled (decay=%s)", train_cfg["ema_decay"])
 
     # -----------------------------------------------------------------------
     # Logging & checkpoints
@@ -295,10 +407,13 @@ def main():
     log_dir = Path(train_cfg.get("log_dir", f"runs/{dataset_type}"))
     writer = SummaryWriter(str(log_dir))
     writer.add_text("config", yaml.dump(cfg), 0)
-    print(f"TensorBoard logs -> {log_dir}  (run: tensorboard --logdir {log_dir})")
+    logger.info("TensorBoard logs -> %s (run: tensorboard --logdir %s)", log_dir, log_dir)
 
     log_img_every = train_cfg.get("log_images_every_n_steps", 50)
     log_img_max_B = train_cfg.get("log_images_max_batch", 2)
+    step_log_every = int(train_cfg.get("step_log_every_n_steps", 0))
+    if args.debug and step_log_every < 1:
+        step_log_every = 1
 
     ckpt_dir = Path(train_cfg.get("checkpoint_dir", f"checkpoints/{dataset_type}"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -311,6 +426,7 @@ def main():
     global_step = 0
 
     if args.resume and os.path.isfile(args.resume):
+        logger.info("Resuming from checkpoint: %s", args.resume)
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -322,7 +438,9 @@ def main():
         global_step = ckpt.get("global_step", 0)
         if ema is not None and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
-        print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.5f}")
+        logger.info("Resumed from epoch %d, best_val_loss=%.5f", start_epoch, best_val_loss)
+    elif args.resume:
+        logger.warning("Resume checkpoint not found: %s", args.resume)
 
     # -----------------------------------------------------------------------
     # Training loop
@@ -330,6 +448,14 @@ def main():
     val_every = train_cfg.get("val_every_n_epochs", 5)
     grad_clip = train_cfg.get("grad_clip", 1.0)
     t_start = time.time()
+    logger.info(
+        "Training loop: start_epoch=%d max_epochs=%d val_every=%d grad_clip=%.3f",
+        start_epoch,
+        max_epochs,
+        val_every,
+        grad_clip,
+    )
+    logger.info("Step logging: every_n_steps=%d", step_log_every)
 
     # tqdm settings — throttle in SLURM non-TTY
     _is_tty = sys.stdout.isatty()
@@ -355,6 +481,8 @@ def main():
 
         # Update curriculum degradation scale (no-op until degradation is wired in)
         deg_scale = curriculum.get_scale(epoch)
+        if args.verbose or args.debug:
+            logger.info("Epoch %d/%d started | global_step=%d | deg_scale=%.3f", epoch + 1, max_epochs, global_step, deg_scale)
         writer.add_scalar("train/degradation_scale", deg_scale, epoch)
 
         # Train one epoch
@@ -375,7 +503,11 @@ def main():
             teacher_weights=teacher_weights if active_teachers else None,
             log_img_every=log_img_every,
             log_img_max_B=log_img_max_B,
+            grad_accum_steps=train_cfg.get("gradient_accumulation_steps", 1),
+            logger=logger,
+            step_log_every_n_steps=step_log_every,
         )
+        logger.debug("Epoch %d finished train_one_epoch | avg_loss=%.6f | global_step=%d", epoch + 1, avg_loss, global_step)
         epoch_time = time.time() - epoch_t0
 
         # ETA
@@ -443,6 +575,7 @@ def main():
                     global_step, best_val_loss, cfg, ema,
                 )
                 tqdm.write(f"  -> Best saved (val_loss={best_val_loss:.5f})")
+                logger.info("New best checkpoint saved: val_loss=%.5f (epoch=%d)", best_val_loss, epoch + 1)
 
         # Save latest checkpoint every epoch
         _save_ckpt(
@@ -450,6 +583,7 @@ def main():
             epoch, model, optimizer, scaler, scheduler,
             global_step, best_val_loss, cfg, ema,
         )
+        logger.debug("Saved latest checkpoint for epoch %d", epoch + 1)
 
     # -----------------------------------------------------------------------
     # Final profiling
@@ -460,15 +594,15 @@ def main():
     )
     try:
         latency = profiler.measure(model, device)
-        print(f"\nLatency: {latency['fps']:.1f} FPS, {latency['ms_per_frame']:.1f} ms/frame")
+        logger.info("Latency: %.1f FPS, %.1f ms/frame", latency["fps"], latency["ms_per_frame"])
         if not latency["meets_target"]:
-            print("  WARNING: Does not meet 30 FPS target!")
+            logger.warning("Does not meet 30 FPS target")
     except Exception as e:
-        print(f"Latency profiling skipped: {e}")
+        logger.warning("Latency profiling skipped: %s", e)
 
     writer.close()
-    print(f"\nTraining complete. Best val loss: {best_val_loss:.5f}")
-    print(f"Checkpoints in: {ckpt_dir}")
+    logger.info("Training complete. Best val loss: %.5f", best_val_loss)
+    logger.info("Checkpoints in: %s", ckpt_dir)
 
 
 if __name__ == "__main__":

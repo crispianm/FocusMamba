@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from pathlib import Path
@@ -148,6 +149,9 @@ def train_one_epoch(
     teacher_weights: Optional[Dict[str, float]] = None,
     log_img_every: int = 50,
     log_img_max_B: int = 2,
+    grad_accum_steps: int = 1,
+    logger: Optional[logging.Logger] = None,
+    step_log_every_n_steps: int = 0,
 ) -> tuple[float, int]:
     """Run one training epoch.
 
@@ -157,6 +161,14 @@ def train_one_epoch(
         2. Degradation: batch has ``degraded_frames`` + ``clean_frames``.
            Student runs on degraded, teachers on clean.
 
+    Teacher pseudo-labels are loaded from ``batch["cached_teacher_depths"]`` when
+    present (pre-cached with ``tools/cache_teacher_labels.py``), falling back to
+    live inference only for any teacher not found in the cache.
+
+    When ``grad_accum_steps > 1`` the optimizer is stepped only every
+    ``grad_accum_steps`` micro-batches, giving a larger effective batch size
+    without increasing VRAM usage.
+
     Returns:
         (avg_loss, updated_global_step)
     """
@@ -164,7 +176,11 @@ def train_one_epoch(
     running_loss = 0.0
     n_batches = 0
 
-    for batch in tqdm(loader, desc="Train", unit="it", leave=False):
+    optimizer.zero_grad(set_to_none=True)
+
+    for micro_step, batch in enumerate(tqdm(loader, desc="Train", unit="it", leave=False)):
+        is_accum_step = ((micro_step + 1) % grad_accum_steps != 0)
+
         # ── Resolve input frames ────────────────────────────────────────
         if "degraded_frames" in batch:
             student_input = batch["degraded_frames"].to(device)
@@ -178,29 +194,49 @@ def train_one_epoch(
         if gt_depth is not None:
             gt_depth = gt_depth.to(device)  # (B, 1, T, H, W)
 
-        optimizer.zero_grad(set_to_none=True)
-
+        # Mark the start of a new CUDAGraph step so that torch.compile
+        # (mode="reduce-overhead") knows it is safe to overwrite the output
+        # buffers recorded from the previous iteration.  Without this call,
+        # pin_memory DataLoader buffers are recycled before the backward pass
+        # has finished reading them, causing the "overwritten by a subsequent
+        # run" RuntimeError.
+        # torch.compiler.cudagraph_mark_step_begin()
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             # Student forward
             student_outputs = model(student_input)
             student_depth = student_outputs["depth"]
 
-            # Guard: skip if non-finite
-            if not torch.isfinite(student_depth).all():
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            # # Guard: skip if non-finite
+            # if not torch.isfinite(student_depth).all():
+            #     if not is_accum_step:
+            #         optimizer.zero_grad(set_to_none=True)
+            #     continue
 
-            # Teacher forward on clean input (no grad)
-            teacher_depths = {}
+            # ── Teacher depths ────────────────────────────────────────
+            # Priority 1: cached pseudo-labels from disk (fast, no GPU cost).
+            # Priority 2: live teacher inference (slow, kept as fallback).
+            teacher_depths: Dict[str, torch.Tensor] = {}
+
+            # Load from cache if the batch carries pre-computed depths
+            cached_batch: Optional[Dict[str, torch.Tensor]] = batch.get("cached_teacher_depths")
+            if cached_batch is not None:
+                for t_name, td in cached_batch.items():
+                    # td: (B, 1, T, H, W) from collation of per-sample (1, T, H, W) tensors
+                    teacher_depths[t_name] = td.to(device, non_blocking=True)
+
+            # Fall back to live inference for any teacher missing from cache
             if teachers:
-                with torch.no_grad():
-                    for name, teacher in teachers.items():
-                        try:
-                            teacher_depths[name] = teacher.predict(teacher_input)
-                        except Exception:
-                            pass
+                missing = [n for n in teachers if n not in teacher_depths]
+                if missing:
+                    with torch.no_grad():
+                        for name in missing:
+                            try:
+                                teacher_depths[name] = teachers[name].predict(teacher_input)
+                            except Exception:
+                                pass
 
-            # Compute combined loss
+            # Compute combined loss; scale by 1/grad_accum_steps so that
+            # accumulated gradients equal the true gradient for the macro-batch.
             losses = criterion(
                 student_outputs=student_outputs,
                 teacher_depths=teacher_depths if teacher_depths else None,
@@ -208,35 +244,63 @@ def train_one_epoch(
             )
 
         total_loss = losses["total"]
-        if not torch.isfinite(total_loss):
-            optimizer.zero_grad(set_to_none=True)
-            continue
+        # if not torch.isfinite(total_loss):
+        #     if not is_accum_step:
+        #         optimizer.zero_grad(set_to_none=True)
+        #     continue
 
-        scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
+        scaled_loss = total_loss / grad_accum_steps
+        scaler.scale(scaled_loss).backward()
 
-        # NaN gradient guard
-        grads_ok = all(
-            p.grad is None or torch.isfinite(p.grad).all()
-            for p in model.parameters()
-        )
-        if not grads_ok:
-            optimizer.zero_grad(set_to_none=True)
+        # Only update weights at the end of each accumulation window
+        if not is_accum_step:
+            scaler.unscale_(optimizer)
+
+            # NaN gradient guard
+            grads_ok = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for p in model.parameters()
+            )
+            if not grads_ok:
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
             scaler.update()
-            continue
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-
-        # EMA update
-        if ema is not None:
-            ema.update()
+            # EMA update
+            if ema is not None:
+                ema.update()
 
         running_loss += total_loss.item()
         n_batches += 1
         global_step += 1
+
+        if logger is not None and step_log_every_n_steps > 0 and (global_step % step_log_every_n_steps == 0):
+            current_lr = optimizer.param_groups[0]["lr"]
+            component_items = []
+            for k, v in losses.items():
+                if k == "total":
+                    continue
+                if isinstance(v, torch.Tensor):
+                    component_items.append(f"{k}={float(v.detach().item()):.6f}")
+                else:
+                    component_items.append(f"{k}={float(v):.6f}")
+            component_str = " | ".join(component_items) if component_items else "no_components"
+            logger.debug(
+                "step=%d micro_step=%d lr=%.8f total_loss=%.6f accum=%d/%d | %s",
+                global_step,
+                micro_step,
+                current_lr,
+                float(total_loss.detach().item()),
+                (micro_step % grad_accum_steps) + 1,
+                grad_accum_steps,
+                component_str,
+            )
 
         # TensorBoard logging — scalars
         if global_step % 50 == 0:
@@ -313,6 +377,7 @@ def validate(
         if gt_depth is not None:
             gt_depth = gt_depth.to(device)
 
+        # torch.compiler.cudagraph_mark_step_begin()
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             outputs = model(frames)
             pred_depth = outputs["depth"]

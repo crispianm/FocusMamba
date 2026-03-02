@@ -88,5 +88,12 @@ class DepthAnythingV3Teacher(TeacherBase):
         output = self.model(x)  # dict: depth (B, N, H, W), sky (B, N, 1, H, W)
         depth = output["depth"]  # (1, 1, H, W) — (B=1, N=1, H, W)
 
+        # Zero out sky pixels so they are excluded by the GT validity mask
+        # during training.  sky is relu-activated: any positive value = sky.
+        sky = output.get("sky")  # (1, 1, 1, H, W) or None
+        if sky is not None:
+            sky_mask = sky.squeeze(2) > 0.1  # (1, 1, H, W) bool
+            depth = depth.masked_fill(sky_mask, 0.0)
+
         # depth shape is (1, 1, H, W) which matches expected (B=1, C=1, H, W).
         return depth

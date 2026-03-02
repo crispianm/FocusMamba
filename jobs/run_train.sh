@@ -8,7 +8,12 @@
 #   1. Edit PROJECT_DIR and CONFIG below if needed.
 #   2. Make sure uv is installed on Isambard:
 #        curl -LsSf https://astral.sh/uv/install.sh | sh
-#   3. Verify checkpoints are in ./checkpoints/ if using teachers:
+#   3. Run teacher label caching BEFORE this job (one-time, ~2-4 h):
+#        sbatch jobs/run_cache_teachers.sh
+#      This eliminates ~2.5 s/it of teacher inference overhead and is the
+#      single largest training speed-up.  Using the cache the expected
+#      throughput on a GH200 is ~0.25-0.35 s/it (vs 2.68 s/it uncached).
+#   4. Verify checkpoints are in ./checkpoints/ if using teachers:
 #        checkpoints/da3_metric.safetensors
 #        checkpoints/config.json               (DA3 config, same dir as above)
 #        checkpoints/depth_pro.pt
@@ -26,8 +31,8 @@
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
-#SBATCH --mem=60G
-#SBATCH --cpus-per-task=8
+#SBATCH --mem=80G
+#SBATCH --cpus-per-task=16
 #SBATCH --output=./logs/focusmamba_train_%j.out
 #SBATCH --error=./logs/focusmamba_train_%j.err
 
@@ -58,24 +63,12 @@ source .venv/bin/activate
 
 which uv || { echo "ERROR: uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
 echo "uv: $(uv --version)"
-
-uv sync --locked
-
 source .venv/bin/activate
 
 # ---------------------------------------------------------------------------
 # Verify GPU visibility
 # ---------------------------------------------------------------------------
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}')"
-
-# ---------------------------------------------------------------------------
-# Pre-flight: verify teacher imports (skip if no teachers in config)
-# ---------------------------------------------------------------------------
-echo "--- Checking teacher imports ---"
-if ! python jobs/check_teachers.py --dry-run; then
-    echo "WARNING: Teacher import check failed — continuing anyway (GT-only training)."
-fi
-echo "--- Pre-flight done ---"
 
 # ---------------------------------------------------------------------------
 # Training — auto-resume from latest checkpoint if it exists
@@ -93,6 +86,8 @@ fi
 
 python train.py \
     --config "$CONFIG" \
+    --verbose \
+    --debug \
     $RESUME_FLAG
 
 echo "========================================"
