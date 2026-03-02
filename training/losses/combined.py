@@ -32,6 +32,7 @@ class CombinedLoss(nn.Module):
         super().__init__()
 
         self.si_log_weight = cfg.get("si_log_weight", 1.0)
+        self.distillation_weight = cfg.get("distillation_weight", 1.0)
         self.gradient_weight = cfg.get("gradient_weight", 0.0)
         self.temporal_weight = cfg.get("temporal_weight", 0.0)
         self.uncertainty_weight = cfg.get("uncertainty_nll_weight", 0.0)
@@ -84,17 +85,24 @@ class CombinedLoss(nn.Module):
         losses: Dict[str, torch.Tensor] = {}
         total = torch.tensor(0.0, device=student_depth.device, requires_grad=True)
 
-        # 1. Distillation loss (primary training signal)
+        # Auto-derive a validity mask from GT depth when none is supplied.
+        # TartanAir encodes invalid/sky pixels as depth=0; excluding them prevents
+        # sky pixels in teacher outputs (e.g. DepthPro ~10 000 m) from corrupting
+        # the SI-log loss.  A mask provided by the caller always takes precedence.
+        if mask is None and gt_depth is not None:
+            mask = (gt_depth > 0).float()
+
+        # 1. Distillation loss (from teacher pseudo-labels)
         if self.distillation is not None and teacher_depths:
             distill_losses = self.distillation(student_depth, teacher_depths, mask)
             distill_total = distill_losses.get("total", torch.tensor(0.0))
-            total = total + self.si_log_weight * distill_total
+            total = total + (self.distillation_weight * distill_total)
             losses.update(distill_losses)
 
-        # 2. Direct SI-log loss against GT (if available)
-        elif gt_depth is not None:
+        # 2. Direct SI-log loss against GT (additive with distillation when both available)
+        if gt_depth is not None:
             si_loss = self.si_log(student_depth, gt_depth, mask)
-            total = total + self.si_log_weight * si_loss
+            total = total + (self.si_log_weight * si_loss)
             losses["si_log"] = si_loss.detach()
 
         # 3. Gradient smoothness loss (if implemented)
@@ -102,7 +110,7 @@ class CombinedLoss(nn.Module):
             target = gt_depth if gt_depth is not None else list(teacher_depths.values())[0]
             try:
                 grad_loss = self._gradient_loss(student_depth, target, mask)
-                total = total + self.gradient_weight * grad_loss
+                total = total + (self.gradient_weight * grad_loss)
                 losses["gradient"] = grad_loss.detach()
             except NotImplementedError:
                 pass
@@ -112,7 +120,7 @@ class CombinedLoss(nn.Module):
             target = gt_depth if gt_depth is not None else list(teacher_depths.values())[0]
             try:
                 temp_loss = self._temporal_loss(student_depth, target, mask)
-                total = total + self.temporal_weight * temp_loss
+                total = total + (self.temporal_weight * temp_loss)
                 losses["temporal"] = temp_loss.detach()
             except NotImplementedError:
                 pass
@@ -126,7 +134,7 @@ class CombinedLoss(nn.Module):
                 nll_loss = self._uncertainty_nll(
                     student_depth, student_outputs["uncertainty"], target
                 )
-                total = total + self.uncertainty_weight * nll_loss
+                total = total + (self.uncertainty_weight * nll_loss)
                 losses["uncertainty_nll"] = nll_loss.detach()
 
         losses["total"] = total

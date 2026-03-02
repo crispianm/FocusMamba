@@ -1,13 +1,12 @@
 """
-Video Depth Anything — Video Teacher Wrapper
-==============================================
+Video Depth Anything — Video Teacher Wrapper (Vendored)
+========================================================
 
-Wraps Video Depth Anything for use as a frozen video-level teacher.
-Unlike image teachers, this processes temporal sequences natively,
-providing temporally consistent depth predictions.
+Wraps the vendored Video Depth Anything model for use as a frozen video-level
+teacher.  Calls forward() directly with ImageNet-normalised tensors — no
+sys.path manipulation, no module stashing.
 
-Repository: https://github.com/DepthAnything/Video-Depth-Anything
-Checkpoint: checkpoints/metric_video_depth_anything_vitl.pth (already present)
+Checkpoint: checkpoints/metric_video_depth_anything_vitl.pth
 
 Usage:
     teacher = VideoDepthAnythingTeacher(
@@ -24,6 +23,10 @@ from typing import Optional
 import torch
 
 from .teacher_base import TeacherBase
+
+# ImageNet normalisation used by DINOv2 backbone in Video-Depth-Anything.
+_VDA_MEAN = (0.485, 0.456, 0.406)
+_VDA_STD  = (0.229, 0.224, 0.225)
 
 
 class VideoDepthAnythingTeacher(TeacherBase):
@@ -55,21 +58,24 @@ class VideoDepthAnythingTeacher(TeacherBase):
         return True
 
     def _load_model(self) -> None:
-        """Load Video Depth Anything model.
+        """Load Video Depth Anything (metric vitl) from vendored code."""
+        from .vendor.video_depth_anything import VideoDepthAnything
 
-        TODO: Implement actual model loading.
-        The Video-Depth-Anything/ directory is already present in the project.
-        Expected steps:
-            1. Import from Video-Depth-Anything package
-            2. Instantiate model
-            3. Load checkpoint weights
-            4. self.model = model.to(self.target_device).eval()
-        """
-        raise NotImplementedError(
-            "Implement Video Depth Anything model loading. "
-            "Repo at: Video-Depth-Anything/ in project root. "
-            f"Checkpoint expected at: {self.checkpoint_path}"
+        self.model = VideoDepthAnything(
+            encoder="vitl",
+            features=256,
+            out_channels=[256, 512, 1024, 1024],
+            use_bn=False,
+            use_clstoken=False,
+            # Build with num_frames=32 to match the checkpoint's positional
+            # encoding buffer shape.  temporal_window controls chunking only.
+            num_frames=32,
+            pe="ape",
+            metric=True,
         )
+        state_dict = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
+        self.model.load_state_dict(state_dict)
+        self.model = self.model.to(self.target_device).eval()
 
     def _predict_single_frame(self, frame: torch.Tensor) -> torch.Tensor:
         """Fallback: predict depth for a single frame (image mode).
@@ -82,7 +88,16 @@ class VideoDepthAnythingTeacher(TeacherBase):
         Returns:
             depth: (1, 1, H, W) float32 metric depth in metres.
         """
-        raise NotImplementedError
+        # Run as a 1-frame clip.
+        frame = frame.to(self.target_device)
+        mean = torch.tensor(_VDA_MEAN, device=self.target_device).view(1, 3, 1, 1)
+        std  = torch.tensor(_VDA_STD,  device=self.target_device).view(1, 3, 1, 1)
+        frame_norm = (frame - mean) / std  # (1, C, H, W)
+        # forward expects (B, T, C, H, W)
+        clip_input = frame_norm.unsqueeze(1)  # (1, 1, C, H, W)
+        with torch.no_grad():
+            depth = self.model(clip_input)  # (1, 1, H, W)  B=1, T=1
+        return depth  # (1, 1, H, W) — matches _predict_single_frame contract
 
     def predict(self, clean_frames: torch.Tensor) -> torch.Tensor:
         """Predict depth for a batch of video clips.
@@ -123,10 +138,17 @@ class VideoDepthAnythingTeacher(TeacherBase):
                 t_end = min(t_start + self.temporal_window, T)
                 chunk = clip[:, t_start:t_end]  # (C, T_chunk, H_t, W_t)
 
-                # TODO: Run through video model
-                # chunk_depth = self.model(chunk.unsqueeze(0))
-                # chunk_depths.append(chunk_depth)
-                raise NotImplementedError
+                # chunk: (C, T_chunk, H_t, W_t)
+                # forward expects (B, T, C, H, W)
+                chunk_input = chunk.permute(1, 0, 2, 3).unsqueeze(0)  # (1, T_chunk, C, H_t, W_t)
+
+                mean = torch.tensor(_VDA_MEAN, device=chunk_input.device).view(1, 1, 3, 1, 1)
+                std  = torch.tensor(_VDA_STD,  device=chunk_input.device).view(1, 1, 3, 1, 1)
+                chunk_input = (chunk_input - mean) / std
+
+                with torch.no_grad():
+                    chunk_depth = self.model(chunk_input)  # (1, T_chunk, H_t, W_t)
+                chunk_depths.append(chunk_depth.unsqueeze(1))  # (1, 1, T_chunk, H_t, W_t)
 
             clip_depth = torch.cat(chunk_depths, dim=2)  # (1, 1, T, H_t, W_t)
 
@@ -141,4 +163,5 @@ class VideoDepthAnythingTeacher(TeacherBase):
 
             depths.append(clip_depth)
 
-        return torch.cat(depths, dim=0)  # (B, 1, T, H, W)
+        result = torch.cat(depths, dim=0)  # (B, 1, T, H, W)
+        return result.to(self.target_device)

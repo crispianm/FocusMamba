@@ -5,7 +5,7 @@ Scale-Invariant Logarithmic Depth Loss (SI-Log)
 The primary depth reconstruction loss for metric depth estimation.
 Operates in log-depth space to handle the wide dynamic range of depth values.
 
-SI-log = sqrt(mean(d²) - λ·mean(d)²)
+SI-log = mean(d²) - λ·mean(d)²
 where d = log(pred) - log(gt)
 
 This loss is invariant to global scale shifts while still penalising
@@ -68,5 +68,5 @@ class ScaleInvariantLogLoss(nn.Module):
         d_sq_mean = (log_diff ** 2).mean()
         d_mean_sq = (log_diff.mean()) ** 2
 
-        loss = torch.sqrt(d_sq_mean - self.lambda_si * d_mean_sq + self.eps)
+        loss = d_sq_mean - self.lambda_si * d_mean_sq
         return loss
