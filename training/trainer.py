@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -152,6 +153,7 @@ def train_one_epoch(
     grad_accum_steps: int = 1,
     logger: Optional[logging.Logger] = None,
     step_log_every_n_steps: int = 0,
+    is_main: bool = True,
 ) -> tuple[float, int]:
     """Run one training epoch.
 
@@ -300,19 +302,28 @@ def train_one_epoch(
                 else:
                     component_items.append(f"{k}={float(v):.6f}")
             component_str = " | ".join(component_items) if component_items else "no_components"
+            # Build a string with all loss components (including "total")
+            loss_items = []
+            for k, v in losses.items():
+                try:
+                    val = float(v.detach().item()) if isinstance(v, torch.Tensor) else float(v)
+                except Exception:
+                    val = float("nan")
+                loss_items.append(f"{k}={val:.6f}")
+            loss_str = " | ".join(loss_items)
+
             logger.debug(
-                "step=%d micro_step=%d lr=%.8f total_loss=%.6f accum=%d/%d | %s",
+                "step=%d micro_step=%d lr=%.8f accum=%d/%d | %s",
                 global_step,
                 micro_step,
                 current_lr,
-                float(total_loss.detach().item()),
                 (micro_step % grad_accum_steps) + 1,
                 grad_accum_steps,
-                component_str,
+                loss_str,
             )
 
         # TensorBoard logging — scalars
-        if global_step % 50 == 0:
+        if is_main and global_step % 50 == 0:
             writer.add_scalar("train/loss_total", total_loss.item(), global_step)
             for k, v in losses.items():
                 if k != "total" and isinstance(v, torch.Tensor):
@@ -320,7 +331,7 @@ def train_one_epoch(
             writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
 
         # TensorBoard logging — image grids (matching test_training.py style)
-        if global_step % log_img_every == 0:
+        if is_main and global_step % log_img_every == 0:
             with torch.no_grad():
                 from training.callbacks.visualise_depth import colorise_depth
                 pred_d = student_depth.detach()
@@ -367,6 +378,7 @@ def validate(
     teachers: Optional[Dict[str, nn.Module]] = None,
     teacher_weights: Optional[Dict[str, float]] = None,
     log_img_max_B: int = 2,
+    is_main: bool = True,
 ) -> Dict[str, float]:
     """Run validation and compute depth metrics."""
     model.eval()
@@ -424,7 +436,7 @@ def validate(
             n_batches += 1
 
             # Log one image grid per validation
-            if not logged_image:
+            if is_main and not logged_image:
                 from training.callbacks.visualise_depth import colorise_depth
                 B_vis = min(pred_depth.shape[0], log_img_max_B)
                 rows = []
@@ -451,10 +463,18 @@ def validate(
     avg_metrics = {k: v / n_batches for k, v in metric_accum.items()}
     avg_metrics["loss"] = total_loss / n_batches
 
-    # Log to TensorBoard
-    writer.add_scalar("val/loss", avg_metrics["loss"], epoch)
-    for k, v in avg_metrics.items():
-        if k != "loss":
-            writer.add_scalar(f"val/{k}", v, epoch)
+    # Aggregate metrics across all DDP ranks so rank-0 sees the global average
+    if dist.is_available() and dist.is_initialized():
+        for key in list(avg_metrics.keys()):
+            t = torch.tensor(avg_metrics[key], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+            avg_metrics[key] = t.item()
+
+    # Log to TensorBoard (rank 0 only)
+    if is_main:
+        writer.add_scalar("val/loss", avg_metrics["loss"], epoch)
+        for k, v in avg_metrics.items():
+            if k != "loss":
+                writer.add_scalar(f"val/{k}", v, epoch)
 
     return avg_metrics

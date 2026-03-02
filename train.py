@@ -44,8 +44,11 @@ from typing import Dict, List, Optional
 from tqdm import tqdm
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 import yaml
@@ -147,6 +150,27 @@ def main():
     args = parser.parse_args()
 
     logger = _setup_logger(debug=args.debug, verbose=args.verbose, log_file=args.verbose_log_file)
+
+    # ── Distributed setup ────────────────────────────────────────────────────
+    local_rank  = int(os.environ.get("LOCAL_RANK", 0))
+    world_size  = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = world_size > 1
+
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    elif args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    is_main = (local_rank == 0)  # only rank 0 does logging / checkpointing
+
+    # Only rank 0 writes logs to avoid 4× duplicate output
+    if not is_main:
+        logging.disable(logging.CRITICAL)
+
     logger.info("Starting training script")
     logger.info(
         "Args: config=%s resume=%s device=%s verbose=%s debug=%s verbose_log_file=%s",
@@ -165,11 +189,7 @@ def main():
         cfg = yaml.safe_load(f)
     logger.debug("Loaded config:\n%s", pformat(cfg, sort_dicts=False))
 
-    device = torch.device(
-        args.device if args.device else
-        ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    logger.info("Device: %s", device)
+    logger.info("Device: %s  |  world_size=%d  local_rank=%d", device, world_size, local_rank)
 
     train_cfg = cfg.get("training", {})
     data_cfg = cfg.get("data", {})
@@ -195,6 +215,10 @@ def main():
             logger.info("torch.compile OK")
         except Exception as e:
             logger.warning("torch.compile failed (%s), continuing without compilation", e)
+
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        logger.info("DDP: world_size=%d local_rank=%d", world_size, local_rank)
 
     # -----------------------------------------------------------------------
     # Build teacher models (frozen, for distillation)
@@ -312,10 +336,27 @@ def main():
     _persistent = num_workers > 0
     _prefetch = 2 if num_workers > 0 else None
 
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=True,
+        drop_last=True,
+    ) if is_distributed else None
+
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=False,
+        drop_last=False,
+    ) if is_distributed else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
@@ -326,6 +367,7 @@ def main():
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
@@ -365,6 +407,18 @@ def main():
             {"name": n, "weight": teacher_weights.get(n, 1.0), "loss": "si_log"}
             for n in active_teachers.keys()
         ])
+    # When using cached teacher depths (no live teachers), enable distillation
+    # from the teacher configs in the YAML so CombinedLoss creates the
+    # DistillationLoss module.  Cached depths are keyed by teacher name and
+    # loaded by the DataLoader — no live teacher models are needed.
+    if not active_teachers and _has_cache and teacher_cfgs:
+        distillation_cfg["enabled"] = True
+        distillation_cfg.setdefault("teachers", [
+            {"name": t["name"], "weight": float(t.get("weight", 1.0)), "loss": "si_log"}
+            for t in teacher_cfgs if t.get("enabled", True)
+        ])
+        logger.info("Distillation enabled from cached teacher depths: %s",
+                    [t["name"] for t in distillation_cfg["teachers"]])
     criterion = CombinedLoss(cfg=loss_cfg, distillation_cfg=distillation_cfg)
 
     lr = train_cfg.get("learning_rate", 2e-4)
@@ -377,6 +431,10 @@ def main():
 
     max_epochs = train_cfg.get("max_epochs", 50)
     warmup_steps = train_cfg.get("warmup_steps", 200)
+    # n_train_batches is captured from the DataLoader that already has
+    # DistributedSampler attached, so it already reflects the per-rank step
+    # count (DistributedSampler.__len__ returns ceil(len(dataset)/world_size)).
+    # No further division by world_size is needed.
     total_steps = max_epochs * max(n_train_batches, 1)
 
     scheduler = WarmupCosineScheduler(
@@ -410,8 +468,11 @@ def main():
     # Logging & checkpoints
     # -----------------------------------------------------------------------
     log_dir = Path(train_cfg.get("log_dir", f"runs/{dataset_type}"))
-    writer = SummaryWriter(str(log_dir))
-    writer.add_text("config", yaml.dump(cfg), 0)
+    if is_main:
+        writer = SummaryWriter(str(log_dir))
+        writer.add_text("config", yaml.dump(cfg), 0)
+    else:
+        writer = None
     logger.info("TensorBoard logs -> %s (run: tensorboard --logdir %s)", log_dir, log_dir)
 
     log_img_every = train_cfg.get("log_images_every_n_steps", 50)
@@ -486,17 +547,24 @@ def main():
         unit="epoch",
         initial=start_epoch,
         total=max_epochs,
+        disable=not is_main,
         **_TQDM,
     )
 
     for epoch in epoch_bar:
         epoch_t0 = time.time()
 
+        # Shuffle sampler for this epoch — required so each rank sees a
+        # different shard on every epoch; no-op when running single-GPU.
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # Update curriculum degradation scale (no-op until degradation is wired in)
         deg_scale = curriculum.get_scale(epoch)
         if args.verbose or args.debug:
             logger.info("Epoch %d/%d started | global_step=%d | deg_scale=%.3f", epoch + 1, max_epochs, global_step, deg_scale)
-        writer.add_scalar("train/degradation_scale", deg_scale, epoch)
+        if is_main:
+            writer.add_scalar("train/degradation_scale", deg_scale, epoch)
 
         # Train one epoch
         avg_loss, global_step = train_one_epoch(
@@ -519,6 +587,7 @@ def main():
             grad_accum_steps=train_cfg.get("gradient_accumulation_steps", 1),
             logger=logger,
             step_log_every_n_steps=step_log_every,
+            is_main=is_main,
         )
         logger.debug("Epoch %d finished train_one_epoch | avg_loss=%.6f | global_step=%d", epoch + 1, avg_loss, global_step)
         epoch_time = time.time() - epoch_t0
@@ -529,15 +598,16 @@ def main():
         eta_s = elapsed / epochs_done * (max_epochs - epoch - 1)
         eta_m = eta_s / 60.0
 
-        tqdm.write(
-            f"Epoch {epoch + 1}/{max_epochs}  "
-            f"train_loss={avg_loss:.5f}  "
-            f"deg_scale={deg_scale:.2f}  "
-            f"time={epoch_time:.1f}s  "
-            f"ETA={eta_m:.1f}min"
-        )
-        epoch_bar.set_postfix(train_loss=f"{avg_loss:.5f}")
-        writer.add_scalar("train/epoch_loss", avg_loss, epoch)
+        if is_main:
+            tqdm.write(
+                f"Epoch {epoch + 1}/{max_epochs}  "
+                f"train_loss={avg_loss:.5f}  "
+                f"deg_scale={deg_scale:.2f}  "
+                f"time={epoch_time:.1f}s  "
+                f"ETA={eta_m:.1f}min"
+            )
+            epoch_bar.set_postfix(train_loss=f"{avg_loss:.5f}")
+            writer.add_scalar("train/epoch_loss", avg_loss, epoch)
 
         # -------------------------------------------------------------------
         # Validation
@@ -558,6 +628,7 @@ def main():
                 teachers=active_teachers if active_teachers else None,
                 teacher_weights=teacher_weights if active_teachers else None,
                 log_img_max_B=log_img_max_B,
+                is_main=is_main,
             )
 
             if ema is not None:
@@ -566,21 +637,22 @@ def main():
             val_loss = val_metrics.get("loss", float("inf"))
             abs_rel = val_metrics.get("abs_rel", float("inf"))
             delta1 = val_metrics.get("delta1", 0.0)
-            tqdm.write(
-                f"  Val — loss={val_loss:.5f}  "
-                f"AbsRel={abs_rel:.5f}  "
-                f"d1={delta1:.4f}  "
-                f"RMSE={val_metrics.get('rmse', 0):.4f}  "
-                f"SI-log={val_metrics.get('si_log', 0):.5f}"
-            )
-            epoch_bar.set_postfix(
-                train_loss=f"{avg_loss:.5f}",
-                val_loss=f"{val_loss:.5f}",
-            )
-            writer.add_scalar("val/epoch_loss", val_loss, epoch)
+            if is_main:
+                tqdm.write(
+                    f"  Val — loss={val_loss:.5f}  "
+                    f"AbsRel={abs_rel:.5f}  "
+                    f"d1={delta1:.4f}  "
+                    f"RMSE={val_metrics.get('rmse', 0):.4f}  "
+                    f"SI-log={val_metrics.get('si_log', 0):.5f}"
+                )
+                epoch_bar.set_postfix(
+                    train_loss=f"{avg_loss:.5f}",
+                    val_loss=f"{val_loss:.5f}",
+                )
+                writer.add_scalar("val/epoch_loss", val_loss, epoch)
 
-            # Save best checkpoint
-            if val_loss < best_val_loss:
+            # Save best checkpoint (rank 0 only)
+            if is_main and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 _save_ckpt(
                     ckpt_dir / "best.pt",
@@ -590,32 +662,38 @@ def main():
                 tqdm.write(f"  -> Best saved (val_loss={best_val_loss:.5f})")
                 logger.info("New best checkpoint saved: val_loss=%.5f (epoch=%d)", best_val_loss, epoch + 1)
 
-        # Save latest checkpoint every epoch
-        _save_ckpt(
-            ckpt_dir / "latest.pt",
-            epoch, model, optimizer, scaler, scheduler,
-            global_step, best_val_loss, cfg, ema,
-        )
+        # Save latest checkpoint every epoch (rank 0 only)
+        if is_main:
+            _save_ckpt(
+                ckpt_dir / "latest.pt",
+                epoch, model, optimizer, scaler, scheduler,
+                global_step, best_val_loss, cfg, ema,
+            )
         logger.debug("Saved latest checkpoint for epoch %d", epoch + 1)
 
     # -----------------------------------------------------------------------
-    # Final profiling
+    # Final profiling (rank 0 only)
     # -----------------------------------------------------------------------
-    profiler = LatencyProfiler(
-        input_shape=(1, 3, 8, 256, 256),
-        target_fps=30.0,
-    )
-    try:
-        latency = profiler.measure(model, device)
-        logger.info("Latency: %.1f FPS, %.1f ms/frame", latency["fps"], latency["ms_per_frame"])
-        if not latency["meets_target"]:
-            logger.warning("Does not meet 30 FPS target")
-    except Exception as e:
-        logger.warning("Latency profiling skipped: %s", e)
+    if is_main:
+        profiler = LatencyProfiler(
+            input_shape=(1, 3, 8, 256, 256),
+            target_fps=30.0,
+        )
+        try:
+            latency = profiler.measure(model, device)
+            logger.info("Latency: %.1f FPS, %.1f ms/frame", latency["fps"], latency["ms_per_frame"])
+            if not latency["meets_target"]:
+                logger.warning("Does not meet 30 FPS target")
+        except Exception as e:
+            logger.warning("Latency profiling skipped: %s", e)
 
-    writer.close()
+        writer.close()
+
     logger.info("Training complete. Best val loss: %.5f", best_val_loss)
     logger.info("Checkpoints in: %s", ckpt_dir)
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

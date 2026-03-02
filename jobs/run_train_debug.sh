@@ -1,42 +1,29 @@
 #!/bin/bash
 # =============================================================================
-# Isambard-AI (GH200) SLURM job script — FocusMamba full training
-# Uses uv for dependency management.
+# Isambard-AI (GH200) SLURM job script — FocusMamba SINGLE-GPU DEBUG
+#
+# Use this for quick iteration without consuming full-node resources.
+# For 4-GPU distributed training, use jobs/run_train.sh instead.
 # =============================================================================
 #
-# Before submitting:
-#   1. Edit PROJECT_DIR and CONFIG below if needed.
-#   2. Make sure uv is installed on Isambard:
-#        curl -LsSf https://astral.sh/uv/install.sh | sh
-#   3. Run teacher label caching BEFORE this job (one-time, ~2-4 h):
-#        sbatch jobs/run_cache_teachers.sh
-#      This eliminates ~2.5 s/it of teacher inference overhead and is the
-#      single largest training speed-up.  Using the cache the expected
-#      throughput on a GH200 is ~0.25-0.35 s/it (vs 2.68 s/it uncached).
-#   4. Verify checkpoints are in ./checkpoints/ if using teachers:
-#        checkpoints/da3_metric.safetensors
-#        checkpoints/config.json               (DA3 config, same dir as above)
-#        checkpoints/depth_pro.pt
-#        checkpoints/metric_video_depth_anything_vitl.pth
-#
 # Submit with:
-#   sbatch jobs/run_train.sh
+#   sbatch jobs/run_train_debug.sh
 #
 # Monitor with:
 #   squeue --me
-#   tail -f logs/focusmamba_train_<jobid>.out
+#   tail -f logs/focusmamba_debug_<jobid>.out
 # =============================================================================
 
-#SBATCH --job-name=focusmamba_train
+#SBATCH --job-name=focusmamba_debug
 #SBATCH --partition=workq
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
-#SBATCH --time=24:00:00
-#SBATCH --mem=200G
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --time=02:00:00
+#SBATCH --mem=50G
 #SBATCH --cpus-per-task=18
-#SBATCH --output=./logs/focusmamba_train_%j.out
-#SBATCH --error=./logs/focusmamba_train_%j.err
+#SBATCH --output=./logs/focusmamba_debug_%j.out
+#SBATCH --error=./logs/focusmamba_debug_%j.err
 
 set -euo pipefail
 
@@ -50,7 +37,7 @@ CONFIG="configs/experiments/tartanair_v2.yaml"
 # Environment setup
 # ---------------------------------------------------------------------------
 echo "========================================"
-echo " FocusMamba Training"
+echo " FocusMamba Training (DEBUG / Single-GPU)"
 echo " Job ID  : $SLURM_JOB_ID"
 echo " Node    : $(hostname)"
 echo " Config  : $CONFIG"
@@ -59,9 +46,6 @@ echo "========================================"
 
 nvidia-smi --list-gpus
 
-# GH200 NVLink C2C — force NCCL to use NVLink for intra-node comms
-export NCCL_P2P_LEVEL=NVL
-export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export PYTHONFAULTHANDLER=1        # dumps stack trace on segfault
 
@@ -92,12 +76,7 @@ if [ -f "$LATEST_CKPT" ]; then
     RESUME_FLAG="--resume $LATEST_CKPT"
 fi
 
-torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=localhost:29500 \
-    train.py \
+python train.py \
     --config "$CONFIG" \
     --verbose \
     --debug \

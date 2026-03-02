@@ -111,22 +111,24 @@ A drop-in transformer variant (`models/focus_transformer.py`) replaces all Mamba
 
 ### 4.1 Training Loss
 
-**Current trial configuration** (L1 only):
+**Current production loss** (`training/losses/combined.py`, `configs/experiments/tartanair_v2.yaml`):
 
-$$\mathcal{L} = \frac{1}{\sum_i w_i} \sum_{i \in \text{teachers}} w_i \cdot \|D_{\text{student}} - D_i^{\text{teacher}}\|_1$$
+All six components are active simultaneously. GT SI-log and distillation are **additive** — when both ground-truth depth and cached teacher pseudo-labels are available (TartanAir v2 + teacher cache), both signals contribute to every training step:
 
-**Full distillation loss** (`training/losses/combined.py`, `training/losses/distillation.py`):
-- **Scale-invariant log loss** per teacher: $\text{SI-log} = \sqrt{\text{mean}(d^2) - \lambda \cdot \text{mean}(d)^2}$, where $d = \log D_{\text{pred}} - \log D_{\text{gt}}$ and $\lambda = 0.5$.
-- **Confidence weighting**: Where teachers disagree (high inter-teacher log-depth variance), per-pixel loss weight decays exponentially.
-- **Gradient smoothness loss**: Edge-aware depth smoothness. (Stub — to be implemented.)
-- **Temporal consistency loss**: Penalises frame-to-frame depth oscillation. (Stub — to be implemented.)
-- **Uncertainty NLL**: Gaussian NLL with predicted log-variance, encouraging calibrated uncertainty.
+$$\mathcal{L} = \underbrace{\mathcal{L}_{\text{SI-log}}^{\text{GT}}}_{1.0} + \underbrace{\mathcal{L}_{\text{distill}}}_{1.0} + \underbrace{\mathcal{L}_{\text{grad}}}_{1.0} + \underbrace{\mathcal{L}_{\text{TGM}}}_{1.0} + \underbrace{0.2\,\mathcal{L}_{\text{NLL}}}_{0.2}$$
 
-Current default weights (from `configs/base.yaml`):
+- **Scale-invariant log loss** (GT supervision and per-teacher distillation): $\text{SI-log} = \text{mean}(d^2) - \lambda \cdot \text{mean}(d)^2$, where $d = \log D_{\text{pred}} - \log D_{\text{gt}}$ and $\lambda = 0.5$. The squared (non-rooted) form is used for numerical stability — the $\sqrt{\cdot}$ variant has a $1/(2\sqrt{x})$ gradient that diverges as the loss converges.
+- **Multi-teacher distillation** (`training/losses/distillation.py`): Cached pseudo-labels from DA3, Depth Pro, and VDA loaded by the DataLoader. Per-teacher SI-log losses are weight-averaged (weights 1.0 / 0.3 / 1.0). Confidence weighting via inter-teacher log-depth variance is computed but currently informational only.
+- **Edge-aware gradient smoothness loss** (`training/losses/gradient.py`): L1 between spatial gradients of predicted and GT log-depth, evaluated at 4 scales. Encourages sharp depth boundaries aligned with the scene structure.
+- **Temporal gradient matching (TGM) loss** (`training/losses/temporal.py`): From Video Depth Anything (Chen et al., 2025, Eq. 3). Penalises temporal depth oscillation in log-space, masked to static regions where $|\Delta_t \log D_{\text{gt}}| < 0.10$.
+- **Uncertainty NLL**: Gaussian NLL with the model's predicted log-variance, encouraging calibrated aleatoric uncertainty. Weighted at 0.2 to prevent the uncertainty head from dominating early training.
+
+Current weights (`configs/experiments/tartanair_v2.yaml`):
 - `si_log_weight = 1.0`
-- `gradient_weight = 0.5` (TBI)
-- `temporal_weight = 0.2` (TBI)
-- `uncertainty_nll_weight = 0.1`
+- `distillation_weight = 1.0`
+- `gradient_weight = 1.0`
+- `temporal_weight = 1.0`
+- `uncertainty_nll_weight = 0.2`
 
 ### 4.2 Evaluation Metrics
 
@@ -159,13 +161,14 @@ Self-contained training script used for iterative development:
 - **Resume:** `--resume checkpoints/trial_youtube_vos/latest.pt`.
 
 ### 5.2 Full Training Script (`train.py`)
-Feature-complete script for production distillation runs (not yet the primary entry point):
+Primary production training entry point. Used for all TartanAir v2 and multi-teacher distillation runs.
 
-- Multi-teacher distillation with `CombinedLoss`.
-- Degradation curriculum scheduling.
+- **Combined loss**: SI-log (GT) + multi-teacher distillation (cached pseudo-labels) + gradient smoothness + temporal consistency + uncertainty NLL, all active simultaneously.
+- Distillation always enabled from cached teacher pseudo-labels — no live teacher inference required at training time.
+- Degradation curriculum scheduling (inactive for GT-supervised runs).
 - EMA of student weights (decay=0.999).
-- NaN gradient guards.
-- `WarmupCosineScheduler` from `training/trainer.py`.
+- NaN gradient guards on depth, total loss, and per-parameter gradients.
+- `WarmupCosineScheduler` (warmup_steps=500 → cosine decay over 20 epochs).
 - Latency profiling callback at end of training.
 - Depth visualisation callbacks with turbo colourmap.
 
@@ -215,9 +218,11 @@ Fully implemented. Physically motivated low-light + motion blur simulation with 
 | Low-light degradation pipeline | `dataloader/degradation.py` | Poisson + Gaussian + motion blur |
 | Degradation curriculum scheduler | `training/curriculum.py` | Linear warmup → cosine severity ramp |
 | EMA model | `training/ema.py` | Exponential moving average (decay=0.999) |
-| Scale-invariant log loss | `training/losses/scale_invariant.py` | SI-log, λ=0.5 |
+| Scale-invariant log loss | `training/losses/scale_invariant.py` | SI-log squared form (no sqrt), λ=0.5 |
+| Gradient smoothness loss | `training/losses/gradient.py` | Edge-aware L1 gradient matching, 4 scales, log-space |
+| Temporal consistency loss | `training/losses/temporal.py` | TGM (Video Depth Anything Eq. 3), log-space, stability mask |
 | Distillation loss | `training/losses/distillation.py` | Per-teacher SI-log + confidence weighting |
-| Combined loss | `training/losses/combined.py` | Weighted sum of all loss terms |
+| Combined loss | `training/losses/combined.py` | GT + distillation additive; all 5 components active |
 | Depth metrics | `evaluation/metrics/depth_metrics.py` | AbsRel, SqRel, RMSE, δ thresholds |
 | Depth visualisation callback | `training/callbacks/visualise_depth.py` | Turbo colourmap for TensorBoard |
 | Latency profiler | `training/callbacks/latency_profiler.py` | FPS measurement vs target |
@@ -233,8 +238,7 @@ Fully implemented. Physically motivated low-light + motion blur simulation with 
 
 | Component | Location | Status |
 |-----------|----------|--------|
-| Gradient smoothness loss | `training/losses/gradient.py` | `NotImplementedError` |
-| Temporal consistency loss | `training/losses/temporal.py` | `NotImplementedError` |
+
 | Metric3D V2 teacher | `models/teachers/metric3d_v2.py` | `NotImplementedError` |
 | Inference demo | `inference/demo.py` | `NotImplementedError` |
 | CoreML export | `inference/export/export_coreml.py` | `NotImplementedError` |
@@ -328,9 +332,9 @@ All variants share: `patch_size=4`, `t_patch=2`, `d_conv=4`, `expand=2`.
 - `models/teachers/vendor/` — vendored teacher architectures
 
 **Training:**
-- `test_training.py` — current working training entry point
-- `train.py` — full-featured training script (for production use)
-- `training/losses/` — SI-log, distillation, combined loss
+- `train.py` — primary production training entry point
+- `test_training.py` — lightweight trial script (YouTube-VOS + L1, for rapid iteration)
+- `training/losses/` — SI-log, gradient, temporal, distillation, combined loss
 - `training/curriculum.py` — degradation curriculum
 - `training/ema.py` — EMA model
 
@@ -355,7 +359,6 @@ All variants share: `patch_size=4`, `t_patch=2`, `d_conv=4`, `expand=2`.
 
 - Replace all draft claims with measured numbers from training runs.
 - Run full ablation suite (temporal on/off, cross-scan on/off, single vs multi teacher).
-- Implement gradient smoothness and temporal consistency losses, then retrain with full `CombinedLoss`.
 - Wire degradation curriculum to the data pipeline for degradation-robustness experiments.
 - Add failure case analysis (thin structures, sudden depth discontinuities, textureless regions).
 - Profile student FPS at multiple resolutions and compare against teachers.

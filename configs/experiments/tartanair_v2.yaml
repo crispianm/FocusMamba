@@ -68,14 +68,14 @@ teachers:
 
 # ── Training ──────────────────────────────────────────────────────────────
 training:
-  max_epochs: 20
+  max_epochs: 300
   batch_size: 8              # per GPU; effective batch = batch_size × gradient_accumulation_steps
   learning_rate: 2.0e-4
   weight_decay: 0.01
   warmup_steps: 500
   grad_clip: 1.0
   precision: bf16            # bf16 on CUDA; falls back to fp32 on CPU
-  val_every_n_epochs: 5
+  val_every_n_epochs: 2
   ema_decay: 0.999
   num_workers: 8             # GH200 has fast NVLink; more workers = less data stall
 
@@ -101,11 +101,10 @@ training:
   step_log_every_n_steps: 25     # used by train.py debug logger; debug mode forces 1
 
 # ── Loss ──────────────────────────────────────────────────────────────────
-# GT supervision via SI-log loss. Distillation and other terms off by default.
 loss:
-  si_log_weight: 0
+  si_log_weight: 1.0
   l1_weight: 1.0
   distillation_weight: 1.0
-  gradient_weight: 0.0
-  temporal_weight: 0.0
-  uncertainty_nll_weight: 0.0
+  gradient_weight: 1.0
+  temporal_weight: 1.0
+  uncertainty_nll_weight: 0.2
