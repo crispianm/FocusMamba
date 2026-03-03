@@ -5,11 +5,13 @@ Models package — Degradation-Robust Metric Video Depth Estimation
 Provides:
     - FocusMamba:       Mamba-based depth model (primary)
     - FocusTransformer: Transformer-based ablation baseline
+    - VideoDepthAnythingModel: Trainable VDA baseline
     - build_model:      Factory function from config dict
 """
 
 from .focus_mamba import FocusMamba
 from .focus_transformer import FocusTransformer
+from .video_depth_anything_model import VideoDepthAnythingModel
 
 
 def build_model(cfg: dict) -> "torch.nn.Module":
@@ -26,6 +28,7 @@ def build_model(cfg: dict) -> "torch.nn.Module":
         - ``'mamba'``          → :class:`FocusMamba`
         - ``'transformer'``    → :class:`FocusTransformer`
         - ``'conv_baseline'``  → :class:`FocusTransformer` (ablation alias)
+        - ``'video_depth_anything'`` / ``'vda'`` → :class:`VideoDepthAnythingModel`
     """
     import torch  # local import to avoid circular at package level
 
@@ -54,12 +57,21 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             "mlp_ratio": model_cfg.get("transformer_mlp_ratio", cfg.get("transformer_mlp_ratio", 3.15)),
         }
         model = FocusTransformer(**transformer_kwargs)
+    elif model_type in ("video_depth_anything", "vda"):
+        data_cfg = cfg.get("data", {})
+        model = VideoDepthAnythingModel(
+            variant=model_cfg.get("variant", "small"),
+            num_frames=model_cfg.get("num_frames", data_cfg.get("num_frames", 8)),
+            positional_encoding=model_cfg.get("positional_encoding", "ape"),
+            checkpoint_path=model_cfg.get("checkpoint_path", None),
+            strict_checkpoint=bool(model_cfg.get("strict_checkpoint", False)),
+        )
     else:
         raise ValueError(
             f"Unknown model_type '{model_type}'. "
-            f"Must be 'mamba', 'transformer', or 'conv_baseline'."
+            f"Must be 'mamba', 'transformer', 'conv_baseline', or 'video_depth_anything'."
         )
 
     return model
 
-__all__ = ["FocusMamba", "FocusTransformer", "build_model"]
+__all__ = ["FocusMamba", "FocusTransformer", "VideoDepthAnythingModel", "build_model"]

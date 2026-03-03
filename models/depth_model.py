@@ -13,6 +13,6 @@ For the actual implementations, see:
 
 from __future__ import annotations
 
-from models import build_model, FocusMamba, FocusTransformer
+from models import build_model, FocusMamba, FocusTransformer, VideoDepthAnythingModel
 
-__all__ = ["build_model", "FocusMamba", "FocusTransformer"]
+__all__ = ["build_model", "FocusMamba", "FocusTransformer", "VideoDepthAnythingModel"]

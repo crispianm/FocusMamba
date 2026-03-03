@@ -1,0 +1,88 @@
+# TartanAir v2 GT-only sanity run with trainable Video Depth Anything (small).
+#
+# Goal: isolate training-pipeline correctness by replacing FocusMamba with a
+# known-working architecture from the vendored model stack.
+#
+# Distillation/degradation are disabled on purpose in this config.
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  type: video_depth_anything
+  variant: small
+  num_frames: 8
+  positional_encoding: ape
+  # Small VDA checkpoint from:
+  #   https://huggingface.co/depth-anything/Video-Depth-Anything-Small
+  # The GT SI-log objective in this run provides metric supervision.
+  checkpoint_path: checkpoints/video_depth_anything_vits.pth
+  # Keep non-strict so temporal positional buffers can differ if num_frames is changed.
+  strict_checkpoint: false
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  dataset: tartanair_v2
+  root: /projects/b5dh/data/tartanair-v2
+  num_frames: 8
+  # Must be divisible by 14 for VDA patch embedding.
+  image_size: [392, 392]
+  max_trajectories: null
+  clip_stride: 8
+  frame_stride: 1
+  val_fraction: 0.1
+  seed: 42
+  difficulty: Data_easy
+  camera: lcam_front
+  max_depth: 80.0
+  envs: null
+  teacher_cache_dir: null
+
+# GT-only run: no teachers.
+teachers: []
+
+distillation:
+  enabled: false
+  teachers: []
+  confidence_weighted: false
+
+degradation:
+  enabled: false
+  curriculum: false
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  max_epochs: 40
+  batch_size: 2
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  grad_clip: 1.0
+  precision: bf16
+  val_every_n_epochs: 1
+  ema_decay: 0.0
+  num_workers: 12
+  gradient_accumulation_steps: 1
+  compile: false
+  cpu_prefetch: true
+  cpu_prefetch_batches: 2
+
+  log_dir: runs/tartanair_vda_small_gt
+  checkpoint_dir: checkpoints/tartanair_vda_small_gt
+  log_images_every_n_steps: 200
+  log_images_max_batch: 2
+  step_log_every_n_steps: 20
+
+# ---------------------------------------------------------------------------
+# Loss (GT-only)
+# ---------------------------------------------------------------------------
+loss:
+  si_log_weight: 1.0
+  distillation_weight: 0.0
+  gradient_weight: 0.0
+  temporal_weight: 0.0
+  uncertainty_nll_weight: 0.0
