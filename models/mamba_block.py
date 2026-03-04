@@ -15,9 +15,9 @@ import torch
 import torch.nn as nn
 
 try:
-    from mamba_ssm import Mamba
+    from mamba_ssm.modules.mamba_simple import Mamba
 except ImportError:
-    Mamba = None  # graceful degrade for environments without mamba_ssm
+    from mamba_ssm import Mamba
 
 
 # ---------------------------------------------------------------------------

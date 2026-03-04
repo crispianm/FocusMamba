@@ -36,21 +36,42 @@ def build_model(cfg: dict) -> "torch.nn.Module":
     model_cfg = cfg.get("model", cfg)
     model_type = model_cfg.get("type", cfg.get("model_type", "mamba")).lower()
 
-    common_kwargs = dict(
-        in_channels=3,
-        embed_dim=model_cfg.get("embed_dim", cfg.get("embed_dim", 96)),
-        depths=model_cfg.get("encoder_depths", cfg.get("encoder_depths", [2, 2, 4, 2])),
-        patch_size=cfg.get("data", cfg).get("patch_size", cfg.get("patch_size", 4)),
-        t_patch=cfg.get("data", cfg).get("t_patch", cfg.get("t_patch", 2)),
-        d_state=model_cfg.get("d_state", cfg.get("d_state", 16)),
-        d_conv=model_cfg.get("d_conv", cfg.get("d_conv", 4)),
-        expand=model_cfg.get("expand", cfg.get("expand", 2)),
-        predict_uncertainty=cfg.get("loss", {}).get("uncertainty_nll_weight", 0) > 0,
-    )
+    data_cfg = cfg.get("data", {})
+    predict_uncertainty = cfg.get("loss", {}).get("uncertainty_nll_weight", 0) > 0
 
     if model_type == "mamba":
-        model = FocusMamba(**common_kwargs)
+        model = FocusMamba(
+            in_channels=3,
+            variant=model_cfg.get("variant", "small"),
+            embed_dim=model_cfg.get("embed_dim", cfg.get("embed_dim", None)),
+            depths=model_cfg.get("encoder_depths", cfg.get("encoder_depths", None)),
+            patch_size=model_cfg.get("patch_size", data_cfg.get("patch_size", 14)),
+            t_patch=model_cfg.get("t_patch", data_cfg.get("t_patch", 1)),
+            d_state=model_cfg.get("d_state", cfg.get("d_state", 16)),
+            d_conv=model_cfg.get("d_conv", cfg.get("d_conv", 4)),
+            expand=model_cfg.get("expand", cfg.get("expand", 2)),
+            predict_uncertainty=predict_uncertainty,
+            num_blocks=model_cfg.get("num_blocks", None),
+            out_indices=model_cfg.get("out_indices", None),
+            mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
+            num_frames=model_cfg.get("num_frames", data_cfg.get("num_frames", 8)),
+            positional_encoding=model_cfg.get("positional_encoding", "ape"),
+            checkpoint_path=model_cfg.get("checkpoint_path", None),
+            strict_checkpoint=bool(model_cfg.get("strict_checkpoint", False)),
+            require_mamba=bool(model_cfg.get("require_mamba", True)),
+        )
     elif model_type in ("transformer", "conv_baseline"):
+        common_kwargs = dict(
+            in_channels=3,
+            embed_dim=model_cfg.get("embed_dim", cfg.get("embed_dim", 96)),
+            depths=model_cfg.get("encoder_depths", cfg.get("encoder_depths", [2, 2, 4, 2])),
+            patch_size=data_cfg.get("patch_size", cfg.get("patch_size", 4)),
+            t_patch=data_cfg.get("t_patch", cfg.get("t_patch", 2)),
+            d_state=model_cfg.get("d_state", cfg.get("d_state", 16)),
+            d_conv=model_cfg.get("d_conv", cfg.get("d_conv", 4)),
+            expand=model_cfg.get("expand", cfg.get("expand", 2)),
+            predict_uncertainty=predict_uncertainty,
+        )
         # Use the tuned mlp_ratio for parameter matching (see utils/param_check.py)
         transformer_kwargs = {
             **common_kwargs,
@@ -58,7 +79,6 @@ def build_model(cfg: dict) -> "torch.nn.Module":
         }
         model = FocusTransformer(**transformer_kwargs)
     elif model_type in ("video_depth_anything", "vda"):
-        data_cfg = cfg.get("data", {})
         model = VideoDepthAnythingModel(
             variant=model_cfg.get("variant", "small"),
             num_frames=model_cfg.get("num_frames", data_cfg.get("num_frames", 8)),
