@@ -68,11 +68,12 @@ training:
   num_workers: 12
   gradient_accumulation_steps: 1
   compile: false
+  ddp_find_unused_parameters: true
   cpu_prefetch: true
   cpu_prefetch_batches: 2
 
-  log_dir: runs/tartanair_vda_small_gt
-  checkpoint_dir: checkpoints/tartanair_vda_small_gt
+  log_dir: runs/tartanair_vda_small_gt_not_pretrained
+  checkpoint_dir: checkpoints/tartanair_vda_small_gt_not_pretrained
   log_images_every_n_steps: 200
   log_images_max_batch: 2
   step_log_every_n_steps: 20

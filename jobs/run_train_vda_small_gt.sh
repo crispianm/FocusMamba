@@ -33,7 +33,6 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 PROJECT_DIR="/projects/b5dh/FocusMamba"
 CONFIG="configs/experiments/tartanair_vda_small_gt.yaml"
-VDA_CKPT="checkpoints/video_depth_anything_vits.pth"
 
 # ---------------------------------------------------------------------------
 # Environment setup
@@ -60,25 +59,6 @@ source .venv/bin/activate
 which uv || { echo "ERROR: uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
 echo "uv: $(uv --version)"
 
-# ---------------------------------------------------------------------------
-# Ensure small VDA checkpoint exists
-# ---------------------------------------------------------------------------
-if [ ! -f "$VDA_CKPT" ]; then
-  echo "Checkpoint missing: $VDA_CKPT"
-  echo "Downloading video_depth_anything_vits.pth from Hugging Face..."
-  python - <<'PY'
-from pathlib import Path
-from huggingface_hub import hf_hub_download
-
-Path("checkpoints").mkdir(parents=True, exist_ok=True)
-path = hf_hub_download(
-    repo_id="depth-anything/Video-Depth-Anything-Small",
-    filename="video_depth_anything_vits.pth",
-    local_dir="checkpoints",
-)
-print(f"Downloaded checkpoint: {path}")
-PY
-fi
 
 # ---------------------------------------------------------------------------
 # Verify GPU visibility
@@ -88,12 +68,6 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.
 # ---------------------------------------------------------------------------
 # Training — auto-resume from latest checkpoint
 # ---------------------------------------------------------------------------
-LATEST_CKPT="checkpoints/tartanair_vda_small_gt/latest.pt"
-RESUME_FLAG=""
-if [ -f "$LATEST_CKPT" ]; then
-    echo "Resuming from $LATEST_CKPT"
-    RESUME_FLAG="--resume $LATEST_CKPT"
-fi
 
 torchrun \
     --nproc_per_node=4 \
@@ -104,7 +78,6 @@ torchrun \
     --config "$CONFIG" \
     --verbose \
     --debug \
-    $RESUME_FLAG
 
 echo "========================================"
 echo " Finished : $(date)"

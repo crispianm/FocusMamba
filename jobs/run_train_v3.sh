@@ -82,9 +82,25 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.
 # Training — auto-resume from latest checkpoint if it exists
 # ---------------------------------------------------------------------------
 
-# Derive checkpoint dir from config name (strip path and extension)
-CONFIG_NAME="$(basename "$CONFIG" .yaml)"
-LATEST_CKPT="checkpoints/${CONFIG_NAME}/latest.pt"
+# Read checkpoint dir from YAML config (training.checkpoint_dir).
+# Falls back to filename-derived path if the key is missing.
+CHECKPOINT_DIR="$(python - <<'PY' "$CONFIG"
+import sys
+from pathlib import Path
+import yaml
+
+config_path = Path(sys.argv[1])
+with config_path.open("r") as f:
+    cfg = yaml.safe_load(f) or {}
+
+checkpoint_dir = (cfg.get("training", {}) or {}).get("checkpoint_dir")
+if checkpoint_dir:
+    print(checkpoint_dir)
+else:
+    print(f"checkpoints/{config_path.stem}")
+PY
+)"
+LATEST_CKPT="${CHECKPOINT_DIR}/latest.pt"
 
 RESUME_FLAG=""
 if [ -f "$LATEST_CKPT" ]; then

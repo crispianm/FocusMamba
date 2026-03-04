@@ -102,9 +102,11 @@ training:
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
-  si_log_weight: 1.0
-  l1_weight: 1.0
-  distillation_weight: 1.0
-  gradient_weight: 1.0
-  temporal_weight: 1.0
-  uncertainty_nll_weight: 0.2
+  # VDA Eq.(4): L = alpha * L_TGM + beta * L_ssi
+  ssi_weight: 1.0
+  temporal_weight: 10.0
+  temporal_threshold: 0.05
+  temporal_log_space: false
+  ssi_mode: l2
+  # Novelty only: distillation on top of VDA objective.
+  distillation_weight: 0.5

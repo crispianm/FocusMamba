@@ -1,7 +1,6 @@
 # TartanAir v2 — supervised training with ground-truth depth.
 #
-# No degradations. No teachers (optional — add below to enable distillation).
-# GT depth supervision via SI-log loss.
+# No degradations. No teachers 
 #
 # Usage:
 #   python train.py --config configs/experiments/tartanair_v2.yaml
@@ -60,7 +59,7 @@ training:
   num_workers: 8             # GH200 has fast NVLink; more workers = less data stall
 
   # Gradient accumulation: accumulate over N micro-batches before stepping.
-  # Effective batch size = batch_size × gradient_accumulation_steps = 4 × 4 = 16.
+  # Effective batch size = batch_size × gradient_accumulation_steps = 8 × 4 = 32.
   gradient_accumulation_steps: 4
 
   # torch.compile: fuses CUDA kernels, ~20-40 % throughput gain on GH200.
@@ -72,18 +71,22 @@ training:
   # Set false to force live teacher inference (e.g. to rebuild the cache).
   skip_live_teachers: true
 
-  log_dir: runs/tartanair_v2
-  checkpoint_dir: checkpoints/tartanair_v2
+  log_dir: runs/tartanair_gt
+  checkpoint_dir: checkpoints/tartanair_gt
 
   # TensorBoard image logging
   log_images_every_n_steps: 200  # reduced from 50 to avoid I/O overhead
   log_images_max_batch: 2        # how many samples per grid
   step_log_every_n_steps: 25     # used by train.py debug logger; debug mode forces 1
+  verbose_log_file: runs/tartanair_gt/train_verbose.log
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 loss:
-  si_log_weight: 1.0
-  l1_weight: 1.0
-  gradient_weight: 1.0
-  temporal_weight: 1.0
-  uncertainty_nll_weight: 0.2
+  # VDA Eq.(4): L = alpha * L_TGM + beta * L_ssi
+  ssi_weight: 1.0
+  temporal_weight: 10.0
+  temporal_threshold: 0.05
+  temporal_log_space: false
+  ssi_mode: l2
+  # Novelty only: distillation on top of VDA objective.
+  distillation_weight: 0.5
