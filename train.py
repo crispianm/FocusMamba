@@ -8,8 +8,8 @@ metric depth. Supports TartanAir v2 (with GT depth) and YouTube-VOS
 (teacher pseudo-GT only).
 
 Loss modes:
-    - GT L1/SI-log loss against ground-truth depth (TartanAir)
-    - Teacher distillation loss (optional, additive)
+    - VDA-style GT supervision: SSI + TGM (TartanAir)
+    - Teacher distillation loss (optional novelty term)
     - Both simultaneously when GT + teachers are available
 
 Features:
@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import logging
 import os
 import sys
@@ -83,10 +84,12 @@ def _save_ckpt(
     best_val_loss: float,
     cfg: dict,
     ema: Optional[EMAModel] = None,
+    model_is_ema: bool = False,
 ) -> None:
     save_dict = {
         "epoch": epoch,
         "model": model.state_dict(),
+        "model_is_ema": bool(model_is_ema),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -141,15 +144,15 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="Override device")
     parser.add_argument("--verbose", action="store_true", help="Enable additional runtime logging")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument(
-        "--verbose-log-file",
-        type=str,
-        default="runs/train_verbose.log",
-        help="Path for verbose/debug file logging",
-    )
     args = parser.parse_args()
 
-    logger = _setup_logger(debug=args.debug, verbose=args.verbose, log_file=args.verbose_log_file)
+    # Load config first so verbose/debug log file path is controlled by YAML.
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+    train_cfg = cfg.get("training", {})
+    verbose_log_file = train_cfg.get("verbose_log_file", "runs/train_verbose.log")
+
+    logger = _setup_logger(debug=args.debug, verbose=args.verbose, log_file=verbose_log_file)
 
     # ── Distributed setup ────────────────────────────────────────────────────
     local_rank  = int(os.environ.get("LOCAL_RANK", 0))
@@ -173,25 +176,20 @@ def main():
 
     logger.info("Starting training script")
     logger.info(
-        "Args: config=%s resume=%s device=%s verbose=%s debug=%s verbose_log_file=%s",
+        "Args: config=%s resume=%s device=%s verbose=%s debug=%s",
         args.config,
         args.resume,
         args.device,
         args.verbose,
         args.debug,
-        args.verbose_log_file,
     )
     if args.verbose or args.debug:
-        logger.info("Verbose/debug logs are being written to: %s", args.verbose_log_file)
+        logger.info("Verbose/debug logs are being written to: %s", verbose_log_file)
 
-    # Load config
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
     logger.debug("Loaded config:\n%s", pformat(cfg, sort_dicts=False))
 
     logger.info("Device: %s  |  world_size=%d  local_rank=%d", device, world_size, local_rank)
 
-    train_cfg = cfg.get("training", {})
     data_cfg = cfg.get("data", {})
     use_fp16 = train_cfg.get("precision", "bf16") == "fp16" and device.type == "cuda"
     use_amp  = train_cfg.get("precision", "bf16") in ("bf16", "fp16") and device.type == "cuda"
@@ -216,9 +214,28 @@ def main():
         except Exception as e:
             logger.warning("torch.compile failed (%s), continuing without compilation", e)
 
+    # Video-Depth-Anything and FocusMamba-v2 (DPT temporal head) have a few
+    # parameters that can be outside the active loss path. DDP must track
+    # unused parameters for these model families.
+    ddp_find_unused_cfg = train_cfg.get("ddp_find_unused_parameters", None)
+    if ddp_find_unused_cfg is None:
+        ddp_find_unused = model_type in ("video_depth_anything", "mamba")
+    else:
+        ddp_find_unused = bool(ddp_find_unused_cfg)
+
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        logger.info("DDP: world_size=%d local_rank=%d", world_size, local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=ddp_find_unused,
+        )
+        logger.info(
+            "DDP: world_size=%d local_rank=%d find_unused_parameters=%s",
+            world_size,
+            local_rank,
+            ddp_find_unused,
+        )
 
     # -----------------------------------------------------------------------
     # Build teacher models (frozen, for distillation)
@@ -431,11 +448,15 @@ def main():
 
     max_epochs = train_cfg.get("max_epochs", 50)
     warmup_steps = train_cfg.get("warmup_steps", 200)
+    grad_accum_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
     # n_train_batches is captured from the DataLoader that already has
     # DistributedSampler attached, so it already reflects the per-rank step
     # count (DistributedSampler.__len__ returns ceil(len(dataset)/world_size)).
     # No further division by world_size is needed.
-    total_steps = max_epochs * max(n_train_batches, 1)
+    # Scheduler must be parameterized by optimizer steps (not micro-batches)
+    # when gradient accumulation is enabled.
+    steps_per_epoch = max(math.ceil(max(n_train_batches, 1) / grad_accum_steps), 1)
+    total_steps = max_epochs * steps_per_epoch
 
     scheduler = WarmupCosineScheduler(
         optimizer,
@@ -443,6 +464,19 @@ def main():
         total_steps=total_steps,
         min_lr=1e-6,
     )
+    logger.info(
+        "Scheduler: warmup_steps=%d total_steps=%d steps_per_epoch=%d (grad_accum=%d)",
+        warmup_steps,
+        total_steps,
+        steps_per_epoch,
+        grad_accum_steps,
+    )
+    if warmup_steps >= total_steps:
+        logger.warning(
+            "warmup_steps (%d) >= total_steps (%d): LR may stay in warmup for most/all training",
+            warmup_steps,
+            total_steps,
+        )
 
     # -----------------------------------------------------------------------
     # Curriculum scheduler for degradation severity (no-op for now)
@@ -494,11 +528,28 @@ def main():
     if args.resume and os.path.isfile(args.resume):
         logger.info("Resuming from checkpoint: %s", args.resume)
         ckpt = torch.load(args.resume, map_location=device)
+        if ckpt.get("model_is_ema", False):
+            logger.warning(
+                "Resuming from an EMA-weight checkpoint (%s). "
+                "For continued training prefer latest.pt unless this is intentional.",
+                args.resume,
+            )
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
+            # Enforce current run schedule horizons even when resuming from an
+            # older checkpoint trained with a different total_steps policy.
+            scheduler.warmup_steps = warmup_steps
+            scheduler.total_steps = total_steps
+            scheduler.min_lr = 1e-6
+            logger.info(
+                "Scheduler resumed: last_epoch=%d warmup_steps=%d total_steps=%d",
+                scheduler.last_epoch,
+                scheduler.warmup_steps,
+                scheduler.total_steps,
+            )
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         # Sanity-check: old checkpoints stored AbsRel (e.g. 0.083) under a
@@ -584,12 +635,12 @@ def main():
             teacher_weights=teacher_weights if active_teachers else None,
             log_img_every=log_img_every,
             log_img_max_B=log_img_max_B,
-            grad_accum_steps=train_cfg.get("gradient_accumulation_steps", 1),
+            grad_accum_steps=grad_accum_steps,
             logger=logger,
             step_log_every_n_steps=step_log_every,
             is_main=is_main,
         )
-        logger.debug("Epoch %d finished train_one_epoch | avg_loss=%.6f | global_step=%d", epoch + 1, avg_loss, global_step)
+        logger.info("Epoch %d finished | train_loss=%.6f | global_step=%d", epoch + 1, avg_loss, global_step)
         epoch_time = time.time() - epoch_t0
 
         # ETA
@@ -650,15 +701,35 @@ def main():
                     val_loss=f"{val_loss:.5f}",
                 )
                 writer.add_scalar("val/epoch_loss", val_loss, epoch)
+                logger.info(
+                    "Validation epoch %d | loss=%.5f abs_rel=%.5f delta1=%.4f rmse=%.4f si_log=%.5f",
+                    epoch + 1,
+                    val_loss,
+                    abs_rel,
+                    delta1,
+                    val_metrics.get("rmse", 0),
+                    val_metrics.get("si_log", 0),
+                )
 
             # Save best checkpoint (rank 0 only)
             if is_main and val_loss < best_val_loss:
                 best_val_loss = val_loss
-                _save_ckpt(
-                    ckpt_dir / "best.pt",
-                    epoch, model, optimizer, scaler, scheduler,
-                    global_step, best_val_loss, cfg, ema,
-                )
+                if ema is not None:
+                    ema.apply_shadow()
+                    try:
+                        _save_ckpt(
+                            ckpt_dir / "best.pt",
+                            epoch, model, optimizer, scaler, scheduler,
+                            global_step, best_val_loss, cfg, ema, model_is_ema=True,
+                        )
+                    finally:
+                        ema.restore()
+                else:
+                    _save_ckpt(
+                        ckpt_dir / "best.pt",
+                        epoch, model, optimizer, scaler, scheduler,
+                        global_step, best_val_loss, cfg, ema, model_is_ema=False,
+                    )
                 tqdm.write(f"  -> Best saved (val_loss={best_val_loss:.5f})")
                 logger.info("New best checkpoint saved: val_loss=%.5f (epoch=%d)", best_val_loss, epoch + 1)
 
@@ -667,9 +738,9 @@ def main():
             _save_ckpt(
                 ckpt_dir / "latest.pt",
                 epoch, model, optimizer, scaler, scheduler,
-                global_step, best_val_loss, cfg, ema,
+                global_step, best_val_loss, cfg, ema, model_is_ema=False,
             )
-        logger.debug("Saved latest checkpoint for epoch %d", epoch + 1)
+        logger.info("Saved latest checkpoint for epoch %d", epoch + 1)
 
     # -----------------------------------------------------------------------
     # Final profiling (rank 0 only)

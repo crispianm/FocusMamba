@@ -21,6 +21,7 @@ dependencies = [
     "tensorboard>=2.15",
     "torch>=2.7",
     "torchvision>=0.17",
+    "transformers<5",
     "tqdm>=4.66",
     # Teacher runtime deps (minimal — no heavy extras like open3d, pycolmap, xformers)
     "addict>=2.4",             # Depth-Anything-3 config (omegaconf transitive dep)
@@ -36,6 +37,8 @@ dependencies = [
     "timm>=0.9",               # ml-depth-pro (also installed via uv pip install -e)
     "trimesh>=4.0",            # Depth-Anything-3 mesh export (eagerly imported)
     "tartanair",
+    "mamba-ssm",
+    "causal-conv1d",
 ]
 
 # ── PyTorch index ─────────────────────────────────────────────────────────────
@@ -43,6 +46,8 @@ dependencies = [
 torch       = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 tartanair = { git = "https://github.com/castacks/tartanairpy.git" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "v2.2.4" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d.git", rev = "v1.5.0.post8" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -55,3 +60,4 @@ required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'aarch64'"
 ]
+no-build-isolation-package = ["mamba-ssm", "causal-conv1d"]

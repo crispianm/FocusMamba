@@ -74,17 +74,23 @@ Video clip (B, C, T, H, W)
 git clone https://github.com/crispianm/FocusMamba.git
 cd FocusMamba
 
-# 2. Install PyTorch (CUDA 12.8 recommended)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# 2. Install uv (if needed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 3. Install remaining dependencies
-pip install -r requirements.txt
+# 3. Make sure CUDA toolkit tools are available (nvcc is required for mamba-ssm build)
+nvcc --version
+echo "$CUDA_HOME"
 
-# 4. Install the package (editable)
-pip install -e .
+# 4. Create/update the environment
+uv sync
+
+# Optional helper (includes nvcc checks):
+bash tools/install_mamba_deps.sh
 ```
 
-> **Note:** `mamba-ssm` and `causal-conv1d` CUDA kernels are vendored under `mamba_ssm/` and `causal_conv1d/` respectively — no separate wheel installation is required if building from source.
+> **Important:** `mamba-ssm` and `causal-conv1d` are installed as dependencies (not vendored).
+> They require CUDA build tooling. If `uv sync` fails with `nvcc was not found`, load your CUDA
+> module/toolkit first (for example on HPC: `module load cuda`), then re-run `uv sync`.
 
 ---
 
@@ -286,4 +292,3 @@ FocusMamba/
 
 > Working title: *FocusMamba: ROI-Conditioned Spatiotemporal State Space Modeling for Video Focus Map Prediction*  
 > (manuscript in preparation)
-
