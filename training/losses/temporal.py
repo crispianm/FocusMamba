@@ -17,9 +17,8 @@ depth discontinuities at moving-object edges and scene boundaries.
 
 Metric-depth adaptation
 ------------------------
-The paper uses affine-invariant depth. For metric depth (this repo) we
-operate in log-depth space so gradient magnitudes are scale-normalised
-across the full dynamic range.
+The VDA paper computes TGM on scale-shift aligned depth values with a
+threshold of 0.05. This implementation defaults to that behavior.
 """
 
 from __future__ import annotations
@@ -33,16 +32,15 @@ class TemporalConsistencyLoss(nn.Module):
 
     Args:
         threshold:  GT change threshold for the stability mask.
-                    Paper uses 0.05 (affine-invariant space).
-                    For log-metric depth ~0.10 is recommended.
-        log_space:  Operate in log-depth space (recommended for metric depth).
+                    Paper uses 0.05.
+        log_space:  Optional log-depth mode. Defaults to False for VDA parity.
         eps:        Numerical guard for log().
     """
 
     def __init__(
         self,
-        threshold: float = 0.10,
-        log_space: bool = True,
+        threshold: float = 0.05,
+        log_space: bool = False,
         eps: float = 1e-6,
     ):
         super().__init__()

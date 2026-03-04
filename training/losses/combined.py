@@ -2,8 +2,10 @@
 Combined Loss
 ==============
 
-Weighted sum of all loss components: SI-log, distillation, gradient
-smoothness, temporal consistency, and uncertainty NLL.
+Video Depth Anything-style objective with optional distillation novelty.
+
+Total loss:
+    L = beta * L_ssi + alpha * L_tgm + gamma * L_distill
 
 Weights are read from config.
 """
@@ -15,29 +17,30 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from .scale_invariant import ScaleInvariantLogLoss
+from .scale_shift import ScaleShiftInvariantLoss
 from .distillation import DistillationLoss
 
 
 class CombinedLoss(nn.Module):
-    """Weighted combination of all depth estimation losses.
+    """Weighted combination of SSI + TGM (+ distillation).
 
     Args:
         cfg: Loss config dict with keys:
-            si_log_weight, gradient_weight, temporal_weight, uncertainty_nll_weight
+            ssi_weight, temporal_weight, temporal_threshold, temporal_log_space,
+            distillation_weight
         distillation_cfg: Distillation-specific config (teacher configs, etc.)
     """
 
     def __init__(self, cfg: Dict[str, Any], distillation_cfg: Optional[Dict] = None):
         super().__init__()
 
-        self.si_log_weight = cfg.get("si_log_weight", 1.0)
+        # VDA Eq.(4): L_all = alpha * L_TGM + beta * L_ssi
+        # Keep backward-compatibility with older config names.
+        self.ssi_weight = float(cfg.get("ssi_weight", cfg.get("si_log_weight", 1.0)))
+        self.temporal_weight = float(cfg.get("temporal_weight", 10.0))
         self.distillation_weight = cfg.get("distillation_weight", 1.0)
-        self.gradient_weight = cfg.get("gradient_weight", 0.0)
-        self.temporal_weight = cfg.get("temporal_weight", 0.0)
-        self.uncertainty_weight = cfg.get("uncertainty_nll_weight", 0.0)
 
-        self.si_log = ScaleInvariantLogLoss()
+        self.ssi = ScaleShiftInvariantLoss(mode=cfg.get("ssi_mode", "l2"))
 
         # Distillation loss (if teachers are configured)
         self.distillation = None
@@ -47,19 +50,13 @@ class CombinedLoss(nn.Module):
                 confidence_weighted=distillation_cfg.get("confidence_weighted", True),
             )
 
-        # Gradient and temporal losses (to be implemented)
-        self._gradient_loss = None
         self._temporal_loss = None
-
-        try:
-            from .gradient import GradientSmoothnessLoss
-            self._gradient_loss = GradientSmoothnessLoss()
-        except (ImportError, NotImplementedError):
-            pass
-
         try:
             from .temporal import TemporalConsistencyLoss
-            self._temporal_loss = TemporalConsistencyLoss()
+            self._temporal_loss = TemporalConsistencyLoss(
+                threshold=cfg.get("temporal_threshold", 0.05),
+                log_space=cfg.get("temporal_log_space", False),
+            )
         except (ImportError, NotImplementedError):
             pass
 
@@ -99,58 +96,20 @@ class CombinedLoss(nn.Module):
             total = total + (self.distillation_weight * distill_total)
             losses.update(distill_losses)
 
-        # 2. Direct SI-log loss against GT (additive with distillation when both available)
+        # 2. VDA-style GT supervision: SSI + TGM
         if gt_depth is not None:
-            si_loss = self.si_log(student_depth, gt_depth, mask)
-            total = total + (self.si_log_weight * si_loss)
-            losses["si_log"] = si_loss.detach()
+            aligned_pred = self.ssi.align_scale_shift(student_depth, gt_depth, mask=mask)
+            ssi_loss = self.ssi(student_depth, gt_depth, mask=mask, aligned_pred=aligned_pred)
+            total = total + (self.ssi_weight * ssi_loss)
+            losses["ssi"] = ssi_loss.detach()
 
-        # 3. Gradient smoothness loss (if implemented)
-        if self._gradient_loss is not None and self.gradient_weight > 0:
-            target = gt_depth if gt_depth is not None else list(teacher_depths.values())[0]
-            try:
-                grad_loss = self._gradient_loss(student_depth, target, mask)
-                total = total + (self.gradient_weight * grad_loss)
-                losses["gradient"] = grad_loss.detach()
-            except NotImplementedError:
-                pass
-
-        # 4. Temporal consistency loss (if implemented)
-        if self._temporal_loss is not None and self.temporal_weight > 0:
-            target = gt_depth if gt_depth is not None else list(teacher_depths.values())[0]
-            try:
-                temp_loss = self._temporal_loss(student_depth, target, mask)
-                total = total + (self.temporal_weight * temp_loss)
-                losses["temporal"] = temp_loss.detach()
-            except NotImplementedError:
-                pass
-
-        # 5. Uncertainty NLL loss
-        if self.uncertainty_weight > 0 and "uncertainty" in student_outputs:
-            target = gt_depth if gt_depth is not None else (
-                list(teacher_depths.values())[0] if teacher_depths else None
-            )
-            if target is not None:
-                nll_loss = self._uncertainty_nll(
-                    student_depth, student_outputs["uncertainty"], target
-                )
-                total = total + (self.uncertainty_weight * nll_loss)
-                losses["uncertainty_nll"] = nll_loss.detach()
+            if self._temporal_loss is not None and self.temporal_weight > 0:
+                try:
+                    tgm_loss = self._temporal_loss(aligned_pred, gt_depth, mask)
+                    total = total + (self.temporal_weight * tgm_loss)
+                    losses["tgm"] = tgm_loss.detach()
+                except NotImplementedError:
+                    pass
 
         losses["total"] = total
         return losses
-
-    @staticmethod
-    def _uncertainty_nll(
-        pred: torch.Tensor,
-        log_variance: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """Gaussian NLL loss for uncertainty estimation.
-
-        loss = 0.5 * (log_var + (pred - target)² / exp(log_var))
-        """
-        precision = torch.exp(-log_variance)
-        sq_err = (torch.log(pred.clamp(min=1e-6)) - torch.log(target.clamp(min=1e-6))) ** 2
-        nll = 0.5 * (log_variance + precision * sq_err)
-        return nll.mean()
