@@ -17,3 +17,6 @@ core
 *.out
 MTKD_ Multi-Teacher Knowledge Distillation for Image Super-Resolution.html
 vda.html
+*.yaml
+*.sh
+tools/generate_overnight_suite_20260304.py
