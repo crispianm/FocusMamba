@@ -236,6 +236,7 @@ class FocusMamba(nn.Module):
         checkpoint_path: str | None = None,
         strict_checkpoint: bool = False,
         require_mamba: bool = True,
+        output_activation: str = "softplus",
     ) -> None:
         super().__init__()
 
@@ -282,6 +283,12 @@ class FocusMamba(nn.Module):
         self.variant = key
         self.patch_size = 14  # fixed by the VDA DPT head upsample logic
         self.predict_uncertainty = bool(predict_uncertainty)
+        self.output_activation = str(output_activation).lower()
+        if self.output_activation not in {"relu", "softplus", "exp"}:
+            raise ValueError(
+                f"Unsupported FocusMamba output_activation={output_activation!r}. "
+                "Use 'relu', 'softplus', or 'exp'."
+            )
 
         self.backbone = _FocusMambaBackbone(
             in_channels=in_channels,
@@ -382,7 +389,15 @@ class FocusMamba(nn.Module):
 
         depth_bt = self.head(features, patch_h, patch_w, t)[0]   # (B*T,1,H',W')
         depth_bt = F.interpolate(depth_bt, size=(h_pad, w_pad), mode="bilinear", align_corners=True)
-        depth_bt = F.relu(depth_bt)
+        # ReLU can create large dead zones from random init (zero gradient when
+        # output is negative). Softplus keeps positivity while preserving early
+        # gradients, improving scratch training stability.
+        if self.output_activation == "relu":
+            depth_bt = F.relu(depth_bt)
+        elif self.output_activation == "exp":
+            depth_bt = torch.exp(depth_bt)
+        else:
+            depth_bt = F.softplus(depth_bt, beta=1.0)
 
         depth_bthw = depth_bt.squeeze(1).unflatten(0, (b, t))  # (B,T,H_pad,W_pad)
         depth_bthw = depth_bthw[:, :, :h, :w]

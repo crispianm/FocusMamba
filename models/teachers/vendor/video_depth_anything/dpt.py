@@ -51,11 +51,15 @@ class DPTHead(nn.Module):
         features=256, 
         use_bn=False, 
         out_channels=[256, 512, 1024, 1024], 
-        use_clstoken=False
+        use_clstoken=False,
+        patch_size: int = 14,
+        output_activation: str = "relu",
     ):
         super(DPTHead, self).__init__()
         
         self.use_clstoken = use_clstoken
+        self.patch_size = int(patch_size)
+        self.output_activation = str(output_activation).lower()
         
         self.projects = nn.ModuleList([
             nn.Conv2d(
@@ -119,9 +123,18 @@ class DPTHead(nn.Module):
             nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(True),
             nn.Identity(),
         )
+
+    def _apply_output_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.output_activation in ("none", "identity", "linear"):
+            return x
+        if self.output_activation == "softplus":
+            return F.softplus(x)
+        if self.output_activation == "exp":
+            return torch.exp(x)
+        # Default parity with original VDA implementation.
+        return F.relu(x)
     
     def forward(self, out_features, patch_h, patch_w):
         out = []
@@ -153,8 +166,14 @@ class DPTHead(nn.Module):
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
         
         out = self.scratch.output_conv1(path_1)
-        out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
+        out = F.interpolate(
+            out,
+            (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
+            mode="bilinear",
+            align_corners=True,
+        )
         out = self.scratch.output_conv2(out)
+        out = self._apply_output_activation(out)
         
         return out
         

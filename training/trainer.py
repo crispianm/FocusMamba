@@ -130,6 +130,86 @@ def compute_depth_metrics(
     }
 
 
+@torch.no_grad()
+def _normalize_relative_depth(
+    depth: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    *,
+    log_space: bool = True,
+    q_low: float = 0.02,
+    q_high: float = 0.98,
+    clamp: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Per-clip robust normalization to relative depth in [0, 1]."""
+    base = torch.log(depth.clamp(min=eps)) if log_space else depth
+
+    valid = torch.isfinite(base)
+    if mask is not None:
+        valid = valid & mask.bool()
+
+    out = torch.zeros_like(base)
+    b = base.shape[0]
+    for i in range(b):
+        vi = valid[i]
+        if vi.sum() < 8:
+            continue
+        vals = base[i][vi]
+        lo = torch.quantile(vals, q_low)
+        hi = torch.quantile(vals, q_high)
+        denom = (hi - lo).clamp(min=eps)
+        x = (base[i] - lo) / denom
+        if clamp:
+            x = x.clamp(0.0, 1.0)
+        out[i] = torch.where(vi, x, torch.zeros_like(x))
+    return out
+
+
+@torch.no_grad()
+def compute_relative_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    """Compute relative-depth metrics on robustly normalized depth."""
+    if mask is None:
+        mask = gt > 0
+    else:
+        mask = mask.bool()
+
+    pred_rel = _normalize_relative_depth(pred, mask)
+    gt_rel = _normalize_relative_depth(gt, mask)
+
+    valid = mask & torch.isfinite(pred_rel) & torch.isfinite(gt_rel)
+    if not valid.any():
+        return {
+            "rel_l1": float("inf"),
+            "rel_rmse": float("inf"),
+            "rel_delta1": 0.0,
+            # Backward-compatible aliases used by train.py summary logs.
+            "abs_rel": float("inf"),
+            "rmse": float("inf"),
+            "delta1": 0.0,
+        }
+
+    p = pred_rel[valid]
+    g = gt_rel[valid]
+    diff = p - g
+    rel_l1 = diff.abs().mean().item()
+    rel_rmse = (diff ** 2).mean().sqrt().item()
+    ratio = torch.max((p + 1e-6) / (g + 1e-6), (g + 1e-6) / (p + 1e-6))
+    rel_delta1 = (ratio < 1.25).float().mean().item()
+
+    return {
+        "rel_l1": rel_l1,
+        "rel_rmse": rel_rmse,
+        "rel_delta1": rel_delta1,
+        "abs_rel": rel_l1,
+        "rmse": rel_rmse,
+        "delta1": rel_delta1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Training step
 # ---------------------------------------------------------------------------
@@ -208,6 +288,7 @@ def train_one_epoch(
         is_accum_step = ((micro_step + 1) % grad_accum_steps != 0)
         use_no_sync = is_accum_step and hasattr(model, "no_sync")
         sync_ctx = model.no_sync() if use_no_sync else nullcontext()
+        target_mode = getattr(criterion, "target_mode", "metric")
 
         # ── Resolve input frames ────────────────────────────────────────
         if "degraded_frames" in batch:
@@ -237,7 +318,11 @@ def train_one_epoch(
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
                 # Student forward
                 student_outputs = model(student_input)
-                student_depth = student_outputs["depth"]
+                student_depth_metric = student_outputs["depth"]
+                if target_mode == "relative":
+                    student_depth = student_outputs.get("depth_relative", student_depth_metric)
+                else:
+                    student_depth = student_depth_metric
 
                 # Guard: skip if non-finite
                 if not torch.isfinite(student_depth).all():
@@ -343,6 +428,17 @@ def train_one_epoch(
             with torch.no_grad():
                 from training.callbacks.visualise_depth import colorise_depth
                 pred_d = student_depth.detach()
+                if target_mode == "relative":
+                    vis_mask = mask if mask is not None else (gt_depth > 0 if gt_depth is not None else None)
+                    gt_vis = _normalize_relative_depth(gt_depth, vis_mask) if gt_depth is not None else None
+                    teacher_vis = {
+                        t_name: _normalize_relative_depth(td, vis_mask)
+                        for t_name, td in teacher_depths.items()
+                    }
+                else:
+                    gt_vis = gt_depth
+                    teacher_vis = teacher_depths
+
                 B_vis = min(pred_d.shape[0], log_img_max_B)
                 rows = []
                 for b in range(B_vis):
@@ -350,10 +446,10 @@ def train_one_epoch(
                     rgb = student_input[b, :, t_mid].cpu()  # (3, H, W)
                     s_d = pred_d[b, 0, t_mid].cpu()
                     col = [rgb, colorise_depth(s_d)]
-                    if gt_depth is not None:
-                        gt_d = gt_depth[b, 0, t_mid].cpu()
+                    if gt_vis is not None:
+                        gt_d = gt_vis[b, 0, t_mid].cpu()
                         col.append(colorise_depth(gt_d))
-                    for t_name, td in teacher_depths.items():
+                    for t_name, td in teacher_vis.items():
                         col.append(colorise_depth(td[b, 0, t_mid].cpu()))
                     rows.append(torch.cat(col, dim=1))
                 grid = torch.cat(rows, dim=2).clamp(0.0, 1.0)
@@ -361,10 +457,11 @@ def train_one_epoch(
 
                 # Per-teacher and student depth scale
                 writer.add_scalar("mean_depth/student", pred_d.mean().item(), global_step)
-                for t_name, td in teacher_depths.items():
+                writer.add_scalar("mean_depth/student_metric", student_depth_metric.detach().mean().item(), global_step)
+                for t_name, td in teacher_vis.items():
                     writer.add_scalar(f"mean_depth/teacher_{t_name}", td.mean().item(), global_step)
-                if gt_depth is not None:
-                    writer.add_scalar("mean_depth/gt", gt_depth.mean().item(), global_step)
+                if gt_vis is not None:
+                    writer.add_scalar("mean_depth/gt", gt_vis.mean().item(), global_step)
 
     # Flush partial accumulation at epoch end so tail micro-batches are not dropped.
     if n_batches > 0 and (n_batches % grad_accum_steps != 0):
@@ -407,6 +504,7 @@ def validate(
     logged_image = False
 
     for batch in tqdm(loader, desc=f"Val {epoch}", unit="it", leave=False):
+        target_mode = getattr(criterion, "target_mode", "metric")
         # Resolve input frames (same logic as train_one_epoch)
         if "clean_frames" in batch:
             frames = batch["clean_frames"].to(device)
@@ -420,7 +518,11 @@ def validate(
         # torch.compiler.cudagraph_mark_step_begin()
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             outputs = model(frames)
-            pred_depth = outputs["depth"]
+            pred_depth_metric = outputs["depth"]
+            if target_mode == "relative":
+                pred_depth = outputs.get("depth_relative", pred_depth_metric)
+            else:
+                pred_depth = pred_depth_metric
 
             # Teacher inference for distillation validation
             teacher_depths = {}
@@ -449,7 +551,11 @@ def validate(
 
         # Metrics (against GT if available)
         if gt_depth is not None:
-            m = compute_depth_metrics(pred_depth.float(), gt_depth.float())
+            if target_mode == "relative":
+                val_mask = (gt_depth > 0)
+                m = compute_relative_metrics(pred_depth.float(), gt_depth.float(), mask=val_mask)
+            else:
+                m = compute_depth_metrics(pred_depth.float(), gt_depth.float())
             for k, v in m.items():
                 metric_accum[k] = metric_accum.get(k, 0.0) + v
             n_batches += 1
@@ -458,15 +564,25 @@ def validate(
             if is_main and not logged_image:
                 from training.callbacks.visualise_depth import colorise_depth
                 B_vis = min(pred_depth.shape[0], log_img_max_B)
+                if target_mode == "relative":
+                    vis_mask = gt_depth > 0
+                    gt_vis = _normalize_relative_depth(gt_depth, vis_mask)
+                    teacher_vis = {
+                        t_name: _normalize_relative_depth(td, vis_mask)
+                        for t_name, td in teacher_depths.items()
+                    }
+                else:
+                    gt_vis = gt_depth
+                    teacher_vis = teacher_depths
                 rows = []
                 for b in range(B_vis):
                     t_mid = pred_depth.shape[2] // 2
                     rgb = frames[b, :, t_mid].cpu()
                     s_d = pred_depth[b, 0, t_mid].cpu()
                     col = [rgb, colorise_depth(s_d)]
-                    gt_d = gt_depth[b, 0, t_mid].cpu()
+                    gt_d = gt_vis[b, 0, t_mid].cpu()
                     col.append(colorise_depth(gt_d))
-                    for t_name, td in teacher_depths.items():
+                    for t_name, td in teacher_vis.items():
                         col.append(colorise_depth(td[b, 0, t_mid].cpu()))
                     rows.append(torch.cat(col, dim=1))
                 grid = torch.cat(rows, dim=2).clamp(0.0, 1.0)

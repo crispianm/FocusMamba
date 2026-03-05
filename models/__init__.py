@@ -59,6 +59,7 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             checkpoint_path=model_cfg.get("checkpoint_path", None),
             strict_checkpoint=bool(model_cfg.get("strict_checkpoint", False)),
             require_mamba=bool(model_cfg.get("require_mamba", True)),
+            output_activation=model_cfg.get("output_activation", "softplus"),
         )
     elif model_type in ("transformer", "conv_baseline"):
         common_kwargs = dict(
@@ -85,6 +86,13 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             positional_encoding=model_cfg.get("positional_encoding", "ape"),
             checkpoint_path=model_cfg.get("checkpoint_path", None),
             strict_checkpoint=bool(model_cfg.get("strict_checkpoint", False)),
+            tiny_arch=model_cfg.get("tiny_arch", "dual_dinov3"),
+            tiny_dino_model_name=model_cfg.get("tiny_dino_model_name", "vit_small_patch16_dinov3"),
+            tiny_pretrained=bool(model_cfg.get("tiny_pretrained", True)),
+            tiny_relative_bounded=bool(model_cfg.get("tiny_relative_bounded", True)),
+            tiny_relative_activation=model_cfg.get("tiny_relative_activation", "softplus"),
+            tiny_metric_activation=model_cfg.get("tiny_metric_activation", "softplus"),
+            tiny_out_indices=model_cfg.get("tiny_out_indices", None),
         )
     else:
         raise ValueError(

@@ -28,9 +28,19 @@ class DPTHeadTemporal(DPTHead):
         out_channels=[256, 512, 1024, 1024], 
         use_clstoken=False,
         num_frames=32,
-        pe='ape'
+        pe='ape',
+        patch_size: int = 14,
+        output_activation: str = "relu",
     ):
-        super().__init__(in_channels, features, use_bn, out_channels, use_clstoken)
+        super().__init__(
+            in_channels,
+            features,
+            use_bn,
+            out_channels,
+            use_clstoken,
+            patch_size=patch_size,
+            output_activation=output_activation,
+        )
 
         assert num_frames > 0
         motion_module_kwargs = dict(num_attention_heads                = 8,
@@ -101,13 +111,14 @@ class DPTHeadTemporal(DPTHead):
 
             out = self.scratch.output_conv1(path_1)
             out = F.interpolate(
-                out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True
+                out, (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
+                mode="bilinear", align_corners=True
             )
             ori_type = out.dtype
             with torch.autocast(device_type="cuda", enabled=False):
                 out = self.scratch.output_conv2(out.float())
 
-            output = out.to(ori_type) 
+            output = self._apply_output_activation(out.to(ori_type))
         else:
             ret = []
             for i in range(0, batch_size, micro_batch_size):
@@ -115,12 +126,13 @@ class DPTHeadTemporal(DPTHead):
                 path_1 = self.scratch.refinenet1(path_2, layer_1_rn[i:i + micro_batch_size])
                 out = self.scratch.output_conv1(path_1)
                 out = F.interpolate(
-                    out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True
+                    out, (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
+                    mode="bilinear", align_corners=True
                 )
                 ori_type = out.dtype
                 with torch.autocast(device_type="cuda", enabled=False):
                     out = self.scratch.output_conv2(out.float())
-                ret.append(out.to(ori_type))
+                ret.append(self._apply_output_activation(out.to(ori_type)))
             output = torch.cat(ret, dim=0)
         
         return output, h0 + h1 + h2 + h3
