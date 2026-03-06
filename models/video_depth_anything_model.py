@@ -8,6 +8,10 @@ For tiny variants, this file now provides a novel dual-head architecture:
 - DINOv3-small encoder (timm EVA implementation)
 - temporal DPT decoder for relative depth
 - clip-level metric calibration head to map relative depth -> metric depth
+
+For legacy VDA checkpoints trained for relative depth, the wrapper can also
+insert a lightweight inverse-depth bridge so fine-tuning in metric space starts
+from the correct depth ordering.
 """
 
 from __future__ import annotations
@@ -277,6 +281,68 @@ class TinyDualHeadDINOv3(nn.Module):
         }
 
 
+class LegacyInverseAffineBridge(nn.Module):
+    """Convert disparity-like legacy VDA output into relative + metric depth.
+
+    Relative VDA checkpoints produce larger values for nearer objects. For
+    metric supervision we first flip the ordering via a reciprocal transform,
+    then apply a clip-level affine calibration predicted from the backbone
+    descriptors.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        reciprocal_floor: float = 1e-2,
+        metric_activation: str = "softplus",
+    ) -> None:
+        super().__init__()
+        hidden = max(int(embed_dim) // 2, 128)
+        self.metric_calibrator = nn.Sequential(
+            nn.LayerNorm(int(embed_dim)),
+            nn.Linear(int(embed_dim), hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 2),  # scale_raw, shift_raw
+        )
+        self.reciprocal_floor = float(reciprocal_floor)
+        self.metric_activation = str(metric_activation).lower()
+
+    def _apply_metric_affine(
+        self,
+        rel_depth: torch.Tensor,
+        scale_raw: torch.Tensor,
+        shift_raw: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.metric_activation == "exp":
+            scale = torch.exp(scale_raw).view(-1, 1, 1, 1, 1)
+        else:
+            scale = F.softplus(scale_raw).view(-1, 1, 1, 1, 1) + 1e-4
+        shift = shift_raw.view(-1, 1, 1, 1, 1)
+        return scale * rel_depth + shift
+
+    def forward(
+        self,
+        raw_inverse_depth: torch.Tensor,
+        pooled_descriptors: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+    ) -> dict[str, torch.Tensor]:
+        rel_depth = torch.reciprocal(raw_inverse_depth.clamp(min=self.reciprocal_floor))
+
+        calib_bt = self.metric_calibrator(pooled_descriptors).unflatten(0, (batch_size, num_frames))
+        calib_clip = calib_bt.mean(dim=1)
+        scale_raw = calib_clip[:, 0]
+        shift_raw = calib_clip[:, 1]
+        metric_depth = self._apply_metric_affine(rel_depth, scale_raw, shift_raw)
+
+        return {
+            "depth": metric_depth,
+            "depth_relative": rel_depth,
+            "metric_scale": F.softplus(scale_raw).detach(),
+            "metric_shift": shift_raw.detach(),
+        }
+
+
 class VideoDepthAnythingModel(nn.Module):
     """Trainable Video Depth Anything model for GT-supervised learning.
 
@@ -298,6 +364,9 @@ class VideoDepthAnythingModel(nn.Module):
         tiny_relative_activation: str = "softplus",
         tiny_metric_activation: str = "softplus",
         tiny_out_indices: Iterable[int] | None = None,
+        legacy_metric_bridge: str = "auto",
+        legacy_reciprocal_floor: float = 1e-2,
+        legacy_metric_activation: str = "softplus",
     ) -> None:
         super().__init__()
 
@@ -308,6 +377,8 @@ class VideoDepthAnythingModel(nn.Module):
 
         self.variant = key
         use_dual_tiny = key in ("tiny", "vittiny") and str(tiny_arch).lower() != "legacy"
+
+        self.metric_bridge_mode = "none"
 
         if use_dual_tiny:
             self.model = TinyDualHeadDINOv3(
@@ -338,6 +409,18 @@ class VideoDepthAnythingModel(nn.Module):
             )
             self.patch_size = 14
             self._legacy = True
+            self.metric_bridge_mode = self._resolve_legacy_metric_bridge_mode(
+                bridge_mode=legacy_metric_bridge,
+                checkpoint_path=checkpoint_path,
+            )
+            if self.metric_bridge_mode == "inverse_affine":
+                self.metric_calibrator = LegacyInverseAffineBridge(
+                    embed_dim=int(self.model.pretrained.embed_dim),
+                    reciprocal_floor=float(legacy_reciprocal_floor),
+                    metric_activation=legacy_metric_activation,
+                )
+            else:
+                self.metric_calibrator = None
 
             self.register_buffer(
                 "_mean",
@@ -352,6 +435,30 @@ class VideoDepthAnythingModel(nn.Module):
 
         if checkpoint_path:
             self.load_checkpoint(checkpoint_path, strict=strict_checkpoint)
+
+    @staticmethod
+    def _resolve_legacy_metric_bridge_mode(
+        bridge_mode: str,
+        checkpoint_path: str | None,
+    ) -> str:
+        mode = str(bridge_mode or "auto").strip().lower()
+        if mode in ("none", "off", "false", "disabled"):
+            return "none"
+        if mode in ("inverse_affine", "on", "true", "enabled"):
+            return "inverse_affine"
+        if mode != "auto":
+            raise ValueError(
+                "Unsupported legacy_metric_bridge mode. "
+                "Expected one of: auto, inverse_affine, none."
+            )
+
+        if checkpoint_path:
+            ckpt_name = Path(checkpoint_path).name.lower()
+            if "metric" in ckpt_name:
+                return "none"
+            if "video_depth_anything" in ckpt_name:
+                return "inverse_affine"
+        return "none"
 
     def load_checkpoint(self, checkpoint_path: str, strict: bool = False) -> None:
         if hasattr(self.model, "load_checkpoint"):
@@ -419,5 +526,26 @@ class VideoDepthAnythingModel(nn.Module):
         std = self._std.to(dtype=x.dtype, device=x.device)
         x = (x - mean) / std
 
-        depth = self.model(x).unsqueeze(1)  # (B, 1, T, H, W)
-        return {"depth": depth}
+        features = self.model.pretrained.get_intermediate_layers(
+            x.flatten(0, 1),
+            self.model.intermediate_layer_idx[self.model.encoder],
+            return_class_token=True,
+        )
+        raw_depth_bt = self.model.head(features, height // self.patch_size, width // self.patch_size, frames.shape[2])[0]
+        raw_depth_bt = F.interpolate(raw_depth_bt, size=(height, width), mode="bilinear", align_corners=True)
+        raw_depth_bt = F.relu(raw_depth_bt)
+        raw_depth = raw_depth_bt.squeeze(1).unflatten(0, (frames.shape[0], frames.shape[2])).unsqueeze(1)
+
+        if self.metric_bridge_mode != "inverse_affine" or self.metric_calibrator is None:
+            return {"depth": raw_depth}
+
+        patch_tokens, cls_token = features[-1]
+        pooled = cls_token if cls_token is not None else patch_tokens.mean(dim=1)
+        outputs = self.metric_calibrator(
+            raw_inverse_depth=raw_depth,
+            pooled_descriptors=pooled,
+            batch_size=frames.shape[0],
+            num_frames=frames.shape[2],
+        )
+        outputs["depth_inverse_relative"] = raw_depth
+        return outputs

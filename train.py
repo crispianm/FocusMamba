@@ -409,6 +409,9 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_type = cfg.get("model", {}).get("type", "mamba")
     logger.info("Student: %s | Parameters: %s", model_type, f"{n_params:,}")
+    metric_bridge_mode = getattr(model, "metric_bridge_mode", "none")
+    if metric_bridge_mode and metric_bridge_mode != "none":
+        logger.info("Model metric bridge: %s", metric_bridge_mode)
 
     # torch.compile — fuses kernels and eliminates Python overhead.
     # Gives ~20-40 % throughput improvement on modern CUDA GPUs including GH200.

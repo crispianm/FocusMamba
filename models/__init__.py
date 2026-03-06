@@ -93,6 +93,9 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             tiny_relative_activation=model_cfg.get("tiny_relative_activation", "softplus"),
             tiny_metric_activation=model_cfg.get("tiny_metric_activation", "softplus"),
             tiny_out_indices=model_cfg.get("tiny_out_indices", None),
+            legacy_metric_bridge=model_cfg.get("legacy_metric_bridge", "auto"),
+            legacy_reciprocal_floor=float(model_cfg.get("legacy_reciprocal_floor", 1e-2)),
+            legacy_metric_activation=model_cfg.get("legacy_metric_activation", "softplus"),
         )
     else:
         raise ValueError(

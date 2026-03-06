@@ -289,6 +289,7 @@ def train_one_epoch(
         use_no_sync = is_accum_step and hasattr(model, "no_sync")
         sync_ctx = model.no_sync() if use_no_sync else nullcontext()
         target_mode = getattr(criterion, "target_mode", "metric")
+        use_teacher_signals = getattr(criterion, "distillation", None) is not None
 
         # ── Resolve input frames ────────────────────────────────────────
         if "degraded_frames" in batch:
@@ -339,13 +340,13 @@ def train_one_epoch(
 
                 # Load from cache if the batch carries pre-computed depths
                 cached_batch: Optional[Dict[str, torch.Tensor]] = batch.get("cached_teacher_depths")
-                if cached_batch is not None:
+                if use_teacher_signals and cached_batch is not None:
                     for t_name, td in cached_batch.items():
                         # td: (B, 1, T, H, W) from collation of per-sample (1, T, H, W) tensors
                         teacher_depths[t_name] = td.to(device, non_blocking=True)
 
                 # Fall back to live inference for any teacher missing from cache
-                if teachers:
+                if use_teacher_signals and teachers:
                     missing = [n for n in teachers if n not in teacher_depths]
                     if missing:
                         with torch.no_grad():
@@ -428,6 +429,8 @@ def train_one_epoch(
             with torch.no_grad():
                 from training.callbacks.visualise_depth import colorise_depth
                 pred_d = student_depth.detach()
+                student_rel_vis = None
+                student_inv_vis = None
                 if target_mode == "relative":
                     vis_mask = mask if mask is not None else (gt_depth > 0 if gt_depth is not None else None)
                     gt_vis = _normalize_relative_depth(gt_depth, vis_mask) if gt_depth is not None else None
@@ -438,6 +441,10 @@ def train_one_epoch(
                 else:
                     gt_vis = gt_depth
                     teacher_vis = teacher_depths
+                    if "depth_relative" in student_outputs:
+                        student_rel_vis = student_outputs["depth_relative"].detach()
+                    if "depth_inverse_relative" in student_outputs:
+                        student_inv_vis = student_outputs["depth_inverse_relative"].detach()
 
                 B_vis = min(pred_d.shape[0], log_img_max_B)
                 rows = []
@@ -446,6 +453,10 @@ def train_one_epoch(
                     rgb = student_input[b, :, t_mid].cpu()  # (3, H, W)
                     s_d = pred_d[b, 0, t_mid].cpu()
                     col = [rgb, colorise_depth(s_d)]
+                    if student_rel_vis is not None:
+                        col.append(colorise_depth(student_rel_vis[b, 0, t_mid].cpu()))
+                    if student_inv_vis is not None:
+                        col.append(colorise_depth(student_inv_vis[b, 0, t_mid].cpu()))
                     if gt_vis is not None:
                         gt_d = gt_vis[b, 0, t_mid].cpu()
                         col.append(colorise_depth(gt_d))
@@ -458,6 +469,10 @@ def train_one_epoch(
                 # Per-teacher and student depth scale
                 writer.add_scalar("mean_depth/student", pred_d.mean().item(), global_step)
                 writer.add_scalar("mean_depth/student_metric", student_depth_metric.detach().mean().item(), global_step)
+                if student_rel_vis is not None:
+                    writer.add_scalar("mean_depth/student_relative", student_rel_vis.mean().item(), global_step)
+                if student_inv_vis is not None:
+                    writer.add_scalar("mean_depth/student_inverse_relative", student_inv_vis.mean().item(), global_step)
                 for t_name, td in teacher_vis.items():
                     writer.add_scalar(f"mean_depth/teacher_{t_name}", td.mean().item(), global_step)
                 if gt_vis is not None:
@@ -505,6 +520,7 @@ def validate(
 
     for batch in tqdm(loader, desc=f"Val {epoch}", unit="it", leave=False):
         target_mode = getattr(criterion, "target_mode", "metric")
+        use_teacher_signals = getattr(criterion, "distillation", None) is not None
         # Resolve input frames (same logic as train_one_epoch)
         if "clean_frames" in batch:
             frames = batch["clean_frames"].to(device)
@@ -526,7 +542,7 @@ def validate(
 
             # Teacher inference for distillation validation
             teacher_depths = {}
-            if teachers:
+            if use_teacher_signals and teachers:
                 for name, teacher in teachers.items():
                     try:
                         teacher_depths[name] = teacher.predict(frames)
@@ -564,6 +580,8 @@ def validate(
             if is_main and not logged_image:
                 from training.callbacks.visualise_depth import colorise_depth
                 B_vis = min(pred_depth.shape[0], log_img_max_B)
+                student_rel_vis = None
+                student_inv_vis = None
                 if target_mode == "relative":
                     vis_mask = gt_depth > 0
                     gt_vis = _normalize_relative_depth(gt_depth, vis_mask)
@@ -574,12 +592,20 @@ def validate(
                 else:
                     gt_vis = gt_depth
                     teacher_vis = teacher_depths
+                    if "depth_relative" in outputs:
+                        student_rel_vis = outputs["depth_relative"].detach()
+                    if "depth_inverse_relative" in outputs:
+                        student_inv_vis = outputs["depth_inverse_relative"].detach()
                 rows = []
                 for b in range(B_vis):
                     t_mid = pred_depth.shape[2] // 2
                     rgb = frames[b, :, t_mid].cpu()
                     s_d = pred_depth[b, 0, t_mid].cpu()
                     col = [rgb, colorise_depth(s_d)]
+                    if student_rel_vis is not None:
+                        col.append(colorise_depth(student_rel_vis[b, 0, t_mid].cpu()))
+                    if student_inv_vis is not None:
+                        col.append(colorise_depth(student_inv_vis[b, 0, t_mid].cpu()))
                     gt_d = gt_vis[b, 0, t_mid].cpu()
                     col.append(colorise_depth(gt_d))
                     for t_name, td in teacher_vis.items():
