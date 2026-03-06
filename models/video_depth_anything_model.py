@@ -162,11 +162,10 @@ class TinyDualHeadDINOv3(nn.Module):
     def _apply_metric_affine(self, rel_depth: torch.Tensor, scale_raw: torch.Tensor, shift_raw: torch.Tensor) -> torch.Tensor:
         if self.metric_activation == "exp":
             scale = torch.exp(scale_raw).view(-1, 1, 1, 1, 1)
-            shift = torch.exp(shift_raw).view(-1, 1, 1, 1, 1)
         else:
             # Softplus is more stable than ReLU for early-stage calibration.
             scale = F.softplus(scale_raw).view(-1, 1, 1, 1, 1) + 1e-4
-            shift = F.softplus(shift_raw).view(-1, 1, 1, 1, 1)
+        shift = shift_raw.view(-1, 1, 1, 1, 1)
         return scale * rel_depth + shift
 
     def load_checkpoint(self, checkpoint_path: str, strict: bool = False) -> None:
@@ -274,7 +273,7 @@ class TinyDualHeadDINOv3(nn.Module):
             "depth": metric_depth,
             "depth_relative": rel_depth,
             "metric_scale": F.softplus(scale_raw).detach(),
-            "metric_shift": F.softplus(shift_raw).detach(),
+            "metric_shift": shift_raw.detach(),
         }
 
 

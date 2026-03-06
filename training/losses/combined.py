@@ -32,6 +32,9 @@ class CombinedLoss(nn.Module):
         self.ssi_weight = float(cfg.get("ssi_weight", cfg.get("si_log_weight", 1.0)))
         self.temporal_weight = float(cfg.get("temporal_weight", 10.0))
         self.distillation_weight = cfg.get("distillation_weight", 1.0)
+        # Optional absolute metric anchors (useful for Stage-B conversion).
+        self.metric_l1_weight = float(cfg.get("metric_l1_weight", 0.0))
+        self.metric_log_l1_weight = float(cfg.get("metric_log_l1_weight", 0.0))
         self.target_mode = str(cfg.get("training_target", "metric")).lower()
         if self.target_mode not in ("metric", "relative"):
             raise ValueError(f"Unknown loss.training_target={self.target_mode!r}")
@@ -173,6 +176,20 @@ class CombinedLoss(nn.Module):
                 ssi_loss = self.ssi(student_depth, gt_depth, mask=mask, aligned_pred=aligned_pred)
                 total = total + (self.ssi_weight * ssi_loss)
                 losses["ssi"] = ssi_loss.detach()
+
+                if self.metric_l1_weight > 0:
+                    metric_l1 = self._masked_l1(student_depth, gt_depth, mask=mask)
+                    total = total + (self.metric_l1_weight * metric_l1)
+                    losses["metric_l1"] = metric_l1.detach()
+
+                if self.metric_log_l1_weight > 0:
+                    metric_log_l1 = self._masked_l1(
+                        torch.log(student_depth.clamp(min=self.eps)),
+                        torch.log(gt_depth.clamp(min=self.eps)),
+                        mask=mask,
+                    )
+                    total = total + (self.metric_log_l1_weight * metric_log_l1)
+                    losses["metric_log_l1"] = metric_log_l1.detach()
 
                 if self._temporal_loss is not None and self.temporal_weight > 0:
                     try:
