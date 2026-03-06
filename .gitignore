@@ -1,22 +1,34 @@
-z_depth_investigation.ipynb
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+
+# Runtime artifacts
+core
+runs/
+oldruns/
+checkpoints/
+logs/
+
+# Local data
 data/
 genfocus_data/
-*.pyc
-models/__pycache__/mamba_block.cpython-311.pyc
-runs/
-Video-Depth-Anything/
-checkpoints/
 youtube-vos/
-models/__pycache__/__init__.cpython-310.pyc
-models/__pycache__/decoder.cpython-310.pyc
-logs/focusmamba_trial_2503263.out
+
+# Local notebooks and scratch analysis
+*.ipynb
+*.map
+z_depth_investigation.ipynb
 zz_dataset.ipynb
-core
-*.err
-*.log
-*.out
-MTKD_ Multi-Teacher Knowledge Distillation for Image Super-Resolution.html
+config.yaml
+MTKD_*.html
+
+# Vendored / external worktrees
+Video-Depth-Anything/
+configs/experiments/
 vda.html
-*.yaml
-*.sh
-tools/generate_overnight_suite_20260304.py

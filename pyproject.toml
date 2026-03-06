@@ -17,6 +17,7 @@ dependencies = [
     "pytest>=7.4",
     "pytorch-msssim>=1.0.0",
     "pyyaml>=6.0",
+    "rich>=13.9",
     "seaborn>=0.13",
     "tensorboard>=2.15",
     "torch>=2.7",

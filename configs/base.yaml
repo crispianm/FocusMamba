@@ -1,0 +1,88 @@
+# ============================================================================
+# Base Configuration — Shared Defaults
+# ============================================================================
+# All training runs are fully reproducible from a single YAML.
+# Experiment configs inherit from this and override specific fields.
+
+# ── Optimizer ──────────────────────────────────────────────────────────────
+optimizer:
+  type: AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# ── Scheduler ──────────────────────────────────────────────────────────────
+scheduler:
+  type: warmup_cosine
+  warmup_steps: 500
+  min_lr: 1.0e-6
+
+# ── Training ───────────────────────────────────────────────────────────────
+training:
+  max_epochs: 300
+  batch_size: 4
+  grad_clip: 1.0
+  precision: bf16            # bf16 | fp32
+  val_every_n_epochs: 5
+  ema_decay: 0.999           # EMA of student weights; 0 to disable
+  num_workers: 4
+  pin_memory: true
+  seed: 42
+
+# ── Logging ────────────────────────────────────────────────────────────────
+logging:
+  log_dir: ./runs
+  checkpoint_dir: ./checkpoints
+  log_every_n_steps: 50
+  save_top_k: 3              # keep top-K checkpoints by validation metric
+
+# ── Data ───────────────────────────────────────────────────────────────────
+data:
+  window_length: 8           # T = number of frames per clip
+  clip_stride: 4             # stride for sliding window sampling
+  resolution: [256, 256]     # training crop size [H, W]
+  patch_size: 4              # tubelet spatial patch size
+  t_patch: 2                 # tubelet temporal patch size
+
+# ── Model ──────────────────────────────────────────────────────────────────
+model:
+  type: mamba                # mamba | transformer | conv_baseline
+  embed_dim: 96
+  encoder_depths: [2, 2, 4, 2]
+  d_state: 16
+  d_conv: 4
+  expand: 2
+
+# ── Distillation ───────────────────────────────────────────────────────────
+distillation:
+  enabled: true
+  teachers:
+    - name: depth_anything_v3
+      weight: 0.25
+      loss: si_log
+    - name: depth_pro
+      weight: 0.25
+      loss: si_log
+    - name: video_depth_anything
+      weight: 0.25
+      loss: si_log_plus_temporal
+  ensemble_method: fixed     # fixed | learned
+  confidence_weighted: true  # down-weight where teachers disagree
+
+# ── Loss ───────────────────────────────────────────────────────────────────
+loss:
+  si_log_weight: 1.0
+  gradient_weight: 0.5       # edge-aware smoothness (to be implemented)
+  temporal_weight: 0.2       # temporal consistency (to be implemented)
+  uncertainty_nll_weight: 0.1
+
+# ── Degradation ────────────────────────────────────────────────────────────
+degradation:
+  enabled: true
+  curriculum: true           # increase severity over training
+  # Per-type settings are in configs/data/synthetic_degradation.yaml
+
+# ── Inference ──────────────────────────────────────────────────────────────
+inference:
+  target_fps: 30             # used to gate architecture search / profiling
