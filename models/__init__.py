@@ -9,9 +9,24 @@ Provides:
     - build_model:      Factory function from config dict
 """
 
-from .focus_mamba import FocusMamba
-from .focus_transformer import FocusTransformer
+from __future__ import annotations
+
 from .video_depth_anything_model import VideoDepthAnythingModel
+
+_FOCUS_MAMBA_IMPORT_ERROR: Exception | None = None
+_FOCUS_TRANSFORMER_IMPORT_ERROR: Exception | None = None
+
+try:
+    from .focus_mamba import FocusMamba
+except Exception as exc:  # pragma: no cover - optional dependency path
+    FocusMamba = None  # type: ignore[assignment]
+    _FOCUS_MAMBA_IMPORT_ERROR = exc
+
+try:
+    from .focus_transformer import FocusTransformer
+except Exception as exc:  # pragma: no cover - optional dependency path
+    FocusTransformer = None  # type: ignore[assignment]
+    _FOCUS_TRANSFORMER_IMPORT_ERROR = exc
 
 
 def build_model(cfg: dict) -> "torch.nn.Module":
@@ -43,6 +58,11 @@ def build_model(cfg: dict) -> "torch.nn.Module":
     model_num_frames = int(model_cfg.get("num_frames", max(train_frames, val_frames)))
 
     if model_type == "mamba":
+        if FocusMamba is None:
+            raise ImportError(
+                "FocusMamba is unavailable in this environment. "
+                f"Original import error: {_FOCUS_MAMBA_IMPORT_ERROR}"
+            )
         model = FocusMamba(
             in_channels=3,
             variant=model_cfg.get("variant", "small"),
@@ -65,6 +85,11 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             output_activation=model_cfg.get("output_activation", "softplus"),
         )
     elif model_type in ("transformer", "conv_baseline"):
+        if FocusTransformer is None:
+            raise ImportError(
+                "FocusTransformer is unavailable in this environment. "
+                f"Original import error: {_FOCUS_TRANSFORMER_IMPORT_ERROR}"
+            )
         common_kwargs = dict(
             in_channels=3,
             embed_dim=model_cfg.get("embed_dim", cfg.get("embed_dim", 96)),
@@ -97,6 +122,8 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             state_gate_stage_mask=model_cfg.get("state_gate_stage_mask", None),
             prefilter_enabled=bool(model_cfg.get("prefilter_enabled", False)),
             prefilter_type=str(model_cfg.get("prefilter_type", "fast_classical")),
+            prefilter_target_mean=model_cfg.get("prefilter_target_mean", None),
+            prefilter_target_std=model_cfg.get("prefilter_target_std", None),
             prefilter_kernel_size=int(model_cfg.get("prefilter_kernel_size", 5)),
             prefilter_sigma=float(model_cfg.get("prefilter_sigma", 1.0)),
             prefilter_denoise_init=float(model_cfg.get("prefilter_denoise_init", 0.20)),

@@ -250,6 +250,8 @@ class VideoDepthAnythingModel(nn.Module):
         state_gate_stage_mask: Sequence[bool] | None = None,
         prefilter_enabled: bool = False,
         prefilter_type: str = "fast_classical",
+        prefilter_target_mean: Sequence[float] | None = None,
+        prefilter_target_std: Sequence[float] | None = None,
         prefilter_kernel_size: int = 5,
         prefilter_sigma: float = 1.0,
         prefilter_denoise_init: float = 0.20,
@@ -295,6 +297,8 @@ class VideoDepthAnythingModel(nn.Module):
         self.prefilter = self._build_prefilter(
             enabled=self.prefilter_enabled,
             prefilter_type=self.prefilter_type,
+            target_mean=prefilter_target_mean,
+            target_std=prefilter_target_std,
             kernel_size=int(prefilter_kernel_size),
             sigma=float(prefilter_sigma),
             denoise_init=float(prefilter_denoise_init),
@@ -602,6 +606,8 @@ class VideoDepthAnythingModel(nn.Module):
         *,
         enabled: bool,
         prefilter_type: str,
+        target_mean: Sequence[float] | None,
+        target_std: Sequence[float] | None,
         kernel_size: int,
         sigma: float,
         denoise_init: float,
@@ -619,7 +625,11 @@ class VideoDepthAnythingModel(nn.Module):
                 learnable=learnable,
             )
         if prefilter_type == "stats_align":
-            return ChannelStatsAlignPrefilter(learnable=learnable)
+            return ChannelStatsAlignPrefilter(
+                target_mean=(0.485, 0.456, 0.406) if target_mean is None else target_mean,
+                target_std=(0.229, 0.224, 0.225) if target_std is None else target_std,
+                learnable=learnable,
+            )
         if prefilter_type == "learned_affine":
             return TinyAffineNormalizer()
         if prefilter_type == "depthwise":
