@@ -151,6 +151,7 @@ def _resolve_selection_metric(train_cfg: dict, loss_cfg: dict) -> str:
         "delta1",
         "delta2",
         "delta3",
+        "fdv",
         "rel_l1",
         "rel_rmse",
         "rel_delta1",
@@ -395,11 +396,14 @@ def main():
     logger.info("Device: %s  |  world_size=%d  local_rank=%d", device, world_size, local_rank)
 
     data_cfg = cfg.get("data", {})
+    train_num_frames = int(data_cfg.get("train_num_frames", data_cfg.get("num_frames", 8)))
+    val_num_frames = int(data_cfg.get("val_num_frames", data_cfg.get("num_frames", train_num_frames)))
     use_fp16 = train_cfg.get("precision", "bf16") == "fp16" and device.type == "cuda"
     use_amp  = train_cfg.get("precision", "bf16") in ("bf16", "fp16") and device.type == "cuda"
     logger.info("Runtime settings: use_amp=%s use_fp16=%s precision=%s", use_amp, use_fp16, train_cfg.get("precision", "bf16"))
     logger.debug("Training config:\n%s", pformat(train_cfg, sort_dicts=False))
     logger.debug("Data config:\n%s", pformat(data_cfg, sort_dicts=False))
+    logger.info("Sequence lengths: train=%d val=%d", train_num_frames, val_num_frames)
 
     # -----------------------------------------------------------------------
     # Build student model
@@ -492,18 +496,45 @@ def main():
     # Build dataloaders
     # -----------------------------------------------------------------------
     dataset_type = data_cfg.get("dataset", "tartanair_v2")
+    loss_cfg = cfg.get("loss", {})
+    validation_cfg = cfg.get("validation", {}) or {}
+    selection_metric = _resolve_selection_metric(train_cfg, loss_cfg)
+    val_use_teacher_signals = bool(validation_cfg.get("use_teacher_signals", False))
 
     if dataset_type == "tartanair_v2":
+        from dataloader.degradation import build_degradation
         from dataloader.tartanair_v2 import TartanAirV2Dataset
 
         _teacher_cache_dir = data_cfg.get("teacher_cache_dir", None)
+        _val_teacher_cache_dir = _teacher_cache_dir if val_use_teacher_signals else None
         if _teacher_cache_dir:
             logger.info("Teacher cache: %s", _teacher_cache_dir)
+        train_degradation = build_degradation(cfg)
+        val_degradation = build_degradation(cfg)
+        degradation = train_degradation
+        if train_degradation is not None:
+            logger.info("Low-light degradation enabled for paired clean/degraded metric clips.")
+        auxiliary_cfg = loss_cfg.get("auxiliary", {}) or {}
+        need_clean_reference = (
+            train_degradation is not None
+            and (
+                bool(active_teachers)
+                or float(auxiliary_cfg.get("feature_alignment_weight", 0.0)) > 0
+                or float(auxiliary_cfg.get("clean_depth_consistency_weight", 0.0)) > 0
+            )
+        )
+        val_need_clean_reference = val_degradation is not None and bool(active_teachers) and val_use_teacher_signals
+        if train_degradation is not None and not need_clean_reference:
+            logger.info("Degraded clips will omit clean-frame copies because no live teachers are active.")
+        if val_degradation is not None and not val_need_clean_reference:
+            logger.info("Validation clips will omit clean-frame copies because teacher signals are disabled in val.")
+        max_train_trajectories = data_cfg.get("max_train_trajectories", data_cfg.get("max_trajectories", None))
+        max_val_trajectories = data_cfg.get("max_val_trajectories", data_cfg.get("max_trajectories", None))
         train_dataset = TartanAirV2Dataset(
             root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
-            num_frames=data_cfg.get("num_frames", 8),
+            num_frames=train_num_frames,
             image_size=tuple(data_cfg.get("image_size", [256, 256])),
-            max_trajectories=data_cfg.get("max_trajectories", None),
+            max_trajectories=max_train_trajectories,
             clip_stride=data_cfg.get("clip_stride", 8),
             frame_stride=data_cfg.get("frame_stride", 1),
             split="train",
@@ -514,12 +545,15 @@ def main():
             max_depth=data_cfg.get("max_depth", 80.0),
             envs=data_cfg.get("envs", None),
             teacher_cache_dir=_teacher_cache_dir,
+            degradation=train_degradation,
+            return_clean_and_degraded=train_degradation is not None,
+            return_clean_reference=need_clean_reference,
         )
         val_dataset = TartanAirV2Dataset(
             root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
-            num_frames=data_cfg.get("num_frames", 8),
+            num_frames=val_num_frames,
             image_size=tuple(data_cfg.get("image_size", [256, 256])),
-            max_trajectories=data_cfg.get("max_trajectories", None),
+            max_trajectories=max_val_trajectories,
             clip_stride=data_cfg.get("clip_stride", 8),
             frame_stride=data_cfg.get("frame_stride", 1),
             split="val",
@@ -529,14 +563,17 @@ def main():
             camera=data_cfg.get("camera", "lcam_front"),
             max_depth=data_cfg.get("max_depth", 80.0),
             envs=data_cfg.get("envs", None),
-            teacher_cache_dir=_teacher_cache_dir,
+            teacher_cache_dir=_val_teacher_cache_dir,
+            degradation=val_degradation,
+            return_clean_and_degraded=val_degradation is not None,
+            return_clean_reference=val_need_clean_reference,
         )
     elif dataset_type == "youtube_vos":
         from dataloader.youtube_vos import YouTubeVOSDataset
 
         train_dataset = YouTubeVOSDataset(
             root=data_cfg.get("root", "data/youtube-vos/train_all_frames/JPEGImages"),
-            num_frames=data_cfg.get("num_frames", 8),
+            num_frames=train_num_frames,
             image_size=tuple(data_cfg.get("image_size", [256, 256])),
             max_videos=data_cfg.get("max_videos", None),
             clip_stride=data_cfg.get("clip_stride", 8),
@@ -547,7 +584,7 @@ def main():
         )
         val_dataset = YouTubeVOSDataset(
             root=data_cfg.get("root", "data/youtube-vos/train_all_frames/JPEGImages"),
-            num_frames=data_cfg.get("num_frames", 8),
+            num_frames=val_num_frames,
             image_size=tuple(data_cfg.get("image_size", [256, 256])),
             max_videos=data_cfg.get("max_videos", None),
             clip_stride=data_cfg.get("clip_stride", 8),
@@ -561,11 +598,17 @@ def main():
 
     batch_size = train_cfg.get("batch_size", 2)
     num_workers = train_cfg.get("num_workers", 4)
+    # Validation with degraded video clips has been more reliable on Isambard
+    # with a single-process loader. Worker startup/IPC can stall before the
+    # first batch even when plain dataset access is fast.
+    val_num_workers = int(train_cfg.get("val_num_workers", 0))
     # persistent_workers keeps worker processes alive between epochs, saving
     # the fork overhead (~1-3 s per epoch on disk-heavy datasets).
     # prefetch_factor lets workers queue up batches while the GPU is busy.
     _persistent = num_workers > 0
     _prefetch = 2 if num_workers > 0 else None
+    _val_persistent = bool(train_cfg.get("val_persistent_workers", False)) and val_num_workers > 0
+    _val_prefetch = int(train_cfg.get("val_prefetch_factor", 1)) if val_num_workers > 0 else None
 
     train_sampler = DistributedSampler(
         train_dataset,
@@ -599,11 +642,11 @@ def main():
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=num_workers,
+        num_workers=val_num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
+        persistent_workers=_val_persistent,
+        prefetch_factor=_val_prefetch,
     )
 
     # Compute batch count before optionally wrapping in CPUPrefetchLoader,
@@ -616,23 +659,34 @@ def main():
     if train_cfg.get("cpu_prefetch", True):
         cpu_prefetch_batches = int(train_cfg.get("cpu_prefetch_batches", 2))
         train_loader = CPUPrefetchLoader(train_loader, prefetch=cpu_prefetch_batches)
-        val_loader = CPUPrefetchLoader(val_loader, prefetch=cpu_prefetch_batches)
+    if train_cfg.get("val_cpu_prefetch", False):
+        val_cpu_prefetch_batches = int(train_cfg.get("val_cpu_prefetch_batches", 1))
+        val_loader = CPUPrefetchLoader(val_loader, prefetch=val_cpu_prefetch_batches)
     logger.info("Train clips: %d | Val clips: %d", len(train_dataset), len(val_dataset))
     logger.info(
-        "Dataloader settings: batch_size=%d num_workers=%d persistent_workers=%s prefetch_factor=%s cpu_prefetch=%s",
+        "Train loader: batch_size=%d num_workers=%d persistent_workers=%s prefetch_factor=%s cpu_prefetch=%s",
         batch_size,
         num_workers,
         _persistent,
         _prefetch,
         train_cfg.get("cpu_prefetch", True),
     )
+    logger.info(
+        "Val loader: batch_size=%d num_workers=%d persistent_workers=%s prefetch_factor=%s cpu_prefetch=%s teacher_signals=%s",
+        batch_size,
+        val_num_workers,
+        _val_persistent,
+        _val_prefetch,
+        train_cfg.get("val_cpu_prefetch", False),
+        val_use_teacher_signals,
+    )
 
     # -----------------------------------------------------------------------
     # Loss, optimizer, scheduler
     # -----------------------------------------------------------------------
-    loss_cfg = cfg.get("loss", {})
     distillation_cfg = dict(cfg.get("distillation", {}))
     distillation_cfg["enabled"] = distillation_requested
+    distillation_cfg.setdefault("max_depth", float(data_cfg.get("max_depth", 80.0)))
     if distillation_requested:
         if active_teachers:
             distillation_cfg.setdefault(
@@ -708,6 +762,9 @@ def main():
         total_epochs=max_epochs,
         warmup_epochs=deg_cfg.get("warmup_epochs", 10),
         schedule=deg_cfg.get("schedule", "linear"),
+        warmup_start_scale=deg_cfg.get("warmup_start_scale", 0.0),
+        min_scale=deg_cfg.get("min_scale", 0.1),
+        max_scale=deg_cfg.get("max_scale", 1.0),
     )
 
     # -----------------------------------------------------------------------
@@ -723,7 +780,6 @@ def main():
     # -----------------------------------------------------------------------
     log_dir = artifacts.log_dir
     metrics_logger: JsonlMetricLogger | None = None
-    selection_metric = _resolve_selection_metric(train_cfg, loss_cfg)
     if is_main:
         write_run_metadata(
             artifacts=artifacts,
@@ -767,7 +823,7 @@ def main():
             artifacts.config_snapshot_file,
         )
 
-    log_img_every = train_cfg.get("log_images_every_n_steps", 50)
+    log_img_every = train_cfg.get("log_images_every_n_steps", 1000)
     log_img_max_B = train_cfg.get("log_images_max_batch", 2)
     step_log_every = int(train_cfg.get("step_log_every_n_steps", 0))
     if args.debug and step_log_every < 1:
@@ -934,8 +990,15 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # Update curriculum degradation scale (no-op until degradation is wired in)
+        # Update train-time degradation schedule. Validation stays at full severity.
         deg_scale = curriculum.get_scale(epoch)
+        if degradation is not None and hasattr(degradation, "set_severity_scale"):
+            degradation.set_severity_scale(deg_scale)
+            mix_start = float(deg_cfg.get("mix_clean_probability_start", 0.0))
+            mix_end = float(deg_cfg.get("mix_clean_probability_end", 0.0))
+            mix_prob = mix_start + (mix_end - mix_start) * min(max(deg_scale, 0.0), 1.0)
+            if hasattr(degradation, "set_clean_probability"):
+                degradation.set_clean_probability(max(0.0, min(1.0, mix_prob)))
         if args.verbose or args.debug:
             logger.info("Epoch %d/%d started | global_step=%d | deg_scale=%.3f", epoch + 1, max_epochs, global_step, deg_scale)
         if is_main:
@@ -1012,10 +1075,11 @@ def main():
                 use_amp=use_amp,
                 writer=writer,
                 epoch=epoch,
-                teachers=active_teachers if active_teachers else None,
-                teacher_weights=teacher_weights if active_teachers else None,
+                teachers=active_teachers if (active_teachers and val_use_teacher_signals) else None,
+                teacher_weights=teacher_weights if (active_teachers and val_use_teacher_signals) else None,
                 log_img_max_B=log_img_max_B,
                 is_main=is_main,
+                use_teacher_signals=val_use_teacher_signals,
             )
 
             if ema is not None:
@@ -1105,8 +1169,9 @@ def main():
     # Final profiling (rank 0 only)
     # -----------------------------------------------------------------------
     if is_main:
+        image_size = tuple(data_cfg.get("image_size", [256, 256]))
         profiler = LatencyProfiler(
-            input_shape=(1, 3, 8, 256, 256),
+            input_shape=(1, 3, val_num_frames, int(image_size[0]), int(image_size[1])),
             target_fps=30.0,
         )
         try:

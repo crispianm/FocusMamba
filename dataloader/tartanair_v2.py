@@ -59,6 +59,8 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 
+from dataloader.degradation import LowLightDegradation
+
 
 def _decode_tartanair_depth(path: str) -> np.ndarray:
     """Decode a TartanAir v2 depth PNG (RGBA uint8 → float32 metres).
@@ -108,6 +110,9 @@ class TartanAirV2Dataset(Dataset):
         max_depth: float = 80.0,
         envs: Optional[List[str]] = None,
         teacher_cache_dir: Optional[str] = None,
+        degradation: Optional[LowLightDegradation] = None,
+        return_clean_and_degraded: bool = False,
+        return_clean_reference: bool = True,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -118,6 +123,11 @@ class TartanAirV2Dataset(Dataset):
         self.max_depth = max_depth
         self.camera = camera
         self.teacher_cache_dir = Path(teacher_cache_dir) if teacher_cache_dir else None
+        self.degradation = degradation
+        self.return_clean_and_degraded = bool(return_clean_and_degraded and degradation is not None)
+        self.return_clean_reference = bool(return_clean_reference and self.return_clean_and_degraded)
+        self.split = split
+        self.seed = int(seed)
 
         # --- Discover all trajectories with both image and depth -----------
         all_trajectories: List[Tuple[Path, Path]] = []  # (image_dir, depth_dir)
@@ -211,6 +221,7 @@ class TartanAirV2Dataset(Dataset):
 
         frames = torch.stack(imgs, dim=1)   # (3, T, H, W)
         depth = torch.stack(depths, dim=1)  # (1, T, H, W)
+        mask = (depth > 0).float()
 
         # Resize if needed
         H, W = self.image_size
@@ -229,13 +240,30 @@ class TartanAirV2Dataset(Dataset):
                 size=(H, W),
                 mode="nearest",
             ).permute(1, 0, 2, 3)  # (1, T, H, W)
+            mask = F.interpolate(
+                mask.permute(1, 0, 2, 3),
+                size=(H, W),
+                mode="nearest",
+            ).permute(1, 0, 2, 3)
 
         result: Dict = {
-            "frames": frames,
             "depth": depth,
+            "mask": mask,
             "video_id": video_id,
             "start_frame": start,
         }
+        if self.return_clean_and_degraded:
+            clip_tchw = frames.permute(1, 0, 2, 3).contiguous()
+            rng = None
+            if self.split != "train":
+                rng = np.random.RandomState(self.seed + idx)
+            degraded_clip = self.degradation(clip_tchw, rng=rng)
+            degraded_frames = degraded_clip.permute(1, 0, 2, 3).contiguous()
+            if self.return_clean_reference:
+                result["clean_frames"] = frames
+            result["degraded_frames"] = degraded_frames
+        else:
+            result["frames"] = frames
 
         # ── Load pre-cached teacher pseudo-labels (if available) ────────────
         # This eliminates the need to run expensive teacher forward passes

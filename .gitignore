@@ -26,9 +26,8 @@ youtube-vos/
 z_depth_investigation.ipynb
 zz_dataset.ipynb
 config.yaml
-MTKD_*.html
 
 # Vendored / external worktrees
 Video-Depth-Anything/
 configs/experiments/
-vda.html
+zz_info/

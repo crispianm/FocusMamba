@@ -881,6 +881,8 @@ class LowLightDegradation(nn.Module):
         self.apply_brightness_drop = bool(apply_brightness_drop)
         self.device = device
         self.output = output
+        self.severity_scale = 1.0
+        self.clean_probability = 0.0
         self.config = LowLightConfig(max_blur_kernel_size=self.blur_kernel_size)
         self.config.validate()
 
@@ -891,11 +893,17 @@ class LowLightDegradation(nn.Module):
 
     @property
     def effective_poisson_scale(self) -> float:
-        return self.poisson_scale_base * self.iso_gain
+        return self.poisson_scale_base * self.iso_gain * self.severity_scale
 
     @property
     def effective_gaussian_std(self) -> float:
-        return self.gaussian_std_base * self.iso_gain
+        return self.gaussian_std_base * self.iso_gain * self.severity_scale
+
+    def set_severity_scale(self, scale: float) -> None:
+        self.severity_scale = max(0.0, min(1.0, float(scale)))
+
+    def set_clean_probability(self, probability: float) -> None:
+        self.clean_probability = max(0.0, min(1.0, float(probability)))
 
     @staticmethod
     def _sample_uniform(
@@ -932,11 +940,11 @@ class LowLightDegradation(nn.Module):
             return torch.Generator().manual_seed(seed)
 
     def _blur_sigmas(self) -> tuple[float, float]:
-        if self.blur_intensity <= 0 or self.blur_kernel_size <= 1:
+        if self.severity_scale <= 0 or self.blur_intensity <= 0 or self.blur_kernel_size <= 1:
             return 0.0, 0.0
 
         # Map the old trajectory length heuristic to an anisotropic Gaussian.
-        max_extent = max(1.0, self.blur_intensity * self.blur_kernel_size * 0.35)
+        max_extent = max(0.35, self.blur_intensity * self.blur_kernel_size * 0.35 * self.severity_scale)
         max_supported_sigma = (self.config.max_blur_kernel_size // 2) / self.config.blur_truncate
         sigma_major = min(max_extent / math.sqrt(12.0), max_supported_sigma)
         sigma_minor = min(max(sigma_major * 0.25, 0.35), sigma_major)
@@ -954,7 +962,7 @@ class LowLightDegradation(nn.Module):
     ) -> LowLightParams:
         exposure_ev_value = 0.0
         if self.apply_brightness_drop:
-            exposure_ev_value = math.log2(max(self.lux_level / 50.0, 0.01))
+            exposure_ev_value = math.log2(max(self.lux_level / 50.0, 0.01)) * self.severity_scale
 
         jitter = torch.ones((batch_size, num_frames), device=device, dtype=dtype)
         if self.temporal_variance > 0:
@@ -1065,6 +1073,17 @@ class LowLightDegradation(nn.Module):
         """Apply low-light degradation using the new pipeline with old call semantics."""
         if not torch.is_tensor(frames):
             frames = torch.as_tensor(frames)
+
+        if self.severity_scale <= 0:
+            return (frames, params) if return_params else frames
+
+        if self.clean_probability > 0:
+            if rng is not None:
+                if float(rng.uniform()) < self.clean_probability:
+                    return (frames, params) if return_params else frames
+            else:
+                if float(torch.rand((), device="cpu")) < self.clean_probability:
+                    return (frames, params) if return_params else frames
 
         frames_cf, channels_last = self._normalize_layout(frames)
         process_device = torch.device(self.device) if self.device is not None else frames_cf.device
