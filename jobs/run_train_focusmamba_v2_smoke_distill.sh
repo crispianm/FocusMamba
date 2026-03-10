@@ -40,6 +40,17 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTHONFAULTHANDLER=1
 
+# Force torchrun and tempfile users onto a writable per-job location under HOME.
+TORCHRUN_HOME_ROOT="${TORCHRUN_HOME_ROOT:-${HOME}/.focusmamba/isambard}"
+TORCHRUN_TMP_ROOT="${TORCHRUN_HOME_ROOT}/tmp/${SLURM_JOB_ID:-local}"
+TORCHRUN_LOG_ROOT="${TORCHRUN_HOME_ROOT}/torchrun_logs/${SLURM_JOB_ID:-local}"
+mkdir -p "$TORCHRUN_TMP_ROOT" "$TORCHRUN_LOG_ROOT"
+export TMPDIR="$TORCHRUN_TMP_ROOT"
+export TEMP="$TORCHRUN_TMP_ROOT"
+export TMP="$TORCHRUN_TMP_ROOT"
+echo "TORCHRUN_TMP_ROOT=$TORCHRUN_TMP_ROOT"
+echo "TORCHRUN_LOG_ROOT=$TORCHRUN_LOG_ROOT"
+
 cd "$PROJECT_DIR" || { echo "ERROR: Cannot cd into $PROJECT_DIR"; exit 1; }
 
 if [ ! -f "$CONFIG" ]; then
@@ -123,6 +134,7 @@ torchrun \
   --nnodes=1 \
   --rdzv_backend=c10d \
   --rdzv_endpoint="localhost:${MASTER_PORT}" \
+  --log-dir "$TORCHRUN_LOG_ROOT" \
   train.py \
   --config "$CONFIG" \
   --verbose \

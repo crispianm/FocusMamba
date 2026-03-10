@@ -47,6 +47,17 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTHONFAULTHANDLER=1
 
+# Force torchrun and tempfile users onto a writable per-job location under HOME.
+TORCHRUN_HOME_ROOT="${TORCHRUN_HOME_ROOT:-${HOME}/.focusmamba/isambard}"
+TORCHRUN_TMP_ROOT="${TORCHRUN_HOME_ROOT}/tmp/${SLURM_JOB_ID:-local}"
+TORCHRUN_LOG_ROOT="${TORCHRUN_HOME_ROOT}/torchrun_logs/${SLURM_JOB_ID:-local}"
+mkdir -p "$TORCHRUN_TMP_ROOT" "$TORCHRUN_LOG_ROOT"
+export TMPDIR="$TORCHRUN_TMP_ROOT"
+export TEMP="$TORCHRUN_TMP_ROOT"
+export TMP="$TORCHRUN_TMP_ROOT"
+echo "TORCHRUN_TMP_ROOT=$TORCHRUN_TMP_ROOT"
+echo "TORCHRUN_LOG_ROOT=$TORCHRUN_LOG_ROOT"
+
 cd "$PROJECT_DIR" || { echo "ERROR: Cannot cd into $PROJECT_DIR"; exit 1; }
 
 if [ ! -f "$CONFIG" ]; then
@@ -82,12 +93,14 @@ teachers = cfg.get("teachers", []) or []
 data = cfg.get("data", {}) or {}
 
 checkpoint_dir = training.get("checkpoint_dir", f"checkpoints/{p.stem}")
+log_dir = training.get("log_dir", f"runs/{p.stem}")
 skip_live = bool(training.get("skip_live_teachers", bool(data.get("teacher_cache_dir"))))
 distill_enabled = bool(distill.get("enabled", False))
 cache_dir = data.get("teacher_cache_dir", "") or ""
 teacher_count = len([t for t in teachers if t.get("enabled", True)])
 
 print(checkpoint_dir)
+print(log_dir)
 print("1" if skip_live else "0")
 print("1" if distill_enabled else "0")
 print(cache_dir)
@@ -96,10 +109,11 @@ PY
 )
 
 CHECKPOINT_DIR="${CFG_META[0]}"
-SKIP_LIVE="${CFG_META[1]}"
-DISTILL_ENABLED="${CFG_META[2]}"
-CACHE_DIR="${CFG_META[3]}"
-TEACHER_COUNT="${CFG_META[4]}"
+LOG_DIR="${CFG_META[1]}"
+SKIP_LIVE="${CFG_META[2]}"
+DISTILL_ENABLED="${CFG_META[3]}"
+CACHE_DIR="${CFG_META[4]}"
+TEACHER_COUNT="${CFG_META[5]}"
 
 # Distillation guard: fail fast if config asks for cache-only teachers but cache is unavailable.
 if [ "$DISTILL_ENABLED" = "1" ] && [ "$TEACHER_COUNT" -gt 0 ] && [ "$SKIP_LIVE" = "1" ]; then
@@ -118,6 +132,10 @@ fi
 if [ "${RESET_CHECKPOINTS:-0}" = "1" ] && [ -d "$CHECKPOINT_DIR" ]; then
   echo "RESET_CHECKPOINTS=1 -> removing prior checkpoint dir: $CHECKPOINT_DIR"
   rm -rf "$CHECKPOINT_DIR"
+fi
+if [ "${RESET_CHECKPOINTS:-0}" = "1" ] && [ -d "$LOG_DIR" ]; then
+  echo "RESET_CHECKPOINTS=1 -> clearing prior log dir contents (preserving slurm logs dir): $LOG_DIR"
+  find "$LOG_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
 fi
 
 # ---------------------------------------------------------------------------
@@ -147,10 +165,10 @@ torchrun \
   --nnodes=1 \
   --rdzv_backend=c10d \
   --rdzv_endpoint="localhost:${MASTER_PORT}" \
+  --log-dir "$TORCHRUN_LOG_ROOT" \
   train.py \
   --config "$CONFIG" \
   --verbose \
-  --debug \
   $RESUME_FLAG \
   $EXTRA_TRAIN_ARGS
 set +x

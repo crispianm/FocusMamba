@@ -169,8 +169,24 @@ for idx in $(seq 0 $((SUBMIT_N - 1))); do
   CFG_PATH="${line#*|}"
 
   JOB_NAME="vda_${RUN_TAG}_${EXP_NAME}"
-  OUT_LOG="./logs/${JOB_NAME}_%j.out"
-  ERR_LOG="./logs/${JOB_NAME}_%j.err"
+  RUN_LOG_DIR="$(${PROJECT_DIR}/.venv/bin/python - <<'PY' "$CFG_PATH" "$PROJECT_DIR"
+from pathlib import Path
+import sys
+import yaml
+
+config_path = Path(sys.argv[1])
+project_dir = Path(sys.argv[2])
+with config_path.open("r") as f:
+    cfg = yaml.safe_load(f) or {}
+log_dir = Path(cfg.get("training", {}).get("log_dir", f"runs/{config_path.stem}"))
+if not log_dir.is_absolute():
+    log_dir = project_dir / log_dir
+print(log_dir / "logs")
+PY
+)"
+  mkdir -p "$RUN_LOG_DIR"
+  OUT_LOG="${RUN_LOG_DIR}/${JOB_NAME}_%j.out"
+  ERR_LOG="${RUN_LOG_DIR}/${JOB_NAME}_%j.err"
 
   echo "Submitting: $EXP_NAME"
   SBATCH_OUT=$(sbatch \
