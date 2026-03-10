@@ -38,6 +38,9 @@ def build_model(cfg: dict) -> "torch.nn.Module":
 
     data_cfg = cfg.get("data", {})
     predict_uncertainty = cfg.get("loss", {}).get("uncertainty_nll_weight", 0) > 0
+    train_frames = int(data_cfg.get("train_num_frames", data_cfg.get("num_frames", 8)))
+    val_frames = int(data_cfg.get("val_num_frames", data_cfg.get("num_frames", train_frames)))
+    model_num_frames = int(model_cfg.get("num_frames", max(train_frames, val_frames)))
 
     if model_type == "mamba":
         model = FocusMamba(
@@ -54,7 +57,7 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             num_blocks=model_cfg.get("num_blocks", None),
             out_indices=model_cfg.get("out_indices", None),
             mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
-            num_frames=model_cfg.get("num_frames", data_cfg.get("num_frames", 8)),
+            num_frames=model_num_frames,
             positional_encoding=model_cfg.get("positional_encoding", "ape"),
             checkpoint_path=model_cfg.get("checkpoint_path", None),
             strict_checkpoint=bool(model_cfg.get("strict_checkpoint", False)),
@@ -82,20 +85,23 @@ def build_model(cfg: dict) -> "torch.nn.Module":
     elif model_type in ("video_depth_anything", "vda"):
         model = VideoDepthAnythingModel(
             variant=model_cfg.get("variant", "small"),
-            num_frames=model_cfg.get("num_frames", data_cfg.get("num_frames", 8)),
+            num_frames=model_num_frames,
             positional_encoding=model_cfg.get("positional_encoding", "ape"),
             checkpoint_path=model_cfg.get("checkpoint_path", None),
             strict_checkpoint=bool(model_cfg.get("strict_checkpoint", False)),
-            tiny_arch=model_cfg.get("tiny_arch", "dual_dinov3"),
-            tiny_dino_model_name=model_cfg.get("tiny_dino_model_name", "vit_small_patch16_dinov3"),
-            tiny_pretrained=bool(model_cfg.get("tiny_pretrained", True)),
-            tiny_relative_bounded=bool(model_cfg.get("tiny_relative_bounded", True)),
-            tiny_relative_activation=model_cfg.get("tiny_relative_activation", "softplus"),
-            tiny_metric_activation=model_cfg.get("tiny_metric_activation", "softplus"),
-            tiny_out_indices=model_cfg.get("tiny_out_indices", None),
-            legacy_metric_bridge=model_cfg.get("legacy_metric_bridge", "auto"),
-            legacy_reciprocal_floor=float(model_cfg.get("legacy_reciprocal_floor", 1e-2)),
-            legacy_metric_activation=model_cfg.get("legacy_metric_activation", "softplus"),
+            mode=model_cfg.get("mode", model_cfg.get("streaming_mode", "offline")),
+            stream_max_cache_len=model_cfg.get("stream_max_cache_len", None),
+            stream_reset_interval=int(model_cfg.get("stream_reset_interval", 0)),
+            state_gate_enabled=bool(model_cfg.get("state_gate_enabled", False)),
+            state_gate_reduction=int(model_cfg.get("state_gate_reduction", 8)),
+            state_gate_stage_mask=model_cfg.get("state_gate_stage_mask", None),
+            prefilter_enabled=bool(model_cfg.get("prefilter_enabled", False)),
+            prefilter_type=str(model_cfg.get("prefilter_type", "fast_classical")),
+            prefilter_kernel_size=int(model_cfg.get("prefilter_kernel_size", 5)),
+            prefilter_sigma=float(model_cfg.get("prefilter_sigma", 1.0)),
+            prefilter_denoise_init=float(model_cfg.get("prefilter_denoise_init", 0.20)),
+            prefilter_sharpen_init=float(model_cfg.get("prefilter_sharpen_init", 0.10)),
+            prefilter_learnable=bool(model_cfg.get("prefilter_learnable", True)),
         )
     else:
         raise ValueError(

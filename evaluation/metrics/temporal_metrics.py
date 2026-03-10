@@ -1,11 +1,4 @@
-"""
-Temporal Metrics
-=================
-
-Temporal consistency error (OPW), flicker score.
-
-Stub — user implements optical-flow-warping consistency.
-"""
+"""Temporal metrics for streaming depth evaluation."""
 
 from __future__ import annotations
 
@@ -33,17 +26,42 @@ def temporal_consistency_error(
     )
 
 
-def flicker_score(depth_sequence: torch.Tensor) -> float:
-    """Compute depth flicker score — mean absolute frame-to-frame depth change.
+def frame_depth_variation(
+    depth_sequence: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> float:
+    """Compute normalized frame-to-frame depth variation.
 
     Args:
-        depth_sequence: (B, 1, T, H, W) depth predictions.
+        depth_sequence: (B, 1, T, H, W) predicted depth.
+        mask: Optional validity mask with the same shape.
+        eps: Numerical floor for normalization.
 
     Returns:
-        Mean flicker magnitude.
+        Mean absolute consecutive prediction difference normalized by the
+        sequence mean predicted depth, yielding a dimensionless temporal score.
     """
-    # Simple proxy: mean absolute difference between consecutive frames
     if depth_sequence.shape[2] < 2:
         return 0.0
-    diffs = (depth_sequence[:, :, 1:] - depth_sequence[:, :, :-1]).abs()
-    return diffs.mean().item()
+    depth = depth_sequence.float()
+    diffs = (depth[:, :, 1:] - depth[:, :, :-1]).abs()
+
+    if mask is not None:
+        pair_mask = mask[:, :, 1:].bool() & mask[:, :, :-1].bool()
+        if pair_mask.any():
+            diff_mean = diffs[pair_mask].mean()
+            mean_depth = depth[mask.bool()].abs().mean() if mask.bool().any() else depth.abs().mean()
+        else:
+            return 0.0
+    else:
+        diff_mean = diffs.mean()
+        mean_depth = depth.abs().mean()
+
+    mean_depth = mean_depth.clamp_min(eps)
+    return (diff_mean / mean_depth).item()
+
+
+def flicker_score(depth_sequence: torch.Tensor) -> float:
+    """Backward-compatible alias for the formal FDV metric."""
+    return frame_depth_variation(depth_sequence)

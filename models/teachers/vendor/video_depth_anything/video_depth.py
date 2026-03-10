@@ -24,6 +24,9 @@ class VideoDepthAnything(nn.Module):
         num_frames=32,
         pe='ape',
         metric=False,
+        state_gate_enabled: bool = False,
+        state_gate_reduction: int = 8,
+        state_gate_stage_mask=None,
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -40,6 +43,9 @@ class VideoDepthAnything(nn.Module):
             self.pretrained.embed_dim, features, use_bn,
             out_channels=out_channels, use_clstoken=use_clstoken,
             num_frames=num_frames, pe=pe,
+            state_gate_enabled=state_gate_enabled,
+            state_gate_reduction=state_gate_reduction,
+            state_gate_stage_mask=state_gate_stage_mask,
         )
         self.metric = metric
 

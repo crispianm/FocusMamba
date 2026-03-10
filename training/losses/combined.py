@@ -35,6 +35,10 @@ class CombinedLoss(nn.Module):
         # Optional absolute metric anchors (useful for Stage-B conversion).
         self.metric_l1_weight = float(cfg.get("metric_l1_weight", 0.0))
         self.metric_log_l1_weight = float(cfg.get("metric_log_l1_weight", 0.0))
+        auxiliary_cfg = cfg.get("auxiliary", {}) or {}
+        self.feature_alignment_weight = float(auxiliary_cfg.get("feature_alignment_weight", 0.0))
+        self.clean_depth_consistency_weight = float(auxiliary_cfg.get("clean_depth_consistency_weight", 0.0))
+        self.clean_depth_consistency_mode = str(auxiliary_cfg.get("clean_depth_consistency_mode", "log_l1")).lower()
         self.target_mode = str(cfg.get("training_target", "metric")).lower()
         if self.target_mode not in ("metric", "relative"):
             raise ValueError(f"Unknown loss.training_target={self.target_mode!r}")
@@ -59,10 +63,7 @@ class CombinedLoss(nn.Module):
                     "clamp": self.relative_clamp,
                 }
             self.distillation = DistillationLoss(
-                teacher_configs=distillation_cfg.get("teachers", []),
-                confidence_weighted=distillation_cfg.get("confidence_weighted", True),
-                lambda_si=float(distillation_cfg.get("lambda_si", 0.5)),
-                mtkd_cfg=distillation_cfg.get("mtkd", {}),
+                distillation_cfg=distillation_cfg,
                 target_mode=distillation_cfg.get("target_mode", self.target_mode),
                 relative_cfg=relative_cfg,
             )
@@ -144,7 +145,12 @@ class CombinedLoss(nn.Module):
         # Distillation.
         if self.distillation is not None and teacher_depths:
             distill_pred = student_relative if self.target_mode == "relative" else student_depth
-            distill_losses = self.distillation(distill_pred, teacher_depths, mask)
+            distill_losses = self.distillation(
+                distill_pred,
+                teacher_depths,
+                mask=mask,
+                gt_depth=gt_depth,
+            )
             distill_total = distill_losses.get("total", torch.tensor(0.0, device=student_depth.device))
             total = total + (self.distillation_weight * distill_total)
             losses.update(distill_losses)
@@ -201,3 +207,59 @@ class CombinedLoss(nn.Module):
 
         losses["total"] = total
         return losses
+
+    @property
+    def active_teacher_names(self) -> tuple[str, ...]:
+        if self.distillation is None:
+            return ()
+        return self.distillation.configured_teacher_names
+
+    @property
+    def wants_auxiliary_clean_pass(self) -> bool:
+        return self.feature_alignment_weight > 0 or self.clean_depth_consistency_weight > 0
+
+    @property
+    def wants_feature_summary(self) -> bool:
+        return self.feature_alignment_weight > 0
+
+    def auxiliary_consistency_losses(
+        self,
+        student_outputs: Dict[str, torch.Tensor],
+        clean_outputs: Dict[str, torch.Tensor],
+        *,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {}
+        device = student_outputs["depth"].device
+        total = self._zero_loss(device)
+
+        if self.feature_alignment_weight > 0:
+            student_summary = student_outputs.get("feature_summary")
+            clean_summary = clean_outputs.get("feature_summary")
+            if student_summary is not None and clean_summary is not None:
+                feature_loss = (student_summary - clean_summary.detach()).abs().mean()
+                total = total + self.feature_alignment_weight * feature_loss
+                losses["aux/feature_alignment"] = feature_loss.detach()
+
+        if self.clean_depth_consistency_weight > 0:
+            student_depth = student_outputs["depth"]
+            clean_depth = clean_outputs["depth"].detach()
+            if self.clean_depth_consistency_mode == "si":
+                aligned_student = self.ssi.align_scale_shift(student_depth, clean_depth, mask=mask)
+                depth_consistency = self.ssi(student_depth, clean_depth, mask=mask, aligned_pred=aligned_student)
+            elif self.clean_depth_consistency_mode == "l1":
+                depth_consistency = self._masked_l1(student_depth, clean_depth, mask=mask)
+            else:
+                depth_consistency = self._masked_l1(
+                    torch.log(student_depth.clamp(min=self.eps)),
+                    torch.log(clean_depth.clamp(min=self.eps)),
+                    mask=mask,
+                )
+            total = total + self.clean_depth_consistency_weight * depth_consistency
+            losses["aux/clean_depth_consistency"] = depth_consistency.detach()
+
+        losses["aux/total"] = total
+        return losses
+
+    def _zero_loss(self, device: torch.device | str) -> torch.Tensor:
+        return torch.tensor(0.0, device=device)

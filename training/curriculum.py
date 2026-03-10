@@ -31,6 +31,9 @@ class CurriculumScheduler:
         max_severity_epoch: int = 100,
         schedule: str = "linear",
         total_epochs: int | None = None,
+        warmup_start_scale: float = 0.0,
+        min_scale: float = 0.1,
+        max_scale: float = 1.0,
     ):
         self.warmup_epochs = warmup_epochs
         # Allow total_epochs as alias for max_severity_epoch
@@ -39,6 +42,9 @@ class CurriculumScheduler:
         else:
             self.max_severity_epoch = max_severity_epoch
         self.schedule = schedule
+        self.warmup_start_scale = float(warmup_start_scale)
+        self.min_scale = float(min_scale)
+        self.max_scale = float(max_scale)
 
     def get_scale(self, epoch: int) -> float:
         """Get the current severity scale for a given epoch.
@@ -47,8 +53,8 @@ class CurriculumScheduler:
             float in [0, 1]. 0 = no degradation, 1 = full severity range.
         """
         if epoch < self.warmup_epochs:
-            # During warmup, scale linearly from 0 to a small value
-            return 0.1 * (epoch / max(1, self.warmup_epochs))
+            progress = epoch / max(1, self.warmup_epochs)
+            return self.warmup_start_scale + (self.min_scale - self.warmup_start_scale) * progress
 
         # After warmup, ramp to 1.0
         progress = (epoch - self.warmup_epochs) / max(
@@ -63,8 +69,8 @@ class CurriculumScheduler:
             # Linear schedule
             scale = progress
 
-        # Map from [0, 1] progress to [0.1, 1.0] severity
-        return 0.1 + 0.9 * scale
+        # Map from [0, 1] progress to [min_scale, max_scale] severity
+        return self.min_scale + (self.max_scale - self.min_scale) * scale
 
     @classmethod
     def from_config(cls, cfg: Dict[str, Any]) -> "CurriculumScheduler":
@@ -82,4 +88,7 @@ class CurriculumScheduler:
             warmup_epochs=curriculum_cfg.get("warmup_epochs", 10),
             max_severity_epoch=curriculum_cfg.get("max_severity_epoch", 100),
             schedule=curriculum_cfg.get("schedule", "linear"),
+            warmup_start_scale=curriculum_cfg.get("warmup_start_scale", 0.0),
+            min_scale=curriculum_cfg.get("min_scale", 0.1),
+            max_scale=curriculum_cfg.get("max_scale", 1.0),
         )
