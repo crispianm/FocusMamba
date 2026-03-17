@@ -31,3 +31,4 @@ config.yaml
 Video-Depth-Anything/
 configs/experiments/
 zz_info/
+tmp/
