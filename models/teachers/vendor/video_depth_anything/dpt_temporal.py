@@ -39,6 +39,33 @@ class StageResidualCacheGate(nn.Module):
         return self.mlp(gate_input)
 
 
+class PreTemporalStageAdapter(nn.Module):
+    """Tiny identity-initialized per-frame adapter before temporal mixing."""
+
+    def __init__(self, channels: int, bottleneck_ratio: int = 4):
+        super().__init__()
+        hidden = max(int(channels) // max(int(bottleneck_ratio), 1), 8)
+        self.reduce = nn.Conv2d(int(channels), hidden, kernel_size=1, bias=True)
+        self.depthwise = nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=True)
+        self.act = nn.GELU()
+        self.expand = nn.Conv2d(hidden, int(channels), kernel_size=1, bias=True)
+        self.output_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+        nn.init.zeros_(self.expand.weight)
+        nn.init.zeros_(self.expand.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, num_frames, height, width = x.shape
+        residual = x.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        residual = self.reduce(residual)
+        residual = self.depthwise(residual)
+        residual = self.act(residual)
+        residual = self.expand(residual)
+        residual = residual.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4)
+        scale = 0.25 * torch.tanh(self.output_scale).to(device=x.device, dtype=x.dtype)
+        return x + scale * residual
+
+
 class DPTHeadTemporal(DPTHead):
     def __init__(self, 
         in_channels, 
@@ -53,6 +80,9 @@ class DPTHeadTemporal(DPTHead):
         state_gate_enabled: bool = False,
         state_gate_reduction: int = 8,
         state_gate_stage_mask=None,
+        pre_temporal_stage_adapter_enabled: bool = False,
+        pre_temporal_stage_adapter_stages=None,
+        pre_temporal_stage_adapter_bottleneck_ratio: int = 4,
     ):
         super().__init__(
             in_channels,
@@ -98,6 +128,47 @@ class DPTHeadTemporal(DPTHead):
             StageResidualCacheGate(features, reduction=state_gate_reduction),
             StageResidualCacheGate(features, reduction=state_gate_reduction),
         ]) if self.state_gate_enabled else None
+        self.pre_temporal_stage_adapter_enabled = bool(pre_temporal_stage_adapter_enabled)
+        self.pre_temporal_stage_adapter_stage_names = set()
+        if self.pre_temporal_stage_adapter_enabled:
+            raw_stage_names = (
+                ["layer3", "layer4"] if pre_temporal_stage_adapter_stages is None
+                else [str(name) for name in pre_temporal_stage_adapter_stages]
+            )
+            normalized_stage_names = {
+                str(name).strip().lower().replace("_", "") for name in raw_stage_names
+            }
+            valid_stage_names = {"layer3", "layer4"}
+            invalid_stage_names = sorted(normalized_stage_names - valid_stage_names)
+            if invalid_stage_names:
+                raise ValueError(
+                    "pre_temporal_stage_adapter_stages only supports layer3/layer4, "
+                    f"got {invalid_stage_names!r}"
+                )
+            self.pre_temporal_stage_adapter_stage_names = normalized_stage_names
+            adapters = {}
+            if "layer3" in normalized_stage_names:
+                adapters["layer3"] = PreTemporalStageAdapter(
+                    out_channels[2],
+                    bottleneck_ratio=pre_temporal_stage_adapter_bottleneck_ratio,
+                )
+            if "layer4" in normalized_stage_names:
+                adapters["layer4"] = PreTemporalStageAdapter(
+                    out_channels[3],
+                    bottleneck_ratio=pre_temporal_stage_adapter_bottleneck_ratio,
+                )
+            self.pre_temporal_stage_adapters = nn.ModuleDict(adapters)
+        else:
+            self.pre_temporal_stage_adapters = None
+
+    def _maybe_apply_pre_temporal_stage_adapter(self, stage_name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.pre_temporal_stage_adapter_enabled or self.pre_temporal_stage_adapters is None:
+            return tensor
+        normalized_name = str(stage_name).strip().lower().replace("_", "")
+        if normalized_name not in self.pre_temporal_stage_adapters:
+            return tensor
+        adapter = self.pre_temporal_stage_adapters[normalized_name]
+        return adapter(tensor)
 
     def _gate_stage_cache(self, current_stage, cached_stage_list, stage_idx):
         batch_size = current_stage.shape[0]
@@ -179,11 +250,13 @@ class DPTHeadTemporal(DPTHead):
         gate_means = []
 
         layer_3_seq = layer_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)
+        layer_3_seq = self._maybe_apply_pre_temporal_stage_adapter("layer3", layer_3_seq)
         layer_3_cache, gate_mean = self._gate_stage_cache(layer_3_seq, list(cached_hidden_state_list[0:N]) if N else None, 0)
         gate_means.append(gate_mean)
         layer_3, h0 = self.motion_modules[0](layer_3_seq, None, None, layer_3_cache)
         layer_3 = layer_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
         layer_4_seq = layer_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)
+        layer_4_seq = self._maybe_apply_pre_temporal_stage_adapter("layer4", layer_4_seq)
         layer_4_cache, gate_mean = self._gate_stage_cache(layer_4_seq, list(cached_hidden_state_list[N:2*N]) if N else None, 1)
         gate_means.append(gate_mean)
         layer_4, h1 = self.motion_modules[1](layer_4_seq, None, None, layer_4_cache)

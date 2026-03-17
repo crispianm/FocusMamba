@@ -50,6 +50,15 @@ _STREAM_MODES = {"offline", "streaming_emulated"}
 _NUM_TEMPORAL_STAGES = 4
 
 
+def _materialize_const_tensor(tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Clone non-trainable tensors so repeated forwards stay safe under DDP buffer broadcasts."""
+
+    materialized = tensor.to(device=device, dtype=dtype)
+    if materialized.requires_grad:
+        return materialized
+    return materialized.clone()
+
+
 class FastClassicalPrefilter(nn.Module):
     """Very cheap denoise+deblur front-end with learnable scalar strengths.
 
@@ -102,7 +111,7 @@ class FastClassicalPrefilter(nn.Module):
     def _blur(self, x: torch.Tensor) -> torch.Tensor:
         pad = self.kernel_size // 2
         x = F.pad(x, (pad, pad, pad, pad), mode="reflect")
-        kernel = self.kernel.to(device=x.device, dtype=x.dtype).expand(x.shape[1], 1, -1, -1)
+        kernel = _materialize_const_tensor(self.kernel, device=x.device, dtype=x.dtype).expand(x.shape[1], 1, -1, -1)
         return F.conv2d(x, kernel, groups=x.shape[1])
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
@@ -122,7 +131,7 @@ class FastClassicalPrefilter(nn.Module):
             lowpass = self._blur(denoised).to(dtype=x.dtype)
             sharpen_strength = torch.sigmoid(self.sharpen_logit).to(device=x.device, dtype=x.dtype).view(1, 1, 1, 1)
             sharpened = denoised + sharpen_strength * (denoised - lowpass)
-            filtered = sharpened.clamp_(0.0, 1.0)
+            filtered = sharpened.clamp(0.0, 1.0)
 
         filtered = filtered.to(dtype=input_dtype)
         return filtered.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
@@ -157,11 +166,110 @@ class ChannelStatsAlignPrefilter(nn.Module):
         x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
         frame_mean = x.mean(dim=(2, 3), keepdim=True)
         frame_std = x.std(dim=(2, 3), keepdim=True, unbiased=False).clamp_min(self.eps)
-        target_mean = self.target_mean.to(device=x.device, dtype=x.dtype)
-        target_std = self.target_log_std.to(device=x.device, dtype=x.dtype).exp().clamp_min(self.eps)
+        target_mean = _materialize_const_tensor(self.target_mean, device=x.device, dtype=x.dtype)
+        target_log_std = self.target_log_std.to(device=x.device, dtype=x.dtype)
+        if not target_log_std.requires_grad:
+            target_log_std = target_log_std.clone()
+        target_std = target_log_std.exp().clamp_min(self.eps)
         aligned = (x - frame_mean) / frame_std * target_std + target_mean
-        aligned = aligned.clamp_(0.0, 1.0)
+        aligned = aligned.clamp(0.0, 1.0)
         return aligned.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
+
+
+class StatsConditionSE(nn.Module):
+    """Tiny stats-conditioned channel modulation from per-frame RGB mean/std."""
+
+    def __init__(self, hidden_channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        reduced = max(int(hidden_channels) // max(int(reduction), 1), 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(6, reduced),
+            nn.GELU(),
+            nn.Linear(reduced, hidden_channels),
+        )
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+
+    def forward(self, stats: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.mlp(stats))
+
+
+class StatsGuidedResidualBlock(nn.Module):
+    """Identity-initialized residual RGB refinement block."""
+
+    def __init__(self, hidden_channels: int = 16, use_se: bool = True) -> None:
+        super().__init__()
+        self.use_se = bool(use_se)
+        self.conv_in = nn.Conv2d(3, hidden_channels, kernel_size=1, bias=True)
+        self.depthwise = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=3,
+            padding=1,
+            groups=hidden_channels,
+            bias=True,
+        )
+        self.act = nn.GELU()
+        self.conv_out = nn.Conv2d(hidden_channels, 3, kernel_size=1, bias=True)
+        self.condition = StatsConditionSE(hidden_channels) if self.use_se else None
+        self.output_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+        nn.init.zeros_(self.conv_out.weight)
+        nn.init.zeros_(self.conv_out.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        frame_mean = x.mean(dim=(2, 3))
+        frame_std = x.std(dim=(2, 3), unbiased=False).clamp_min(1e-4)
+        stats = torch.cat([frame_mean, frame_std], dim=1)
+
+        residual = self.conv_in(x)
+        residual = self.depthwise(residual)
+        if self.condition is not None:
+            gate = self.condition(stats).to(device=x.device, dtype=x.dtype).view(x.shape[0], -1, 1, 1)
+            residual = residual * (1.0 + 0.1 * gate)
+        residual = self.act(residual)
+        residual = self.conv_out(residual)
+        scale = 0.25 * torch.tanh(self.output_scale).to(device=x.device, dtype=x.dtype)
+        return (x + scale * residual).clamp(0.0, 1.0)
+
+
+class StatsGuidedFrontAdapter(nn.Module):
+    """Stats alignment followed by tiny identity-initialized residual refinement."""
+
+    def __init__(
+        self,
+        *,
+        hidden_channels: int = 16,
+        num_blocks: int = 2,
+        use_stats_align: bool = True,
+        use_se: bool = True,
+        target_mean: Sequence[float] = (0.485, 0.456, 0.406),
+        target_std: Sequence[float] = (0.229, 0.224, 0.225),
+        learnable_stats: bool = False,
+    ) -> None:
+        super().__init__()
+        self.stats_align = (
+            ChannelStatsAlignPrefilter(
+                target_mean=target_mean,
+                target_std=target_std,
+                learnable=learnable_stats,
+            )
+            if use_stats_align
+            else None
+        )
+        self.blocks = nn.ModuleList(
+            StatsGuidedResidualBlock(hidden_channels=hidden_channels, use_se=use_se)
+            for _ in range(max(int(num_blocks), 1))
+        )
+
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        if self.stats_align is not None:
+            frames = self.stats_align(frames)
+        batch_size, channels, num_frames, height, width = frames.shape
+        x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        for block in self.blocks:
+            x = block(x)
+        return x.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
 
 
 class TinyAffineNormalizer(nn.Module):
@@ -189,7 +297,7 @@ class TinyAffineNormalizer(nn.Module):
         scale_delta, shift = stats[:, :channels], stats[:, channels:]
         scale = 1.0 + self.max_scale_delta * torch.tanh(scale_delta).view(-1, channels, 1, 1)
         shift = self.max_shift * torch.tanh(shift).view(-1, channels, 1, 1)
-        normalized = (x * scale + shift).clamp_(0.0, 1.0)
+        normalized = (x * scale + shift).clamp(0.0, 1.0)
         return normalized.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
 
 
@@ -207,7 +315,7 @@ class DepthwiseResidualNormalizer(nn.Module):
         x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
         residual = self.depthwise(x)
         scale = 0.25 * torch.tanh(self.residual_logit).to(device=x.device, dtype=x.dtype)
-        normalized = (x + scale * residual).clamp_(0.0, 1.0)
+        normalized = (x + scale * residual).clamp(0.0, 1.0)
         return normalized.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
 
 
@@ -257,6 +365,13 @@ class VideoDepthAnythingModel(nn.Module):
         prefilter_denoise_init: float = 0.20,
         prefilter_sharpen_init: float = 0.10,
         prefilter_learnable: bool = True,
+        front_adapter_hidden: int = 16,
+        front_adapter_blocks: int = 2,
+        front_adapter_use_stats_align: bool = True,
+        front_adapter_use_se: bool = True,
+        pre_temporal_stage_adapter_enabled: bool = False,
+        pre_temporal_stage_adapter_stages: Sequence[str] | None = None,
+        pre_temporal_stage_adapter_bottleneck_ratio: int = 4,
     ) -> None:
         super().__init__()
 
@@ -293,6 +408,9 @@ class VideoDepthAnythingModel(nn.Module):
             state_gate_enabled=self.state_gate_enabled,
             state_gate_reduction=int(state_gate_reduction),
             state_gate_stage_mask=state_gate_stage_mask,
+            pre_temporal_stage_adapter_enabled=bool(pre_temporal_stage_adapter_enabled),
+            pre_temporal_stage_adapter_stages=pre_temporal_stage_adapter_stages,
+            pre_temporal_stage_adapter_bottleneck_ratio=int(pre_temporal_stage_adapter_bottleneck_ratio),
         )
         self.prefilter = self._build_prefilter(
             enabled=self.prefilter_enabled,
@@ -304,6 +422,10 @@ class VideoDepthAnythingModel(nn.Module):
             denoise_init=float(prefilter_denoise_init),
             sharpen_init=float(prefilter_sharpen_init),
             learnable=bool(prefilter_learnable),
+            front_adapter_hidden=int(front_adapter_hidden),
+            front_adapter_blocks=int(front_adapter_blocks),
+            front_adapter_use_stats_align=bool(front_adapter_use_stats_align),
+            front_adapter_use_se=bool(front_adapter_use_se),
         )
 
         self.register_buffer(
@@ -328,16 +450,27 @@ class VideoDepthAnythingModel(nn.Module):
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         cleaned_state = _clean_checkpoint_state_dict(checkpoint)
 
-        current_state = self.model.state_dict()
+        current_state = self.state_dict()
+        wrapper_state = {key for key in current_state if not key.startswith("model.")}
+        model_state = self.model.state_dict()
         compatible_state: dict[str, torch.Tensor] = {}
         skipped_shape: list[str] = []
         for key, value in cleaned_state.items():
-            if key in current_state and current_state[key].shape == value.shape:
+            if key in wrapper_state and current_state[key].shape == value.shape:
                 compatible_state[key] = value
-            elif key in current_state:
+                continue
+            if key in wrapper_state:
                 skipped_shape.append(key)
+                continue
 
-        missing_keys, unexpected_keys = self.model.load_state_dict(compatible_state, strict=False)
+            model_key = f"model.{key}"
+            if key in model_state and current_state[model_key].shape == value.shape:
+                compatible_state[model_key] = value
+                continue
+            if key in model_state:
+                skipped_shape.append(model_key)
+
+        missing_keys, unexpected_keys = self.load_state_dict(compatible_state, strict=False)
         if strict and (missing_keys or unexpected_keys or skipped_shape):
             raise RuntimeError(
                 "Strict checkpoint loading failed for VideoDepthAnythingModel. "
@@ -487,8 +620,8 @@ class VideoDepthAnythingModel(nn.Module):
 
         _, _, _, padded_h, padded_w = frames.shape
         x = frames.permute(0, 2, 1, 3, 4)
-        mean = self._mean.to(device=x.device, dtype=x.dtype)
-        std = self._std.to(device=x.device, dtype=x.dtype)
+        mean = _materialize_const_tensor(self._mean, device=x.device, dtype=x.dtype)
+        std = _materialize_const_tensor(self._std, device=x.device, dtype=x.dtype)
         x = (x - mean) / std
         return x, batch_size, num_frames, height, width, padded_h, padded_w
 
@@ -613,6 +746,10 @@ class VideoDepthAnythingModel(nn.Module):
         denoise_init: float,
         sharpen_init: float,
         learnable: bool,
+        front_adapter_hidden: int,
+        front_adapter_blocks: int,
+        front_adapter_use_stats_align: bool,
+        front_adapter_use_se: bool,
     ) -> nn.Module | None:
         if not enabled:
             return None
@@ -634,5 +771,15 @@ class VideoDepthAnythingModel(nn.Module):
             return TinyAffineNormalizer()
         if prefilter_type == "depthwise":
             return DepthwiseResidualNormalizer()
-        valid = ", ".join(("fast_classical", "stats_align", "learned_affine", "depthwise"))
+        if prefilter_type == "stats_guided_front_adapter":
+            return StatsGuidedFrontAdapter(
+                hidden_channels=front_adapter_hidden,
+                num_blocks=front_adapter_blocks,
+                use_stats_align=front_adapter_use_stats_align,
+                use_se=front_adapter_use_se,
+                target_mean=(0.485, 0.456, 0.406) if target_mean is None else target_mean,
+                target_std=(0.229, 0.224, 0.225) if target_std is None else target_std,
+                learnable_stats=learnable,
+            )
+        valid = ", ".join(("fast_classical", "stats_align", "learned_affine", "depthwise", "stats_guided_front_adapter"))
         raise ValueError(f"Unknown prefilter_type={prefilter_type!r}. Valid: {valid}")

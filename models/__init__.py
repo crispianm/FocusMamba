@@ -129,6 +129,15 @@ def build_model(cfg: dict) -> "torch.nn.Module":
             prefilter_denoise_init=float(model_cfg.get("prefilter_denoise_init", 0.20)),
             prefilter_sharpen_init=float(model_cfg.get("prefilter_sharpen_init", 0.10)),
             prefilter_learnable=bool(model_cfg.get("prefilter_learnable", True)),
+            front_adapter_hidden=int(model_cfg.get("front_adapter_hidden", 16)),
+            front_adapter_blocks=int(model_cfg.get("front_adapter_blocks", 2)),
+            front_adapter_use_stats_align=bool(model_cfg.get("front_adapter_use_stats_align", True)),
+            front_adapter_use_se=bool(model_cfg.get("front_adapter_use_se", True)),
+            pre_temporal_stage_adapter_enabled=bool(model_cfg.get("pre_temporal_stage_adapter_enabled", False)),
+            pre_temporal_stage_adapter_stages=model_cfg.get("pre_temporal_stage_adapter_stages", None),
+            pre_temporal_stage_adapter_bottleneck_ratio=int(
+                model_cfg.get("pre_temporal_stage_adapter_bottleneck_ratio", 4)
+            ),
         )
     else:
         raise ValueError(

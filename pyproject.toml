@@ -40,6 +40,8 @@ dependencies = [
     "tartanair",
     "mamba-ssm",
     "causal-conv1d",
+    "datasets>=4.7.0",
+    "setuptools==81.0.0",
 ]
 
 # ── PyTorch index ─────────────────────────────────────────────────────────────

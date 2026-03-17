@@ -27,6 +27,9 @@ class VideoDepthAnything(nn.Module):
         state_gate_enabled: bool = False,
         state_gate_reduction: int = 8,
         state_gate_stage_mask=None,
+        pre_temporal_stage_adapter_enabled: bool = False,
+        pre_temporal_stage_adapter_stages=None,
+        pre_temporal_stage_adapter_bottleneck_ratio: int = 4,
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -46,6 +49,9 @@ class VideoDepthAnything(nn.Module):
             state_gate_enabled=state_gate_enabled,
             state_gate_reduction=state_gate_reduction,
             state_gate_stage_mask=state_gate_stage_mask,
+            pre_temporal_stage_adapter_enabled=pre_temporal_stage_adapter_enabled,
+            pre_temporal_stage_adapter_stages=pre_temporal_stage_adapter_stages,
+            pre_temporal_stage_adapter_bottleneck_ratio=pre_temporal_stage_adapter_bottleneck_ratio,
         )
         self.metric = metric
 
