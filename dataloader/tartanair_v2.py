@@ -3,7 +3,8 @@ TartanAir v2 Clip Dataset
 ==========================
 
 Loads short RGB + GT depth clips from TartanAir v2 for supervised training.
-Ground-truth depth is stored as RGBA PNGs encoding float32 metres.
+Ground-truth depth is stored as float32 metres packed losslessly into
+4-channel PNGs and decoded with OpenCV's unchanged-read path.
 
 Dataset structure::
 
@@ -23,7 +24,7 @@ Dataset structure::
     ├── AmusementPark/
     └── ...
 
-Each depth PNG is RGBA uint8 encoding a float32 depth value in metres.
+Each depth PNG is a 4-channel uint8 image encoding a float32 depth value in metres.
 
 Returns dict with:
     frames          (C, T, H, W)  float32 [0, 1]   – RGB clip
@@ -59,19 +60,17 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 
-from dataloader.degradation import LowLightDegradation
+from dataloader.degradation import ConfigurableDegradation, LowLightDegradation
+from dataloader.tartanair_depth import decode_tartanair_depth
 
 
 def _decode_tartanair_depth(path: str) -> np.ndarray:
-    """Decode a TartanAir v2 depth PNG (RGBA uint8 → float32 metres).
+    """Decode a TartanAir v2 depth PNG to float32 metres.
 
-    The depth is stored as 4 bytes (RGBA channels) per pixel, which
-    when reinterpreted as float32 give the depth in metres.
+    TartanAir depth PNGs must be decoded from the OpenCV unchanged-read
+    byte layout; PIL RGBA reinterpretation produces incorrect values.
     """
-    img = Image.open(path)
-    arr = np.array(img, dtype=np.uint8)  # (H, W, 4)
-    depth = arr.view(np.float32).reshape(arr.shape[0], arr.shape[1])  # (H, W)
-    return depth
+    return decode_tartanair_depth(path)
 
 
 class TartanAirV2Dataset(Dataset):
@@ -110,9 +109,10 @@ class TartanAirV2Dataset(Dataset):
         max_depth: float = 80.0,
         envs: Optional[List[str]] = None,
         teacher_cache_dir: Optional[str] = None,
-        degradation: Optional[LowLightDegradation] = None,
+        degradation: Optional[LowLightDegradation | ConfigurableDegradation] = None,
         return_clean_and_degraded: bool = False,
         return_clean_reference: bool = True,
+        return_degradation_metadata: bool = False,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -126,6 +126,7 @@ class TartanAirV2Dataset(Dataset):
         self.degradation = degradation
         self.return_clean_and_degraded = bool(return_clean_and_degraded and degradation is not None)
         self.return_clean_reference = bool(return_clean_reference and self.return_clean_and_degraded)
+        self.return_degradation_metadata = bool(return_degradation_metadata and self.return_clean_and_degraded)
         self.split = split
         self.seed = int(seed)
 
@@ -257,11 +258,25 @@ class TartanAirV2Dataset(Dataset):
             rng = None
             if self.split != "train":
                 rng = np.random.RandomState(self.seed + idx)
-            degraded_clip = self.degradation(clip_tchw, rng=rng)
+            degradation_output = self.degradation(
+                clip_tchw,
+                rng=rng,
+                return_metadata=self.return_degradation_metadata,
+            )
+            degradation_params = None
+            degradation_summary = None
+            if self.return_degradation_metadata:
+                degraded_clip, degradation_params, degradation_summary = degradation_output
+            else:
+                degraded_clip = degradation_output
             degraded_frames = degraded_clip.permute(1, 0, 2, 3).contiguous()
             if self.return_clean_reference:
                 result["clean_frames"] = frames
             result["degraded_frames"] = degraded_frames
+            if degradation_params is not None:
+                result["degradation_params"] = degradation_params.as_dict()
+            if degradation_summary is not None:
+                result["degradation_summary"] = degradation_summary
         else:
             result["frames"] = frames
 
