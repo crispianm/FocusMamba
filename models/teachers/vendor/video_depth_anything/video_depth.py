@@ -5,7 +5,6 @@
 # Modified: removed infer_video_depth() and its numpy/cv2/tqdm dependencies.
 # Only forward() is needed for distillation training.
 
-import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
@@ -16,13 +15,13 @@ from .dpt_temporal import DPTHeadTemporal
 class VideoDepthAnything(nn.Module):
     def __init__(
         self,
-        encoder='vitl',
+        encoder="vitl",
         features=256,
         out_channels=[256, 512, 1024, 1024],
         use_bn=False,
         use_clstoken=False,
         num_frames=32,
-        pe='ape',
+        pe="ape",
         metric=False,
         state_gate_enabled: bool = False,
         state_gate_reduction: int = 8,
@@ -30,28 +29,40 @@ class VideoDepthAnything(nn.Module):
         pre_temporal_stage_adapter_enabled: bool = False,
         pre_temporal_stage_adapter_stages=None,
         pre_temporal_stage_adapter_bottleneck_ratio: int = 4,
+        temporal_module_type: str = "attention",
+        temporal_mamba_d_state: int = 16,
+        temporal_mamba_d_conv: int = 4,
+        temporal_mamba_expand: int = 2,
     ):
         super(VideoDepthAnything, self).__init__()
 
         self.intermediate_layer_idx = {
-            'vits': [2, 5, 8, 11],
+            "vits": [2, 5, 8, 11],
             "vitb": [2, 5, 8, 11],
-            'vitl': [4, 11, 17, 23]
+            "vitl": [4, 11, 17, 23],
         }
 
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
 
         self.head = DPTHeadTemporal(
-            self.pretrained.embed_dim, features, use_bn,
-            out_channels=out_channels, use_clstoken=use_clstoken,
-            num_frames=num_frames, pe=pe,
+            self.pretrained.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            use_clstoken=use_clstoken,
+            num_frames=num_frames,
+            pe=pe,
             state_gate_enabled=state_gate_enabled,
             state_gate_reduction=state_gate_reduction,
             state_gate_stage_mask=state_gate_stage_mask,
             pre_temporal_stage_adapter_enabled=pre_temporal_stage_adapter_enabled,
             pre_temporal_stage_adapter_stages=pre_temporal_stage_adapter_stages,
             pre_temporal_stage_adapter_bottleneck_ratio=pre_temporal_stage_adapter_bottleneck_ratio,
+            temporal_module_type=temporal_module_type,
+            temporal_mamba_d_state=temporal_mamba_d_state,
+            temporal_mamba_d_conv=temporal_mamba_d_conv,
+            temporal_mamba_expand=temporal_mamba_expand,
         )
         self.metric = metric
 

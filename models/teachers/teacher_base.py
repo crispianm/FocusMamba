@@ -89,13 +89,19 @@ class TeacherBase(ABC, nn.Module):
                 # Resize to teacher input size
                 if (H, W) != self.input_size:
                     frame = torch.nn.functional.interpolate(
-                        frame, size=self.input_size, mode="bilinear", align_corners=False,
+                        frame,
+                        size=self.input_size,
+                        mode="bilinear",
+                        align_corners=False,
                     )
                 d = self._predict_single_frame(frame)  # (1, 1, H_t, W_t)
                 # Resize back to original resolution
                 if d.shape[2:] != (H, W):
                     d = torch.nn.functional.interpolate(
-                        d, size=(H, W), mode="bilinear", align_corners=False,
+                        d,
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
                     )
                 frame_depths.append(d)
             depths.append(torch.stack(frame_depths, dim=2))  # (1, 1, T, H, W)

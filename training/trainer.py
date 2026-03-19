@@ -21,19 +21,17 @@ from __future__ import annotations
 from contextlib import nullcontext
 import logging
 import math
-import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from evaluation.metrics.temporal_metrics import frame_depth_variation
 from training.losses.combined import CombinedLoss
-from training.curriculum import CurriculumScheduler
 from training.ema import EMAModel
 
 
@@ -41,8 +39,11 @@ from training.ema import EMAModel
 # Learning rate schedule: linear warmup + cosine decay
 # ---------------------------------------------------------------------------
 
+
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-6, last_epoch=-1):
+    def __init__(
+        self, optimizer, warmup_steps, total_steps, min_lr=1e-6, last_epoch=-1
+    ):
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
         self.min_lr = min_lr
@@ -57,14 +58,13 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
                 1, self.total_steps - self.warmup_steps
             )
             scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return [
-            max(self.min_lr, base_lr * scale) for base_lr in self.base_lrs
-        ]
+        return [max(self.min_lr, base_lr * scale) for base_lr in self.base_lrs]
 
 
 # ---------------------------------------------------------------------------
 # Depth metrics for validation
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def compute_depth_metrics(
@@ -96,9 +96,13 @@ def compute_depth_metrics(
 
     if pred.numel() == 0:
         return {
-            "abs_rel": float("inf"), "sq_rel": float("inf"),
-            "rmse": float("inf"), "si_log": float("inf"),
-            "delta1": 0.0, "delta2": 0.0, "delta3": 0.0,
+            "abs_rel": float("inf"),
+            "sq_rel": float("inf"),
+            "rmse": float("inf"),
+            "si_log": float("inf"),
+            "delta1": 0.0,
+            "delta2": 0.0,
+            "delta3": 0.0,
         }
 
     # Absolute Relative Error
@@ -112,13 +116,13 @@ def compute_depth_metrics(
 
     # SI-log
     log_diff = torch.log(pred) - torch.log(gt)
-    si_log = (log_diff ** 2).mean().item() - (log_diff.mean().item()) ** 2
+    si_log = (log_diff**2).mean().item() - (log_diff.mean().item()) ** 2
 
     # Delta thresholds
     ratio = torch.max(pred / gt, gt / pred)
     delta1 = (ratio < 1.25).float().mean().item()
-    delta2 = (ratio < 1.25 ** 2).float().mean().item()
-    delta3 = (ratio < 1.25 ** 3).float().mean().item()
+    delta2 = (ratio < 1.25**2).float().mean().item()
+    delta3 = (ratio < 1.25**3).float().mean().item()
 
     return {
         "abs_rel": abs_rel,
@@ -197,7 +201,7 @@ def compute_relative_metrics(
     g = gt_rel[valid]
     diff = p - g
     rel_l1 = diff.abs().mean().item()
-    rel_rmse = (diff ** 2).mean().sqrt().item()
+    rel_rmse = (diff**2).mean().sqrt().item()
     ratio = torch.max((p + 1e-6) / (g + 1e-6), (g + 1e-6) / (p + 1e-6))
     rel_delta1 = (ratio < 1.25).float().mean().item()
 
@@ -211,6 +215,227 @@ def compute_relative_metrics(
     }
 
 
+def _reshape_clip_to_frames(x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, int]:
+    if x.ndim == 5:
+        b, c, t, h, w = x.shape
+        return x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w), b, t, h, w
+    if x.ndim == 4:
+        b, c, h, w = x.shape
+        return x, b, 1, h, w
+    raise ValueError(
+        f"Unsupported depth tensor shape for boundary metrics: {tuple(x.shape)}"
+    )
+
+
+@torch.no_grad()
+def _boundary_map(
+    depth: torch.Tensor,
+    *,
+    threshold: float,
+    log_space: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    base = torch.log(depth.clamp(min=eps)) if log_space else depth
+    flat, _, _, _, _ = _reshape_clip_to_frames(base)
+    gx = flat[:, :, :, 1:] - flat[:, :, :, :-1]
+    gy = flat[:, :, 1:, :] - flat[:, :, :-1, :]
+    gx = F.pad(gx, (0, 1, 0, 0))
+    gy = F.pad(gy, (0, 0, 0, 1))
+    return torch.sqrt(gx.square() + gy.square()) > threshold
+
+
+@torch.no_grad()
+def compute_boundary_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    threshold: float = 0.05,
+    dilation: int = 1,
+    log_space: bool = True,
+) -> Dict[str, float]:
+    pred_edges = _boundary_map(pred, threshold=threshold, log_space=log_space)
+    gt_edges = _boundary_map(gt, threshold=threshold, log_space=log_space)
+    if mask is not None:
+        valid, _, _, _, _ = _reshape_clip_to_frames(mask.float())
+        valid = valid.bool()
+    else:
+        valid = torch.ones_like(gt_edges, dtype=torch.bool)
+
+    if dilation > 0:
+        kernel = 2 * dilation + 1
+        pred_dilated = (
+            F.max_pool2d(
+                pred_edges.float(), kernel_size=kernel, stride=1, padding=dilation
+            )
+            > 0
+        )
+        gt_dilated = (
+            F.max_pool2d(
+                gt_edges.float(), kernel_size=kernel, stride=1, padding=dilation
+            )
+            > 0
+        )
+    else:
+        pred_dilated = pred_edges
+        gt_dilated = gt_edges
+
+    pred_valid = pred_edges & valid
+    gt_valid = gt_edges & valid
+    tp_precision = (pred_valid & gt_dilated).float().sum()
+    tp_recall = (gt_valid & pred_dilated).float().sum()
+    pred_count = pred_valid.float().sum()
+    gt_count = gt_valid.float().sum()
+
+    precision = tp_precision / pred_count.clamp_min(1.0)
+    recall = tp_recall / gt_count.clamp_min(1.0)
+    boundary_f1 = (
+        2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
+    ).item()
+
+    pred_flat, _, _, _, _ = _reshape_clip_to_frames(pred.float())
+    gt_flat, _, _, _, _ = _reshape_clip_to_frames(gt.float())
+    band_mask = gt_dilated & valid & torch.isfinite(pred_flat) & torch.isfinite(gt_flat)
+    band_mask = band_mask & (gt_flat > 1e-6) & (pred_flat > 1e-6)
+    if band_mask.any():
+        edge_abs_rel = (
+            (((pred_flat - gt_flat).abs() / gt_flat)[band_mask]).mean().item()
+        )
+    else:
+        edge_abs_rel = float("inf")
+
+    return {
+        "boundary_f1": boundary_f1,
+        "edge_abs_rel": edge_abs_rel,
+    }
+
+
+@torch.no_grad()
+def compute_edge_temporal_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    threshold: float = 0.05,
+    dilation: int = 1,
+    log_space: bool = True,
+) -> Dict[str, float]:
+    edge_mask = _boundary_map(gt, threshold=threshold, log_space=log_space)
+    if dilation > 0:
+        kernel = 2 * dilation + 1
+        edge_mask = (
+            F.max_pool2d(
+                edge_mask.float(), kernel_size=kernel, stride=1, padding=dilation
+            )
+            > 0
+        )
+    edge_mask = edge_mask.reshape(
+        gt.shape[0], gt.shape[2], 1, gt.shape[-2], gt.shape[-1]
+    ).permute(0, 2, 1, 3, 4)
+    if mask is not None:
+        edge_mask = edge_mask & mask.bool()
+
+    return {
+        "fdv_edge_band": frame_depth_variation(pred.float(), mask=edge_mask.float()),
+    }
+
+
+@torch.no_grad()
+def compute_temporal_gradient_metric(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    aligner=None,
+    log_space: bool = False,
+    threshold: float = 0.05,
+) -> Dict[str, float]:
+    try:
+        from training.losses.temporal import TemporalConsistencyLoss
+    except Exception:
+        return {"tgm_metric": float("nan")}
+
+    if aligner is not None:
+        pred = aligner.align_scale_shift(pred.float(), gt.float(), mask=mask)
+
+    tgm = TemporalConsistencyLoss(threshold=threshold, log_space=log_space)
+    value = tgm(pred.float(), gt.float(), mask=mask)
+    return {"tgm_metric": float(value.detach().item())}
+
+
+@torch.no_grad()
+def compute_aligned_depth_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    *,
+    aligner,
+    mask: Optional[torch.Tensor] = None,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+) -> Dict[str, float]:
+    aligned = aligner.align_scale_shift(pred.float(), gt.float(), mask=mask)
+    aligned = torch.nan_to_num(aligned, nan=0.0, posinf=max_depth, neginf=0.0).clamp(
+        min=min_depth
+    )
+    metrics = compute_depth_metrics(aligned, gt.float(), mask=mask)
+    return {f"aligned_{key}": value for key, value in metrics.items()}
+
+
+@torch.no_grad()
+def compute_depth_distribution_metrics(
+    pred: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+) -> Dict[str, float]:
+    values = pred.float()
+    if mask is not None:
+        valid = mask.bool() & torch.isfinite(values)
+    else:
+        valid = torch.isfinite(values)
+
+    if not valid.any():
+        return {
+            "pred_depth_p01": float("nan"),
+            "pred_depth_p50": float("nan"),
+            "pred_depth_p99": float("nan"),
+            "pred_depth_span": float("nan"),
+            "pred_below_min_frac": float("nan"),
+            "pred_above_max_frac": float("nan"),
+        }
+
+    flat = values[valid]
+    q01 = torch.quantile(flat, 0.01).item()
+    q50 = torch.quantile(flat, 0.50).item()
+    q99 = torch.quantile(flat, 0.99).item()
+    below_min = (flat < min_depth).float().mean().item()
+    above_max = (flat > max_depth).float().mean().item()
+    return {
+        "pred_depth_p01": q01,
+        "pred_depth_p50": q50,
+        "pred_depth_p99": q99,
+        "pred_depth_span": q99 - q01,
+        "pred_below_min_frac": below_min,
+        "pred_above_max_frac": above_max,
+    }
+
+
+@torch.no_grad()
+def summarize_degradation_metadata(summary: dict[str, Any] | None) -> Dict[str, float]:
+    if not summary:
+        return {}
+    metrics: Dict[str, float] = {}
+    for key, value in summary.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                continue
+            metrics[f"degradation_{key}"] = float(value.float().mean().item())
+        elif isinstance(value, (int, float)):
+            metrics[f"degradation_{key}"] = float(value)
+    return metrics
+
+
 @torch.no_grad()
 def _summarize_gate_stats(gate_stats: torch.Tensor) -> Dict[str, float]:
     if gate_stats.ndim == 2:
@@ -219,12 +444,16 @@ def _summarize_gate_stats(gate_stats: torch.Tensor) -> Dict[str, float]:
         stage_means = gate_stats.float().mean(dim=(0, 1))
     else:
         raise ValueError(f"Unsupported gate_stats shape: {tuple(gate_stats.shape)}")
-    return {f"gate_stage_{idx}": float(value.item()) for idx, value in enumerate(stage_means)}
+    return {
+        f"gate_stage_{idx}": float(value.item())
+        for idx, value in enumerate(stage_means)
+    }
 
 
 # ---------------------------------------------------------------------------
 # Training step
 # ---------------------------------------------------------------------------
+
 
 def train_one_epoch(
     model: nn.Module,
@@ -278,8 +507,7 @@ def train_one_epoch(
         scaler.unscale_(optimizer)
 
         grads_ok = all(
-            p.grad is None or torch.isfinite(p.grad).all()
-            for p in model.parameters()
+            p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters()
         )
         if not grads_ok:
             optimizer.zero_grad(set_to_none=True)
@@ -296,15 +524,21 @@ def train_one_epoch(
             ema.update()
         return True
 
-    for micro_step, batch in enumerate(tqdm(loader, desc="Train", unit="it", leave=False)):
-        is_accum_step = ((micro_step + 1) % grad_accum_steps != 0)
+    for micro_step, batch in enumerate(
+        tqdm(loader, desc="Train", unit="it", leave=False)
+    ):
+        is_accum_step = (micro_step + 1) % grad_accum_steps != 0
         use_no_sync = is_accum_step and hasattr(model, "no_sync")
         sync_ctx = model.no_sync() if use_no_sync else nullcontext()
         target_mode = getattr(criterion, "target_mode", "metric")
         use_teacher_signals = getattr(criterion, "distillation", None) is not None
         configured_teacher_names = set(getattr(criterion, "active_teacher_names", ()))
-        use_auxiliary_clean_pass = bool(getattr(criterion, "wants_auxiliary_clean_pass", False))
-        return_feature_summary = bool(getattr(criterion, "wants_feature_summary", False))
+        use_auxiliary_clean_pass = bool(
+            getattr(criterion, "wants_auxiliary_clean_pass", False)
+        )
+        return_feature_summary = bool(
+            getattr(criterion, "wants_feature_summary", False)
+        )
 
         # ── Resolve input frames ────────────────────────────────────────
         clean_input = None
@@ -320,6 +554,12 @@ def train_one_epoch(
             student_input = batch["frames"].to(device)
             teacher_input = student_input
             clean_input = student_input if use_auxiliary_clean_pass else None
+        model_kwargs: Dict[str, Any] = {}
+        if getattr(model, "supports_degradation_inputs", False):
+            if "degradation_params" in batch:
+                model_kwargs["degradation_params"] = batch["degradation_params"]
+            if "degradation_summary" in batch:
+                model_kwargs["degradation_summary"] = batch["degradation_summary"]
 
         gt_depth = batch.get("depth")
         if gt_depth is not None:
@@ -343,17 +583,22 @@ def train_one_epoch(
                     student_input,
                     return_gate_stats=False,
                     return_feature_summary=return_feature_summary,
+                    **model_kwargs,
                 )
                 student_depth_metric = student_outputs["depth"]
                 if target_mode == "relative":
-                    student_depth = student_outputs.get("depth_relative", student_depth_metric)
+                    student_depth = student_outputs.get(
+                        "depth_relative", student_depth_metric
+                    )
                 else:
                     student_depth = student_depth_metric
 
                 # Guard: skip if non-finite
                 if not torch.isfinite(student_depth).all():
                     if logger is not None:
-                        logger.warning("step=%d non-finite student depth, skipping", global_step)
+                        logger.warning(
+                            "step=%d non-finite student depth, skipping", global_step
+                        )
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
                     continue
@@ -364,10 +609,15 @@ def train_one_epoch(
                 teacher_depths: Dict[str, torch.Tensor] = {}
 
                 # Load from cache if the batch carries pre-computed depths
-                cached_batch: Optional[Dict[str, torch.Tensor]] = batch.get("cached_teacher_depths")
+                cached_batch: Optional[Dict[str, torch.Tensor]] = batch.get(
+                    "cached_teacher_depths"
+                )
                 if use_teacher_signals and cached_batch is not None:
                     for t_name, td in cached_batch.items():
-                        if configured_teacher_names and t_name not in configured_teacher_names:
+                        if (
+                            configured_teacher_names
+                            and t_name not in configured_teacher_names
+                        ):
                             continue
                         # td: (B, 1, T, H, W) from collation of per-sample (1, T, H, W) tensors
                         teacher_depths[t_name] = td.to(device, non_blocking=True)
@@ -377,7 +627,10 @@ def train_one_epoch(
                     missing = [
                         name
                         for name in teachers
-                        if (not configured_teacher_names or name in configured_teacher_names)
+                        if (
+                            not configured_teacher_names
+                            or name in configured_teacher_names
+                        )
                         and name not in teacher_depths
                     ]
                     if missing:
@@ -386,7 +639,9 @@ def train_one_epoch(
                                 teacher_input = student_input
                             for name in missing:
                                 try:
-                                    teacher_depths[name] = teachers[name].predict(teacher_input)
+                                    teacher_depths[name] = teachers[name].predict(
+                                        teacher_input
+                                    )
                                 except Exception:
                                     pass
 
@@ -409,6 +664,7 @@ def train_one_epoch(
                         student_outputs,
                         clean_outputs,
                         mask=mask,
+                        clean_frames=clean_input,
                     )
                     aux_total = aux_losses.pop("aux/total", None)
                     if aux_total is not None:
@@ -418,7 +674,11 @@ def train_one_epoch(
             total_loss = losses["total"]
             if not torch.isfinite(total_loss):
                 if logger is not None:
-                    logger.warning("step=%d non-finite loss=%s, skipping", global_step, total_loss.item())
+                    logger.warning(
+                        "step=%d non-finite loss=%s, skipping",
+                        global_step,
+                        total_loss.item(),
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 scaler.update()
                 continue
@@ -435,7 +695,11 @@ def train_one_epoch(
         n_batches += 1
         global_step += 1
 
-        if logger is not None and step_log_every_n_steps > 0 and (global_step % step_log_every_n_steps == 0):
+        if (
+            logger is not None
+            and step_log_every_n_steps > 0
+            and (global_step % step_log_every_n_steps == 0)
+        ):
             current_lr = optimizer.param_groups[0]["lr"]
             component_items = []
             for k, v in losses.items():
@@ -445,12 +709,18 @@ def train_one_epoch(
                     component_items.append(f"{k}={float(v.detach().item()):.6f}")
                 else:
                     component_items.append(f"{k}={float(v):.6f}")
-            component_str = " | ".join(component_items) if component_items else "no_components"
+            component_str = (
+                " | ".join(component_items) if component_items else "no_components"
+            )
             # Build a string with all loss components (including "total")
             loss_items = []
             for k, v in losses.items():
                 try:
-                    val = float(v.detach().item()) if isinstance(v, torch.Tensor) else float(v)
+                    val = (
+                        float(v.detach().item())
+                        if isinstance(v, torch.Tensor)
+                        else float(v)
+                    )
                 except Exception:
                     val = float("nan")
                 loss_items.append(f"{k}={val:.6f}")
@@ -482,12 +752,21 @@ def train_one_epoch(
         if is_main and global_step % log_img_every == 0:
             with torch.no_grad():
                 from training.callbacks.visualise_depth import colorise_depth
+
                 pred_d = student_depth.detach()
                 student_rel_vis = None
                 student_inv_vis = None
                 if target_mode == "relative":
-                    vis_mask = mask if mask is not None else (gt_depth > 0 if gt_depth is not None else None)
-                    gt_vis = _normalize_relative_depth(gt_depth, vis_mask) if gt_depth is not None else None
+                    vis_mask = (
+                        mask
+                        if mask is not None
+                        else (gt_depth > 0 if gt_depth is not None else None)
+                    )
+                    gt_vis = (
+                        _normalize_relative_depth(gt_depth, vis_mask)
+                        if gt_depth is not None
+                        else None
+                    )
                     teacher_vis = {
                         t_name: _normalize_relative_depth(td, vis_mask)
                         for t_name, td in teacher_depths.items()
@@ -498,7 +777,9 @@ def train_one_epoch(
                     if "depth_relative" in student_outputs:
                         student_rel_vis = student_outputs["depth_relative"].detach()
                     if "depth_inverse_relative" in student_outputs:
-                        student_inv_vis = student_outputs["depth_inverse_relative"].detach()
+                        student_inv_vis = student_outputs[
+                            "depth_inverse_relative"
+                        ].detach()
 
                 B_vis = min(pred_d.shape[0], log_img_max_B)
                 rows = []
@@ -521,16 +802,34 @@ def train_one_epoch(
                 writer.add_image("train/depth_grid", grid, global_step)
 
                 # Per-teacher and student depth scale
-                writer.add_scalar("mean_depth/student", pred_d.mean().item(), global_step)
-                writer.add_scalar("mean_depth/student_metric", student_depth_metric.detach().mean().item(), global_step)
+                writer.add_scalar(
+                    "mean_depth/student", pred_d.mean().item(), global_step
+                )
+                writer.add_scalar(
+                    "mean_depth/student_metric",
+                    student_depth_metric.detach().mean().item(),
+                    global_step,
+                )
                 if student_rel_vis is not None:
-                    writer.add_scalar("mean_depth/student_relative", student_rel_vis.mean().item(), global_step)
+                    writer.add_scalar(
+                        "mean_depth/student_relative",
+                        student_rel_vis.mean().item(),
+                        global_step,
+                    )
                 if student_inv_vis is not None:
-                    writer.add_scalar("mean_depth/student_inverse_relative", student_inv_vis.mean().item(), global_step)
+                    writer.add_scalar(
+                        "mean_depth/student_inverse_relative",
+                        student_inv_vis.mean().item(),
+                        global_step,
+                    )
                 for t_name, td in teacher_vis.items():
-                    writer.add_scalar(f"mean_depth/teacher_{t_name}", td.mean().item(), global_step)
+                    writer.add_scalar(
+                        f"mean_depth/teacher_{t_name}", td.mean().item(), global_step
+                    )
                 if gt_vis is not None:
-                    writer.add_scalar("mean_depth/gt", gt_vis.mean().item(), global_step)
+                    writer.add_scalar(
+                        "mean_depth/gt", gt_vis.mean().item(), global_step
+                    )
 
     # Flush partial accumulation at epoch end so tail micro-batches are not dropped.
     if n_batches > 0 and (n_batches % grad_accum_steps != 0):
@@ -551,6 +850,7 @@ def train_one_epoch(
 # Validation step
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -565,6 +865,8 @@ def validate(
     log_img_max_B: int = 2,
     is_main: bool = True,
     use_teacher_signals: Optional[bool] = None,
+    writer_prefix: str = "val",
+    writer_step: Optional[int] = None,
 ) -> Dict[str, float]:
     """Run validation and compute depth metrics."""
     model.eval()
@@ -574,14 +876,18 @@ def validate(
     logged_image = False
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc=f"Val {epoch}", unit="it", leave=False):
+        for batch in tqdm(
+            loader, desc=f"{writer_prefix} {epoch}", unit="it", leave=False
+        ):
             target_mode = getattr(criterion, "target_mode", "metric")
             distill_enabled = getattr(criterion, "distillation", None) is not None
             if use_teacher_signals is None:
                 use_teacher_signals_step = distill_enabled
             else:
                 use_teacher_signals_step = bool(use_teacher_signals and distill_enabled)
-            configured_teacher_names = set(getattr(criterion, "active_teacher_names", ()))
+            configured_teacher_names = set(
+                getattr(criterion, "active_teacher_names", ())
+            )
             # Resolve input frames (same logic as train_one_epoch)
             if "degraded_frames" in batch:
                 frames = batch["degraded_frames"].to(device)
@@ -594,6 +900,12 @@ def validate(
             else:
                 frames = batch["frames"].to(device)
                 teacher_input = frames
+            model_kwargs: Dict[str, Any] = {}
+            if getattr(model, "supports_degradation_inputs", False):
+                if "degradation_params" in batch:
+                    model_kwargs["degradation_params"] = batch["degradation_params"]
+                if "degradation_summary" in batch:
+                    model_kwargs["degradation_summary"] = batch["degradation_summary"]
 
             gt_depth = batch.get("depth")
             if gt_depth is not None:
@@ -604,7 +916,7 @@ def validate(
 
             # torch.compiler.cudagraph_mark_step_begin()
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
-                outputs = model(frames, return_gate_stats=False)
+                outputs = model(frames, return_gate_stats=False, **model_kwargs)
                 pred_depth_metric = outputs["depth"]
                 if target_mode == "relative":
                     pred_depth = outputs.get("depth_relative", pred_depth_metric)
@@ -613,17 +925,25 @@ def validate(
 
                 # Teacher inference for distillation validation
                 teacher_depths = {}
-                cached_batch: Optional[Dict[str, torch.Tensor]] = batch.get("cached_teacher_depths")
+                cached_batch: Optional[Dict[str, torch.Tensor]] = batch.get(
+                    "cached_teacher_depths"
+                )
                 if use_teacher_signals_step and cached_batch is not None:
                     for t_name, td in cached_batch.items():
-                        if configured_teacher_names and t_name not in configured_teacher_names:
+                        if (
+                            configured_teacher_names
+                            and t_name not in configured_teacher_names
+                        ):
                             continue
                         teacher_depths[t_name] = td.to(device, non_blocking=True)
                 if use_teacher_signals_step and teachers:
                     if teacher_input is None:
                         teacher_input = frames
                     for name, teacher in teachers.items():
-                        if configured_teacher_names and name not in configured_teacher_names:
+                        if (
+                            configured_teacher_names
+                            and name not in configured_teacher_names
+                        ):
                             continue
                         if name in teacher_depths:
                             continue
@@ -654,13 +974,97 @@ def validate(
             if gt_depth is not None:
                 if target_mode == "relative":
                     val_mask = mask if mask is not None else (gt_depth > 0)
-                    m = compute_relative_metrics(pred_depth.float(), gt_depth.float(), mask=val_mask)
+                    m = compute_relative_metrics(
+                        pred_depth.float(), gt_depth.float(), mask=val_mask
+                    )
+                    gt_boundary = _normalize_relative_depth(gt_depth.float(), val_mask)
+                    m.update(
+                        compute_boundary_metrics(
+                            pred_depth.float(),
+                            gt_boundary.float(),
+                            mask=val_mask,
+                            threshold=float(
+                                getattr(criterion, "boundary_threshold", 0.05)
+                            ),
+                            dilation=int(getattr(criterion, "boundary_dilation", 1)),
+                            log_space=False,
+                        )
+                    )
                 else:
-                    m = compute_depth_metrics(pred_depth.float(), gt_depth.float(), mask=mask)
+                    m = compute_depth_metrics(
+                        pred_depth.float(), gt_depth.float(), mask=mask
+                    )
+                    m.update(
+                        compute_aligned_depth_metrics(
+                            pred_depth.float(),
+                            gt_depth.float(),
+                            aligner=criterion.ssi,
+                            mask=mask,
+                            min_depth=float(getattr(criterion, "min_depth", 1e-3)),
+                            max_depth=float(getattr(criterion, "max_depth", 80.0)),
+                        )
+                    )
+                    m.update(
+                        compute_depth_distribution_metrics(
+                            pred_depth.float(),
+                            mask=mask,
+                            min_depth=float(getattr(criterion, "min_depth", 1e-3)),
+                            max_depth=float(getattr(criterion, "max_depth", 80.0)),
+                        )
+                    )
+                    m.update(
+                        compute_boundary_metrics(
+                            pred_depth.float(),
+                            gt_depth.float(),
+                            mask=mask,
+                            threshold=float(
+                                getattr(criterion, "boundary_threshold", 0.05)
+                            ),
+                            dilation=int(getattr(criterion, "boundary_dilation", 1)),
+                            log_space=True,
+                        )
+                    )
+                    m.update(
+                        compute_edge_temporal_metrics(
+                            pred_depth.float(),
+                            gt_depth.float(),
+                            mask=mask,
+                            threshold=float(
+                                getattr(criterion, "boundary_threshold", 0.05)
+                            ),
+                            dilation=int(getattr(criterion, "boundary_dilation", 1)),
+                            log_space=True,
+                        )
+                    )
+                    m.update(
+                        compute_temporal_gradient_metric(
+                            pred_depth.float(),
+                            gt_depth.float(),
+                            mask=mask,
+                            aligner=criterion.ssi,
+                            log_space=bool(
+                                getattr(
+                                    getattr(criterion, "_temporal_loss", None),
+                                    "log_space",
+                                    False,
+                                )
+                            ),
+                            threshold=float(
+                                getattr(
+                                    getattr(criterion, "_temporal_loss", None),
+                                    "threshold",
+                                    0.05,
+                                )
+                            ),
+                        )
+                    )
                 m["fdv"] = frame_depth_variation(pred_depth.float(), mask=mask)
                 gate_stats = outputs.get("gate_stats")
                 if gate_stats is not None:
                     m.update(_summarize_gate_stats(gate_stats))
+                m.update(
+                    summarize_degradation_metadata(batch.get("degradation_summary"))
+                )
                 for k, v in m.items():
                     metric_accum[k] = metric_accum.get(k, 0.0) + v
                 n_batches += 1
@@ -668,6 +1072,7 @@ def validate(
                 # Log one image grid per validation
                 if is_main and not logged_image:
                     from training.callbacks.visualise_depth import colorise_depth
+
                     B_vis = min(pred_depth.shape[0], log_img_max_B)
                     student_rel_vis = None
                     student_inv_vis = None
@@ -692,16 +1097,25 @@ def validate(
                         s_d = pred_depth[b, 0, t_mid].cpu()
                         col = [rgb, colorise_depth(s_d)]
                         if student_rel_vis is not None:
-                            col.append(colorise_depth(student_rel_vis[b, 0, t_mid].cpu()))
+                            col.append(
+                                colorise_depth(student_rel_vis[b, 0, t_mid].cpu())
+                            )
                         if student_inv_vis is not None:
-                            col.append(colorise_depth(student_inv_vis[b, 0, t_mid].cpu()))
+                            col.append(
+                                colorise_depth(student_inv_vis[b, 0, t_mid].cpu())
+                            )
                         gt_d = gt_vis[b, 0, t_mid].cpu()
                         col.append(colorise_depth(gt_d))
                         for t_name, td in teacher_vis.items():
                             col.append(colorise_depth(td[b, 0, t_mid].cpu()))
                         rows.append(torch.cat(col, dim=1))
                     grid = torch.cat(rows, dim=2).clamp(0.0, 1.0)
-                    writer.add_image("val/depth_grid", grid, epoch)
+                    if writer is not None:
+                        writer.add_image(
+                            f"{writer_prefix}/depth_grid",
+                            grid,
+                            writer_step if writer_step is not None else epoch,
+                        )
                     logged_image = True
             elif teacher_depths:
                 # No GT — count batches by teacher availability
@@ -721,10 +1135,11 @@ def validate(
             avg_metrics[key] = t.item()
 
     # Log to TensorBoard (rank 0 only)
-    if is_main:
-        writer.add_scalar("val/loss", avg_metrics["loss"], epoch)
+    if is_main and writer is not None:
+        step = writer_step if writer_step is not None else epoch
+        writer.add_scalar(f"{writer_prefix}/loss", avg_metrics["loss"], step)
         for k, v in avg_metrics.items():
             if k != "loss":
-                writer.add_scalar(f"val/{k}", v, epoch)
+                writer.add_scalar(f"{writer_prefix}/{k}", v, step)
 
     return avg_metrics

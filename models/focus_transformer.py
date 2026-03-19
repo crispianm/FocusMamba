@@ -41,6 +41,7 @@ from .transformer_block import (
 # Transformer Encoder Stage
 # ---------------------------------------------------------------------------
 
+
 class TransformerEncoderStage(nn.Module):
     """A single encoder stage: ``depth`` pairs of Spatial + Temporal Transformer blocks.
 
@@ -75,6 +76,7 @@ class TransformerEncoderStage(nn.Module):
 # ---------------------------------------------------------------------------
 # Transformer Encoder
 # ---------------------------------------------------------------------------
+
 
 class FocusTransformerEncoder(nn.Module):
     """Multi-scale Transformer encoder with skip connections.
@@ -112,16 +114,16 @@ class FocusTransformerEncoder(nn.Module):
             # Scale heads proportionally to dim so head_dim stays ~32-48
             stage_heads = max(1, dim // 32)
             self.stages.append(
-                TransformerEncoderStage(dim, depth, num_heads=stage_heads, mlp_ratio=mlp_ratio)
+                TransformerEncoderStage(
+                    dim, depth, num_heads=stage_heads, mlp_ratio=mlp_ratio
+                )
             )
             if i < len(depths) - 1:
                 next_dim = dim * 2
                 self.downsamples.append(SpatialDownsample(dim, next_dim))
                 dim = next_dim
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
         tokens = self.embed(x)
         skips: List[torch.Tensor] = []
         for i, stage in enumerate(self.stages):
@@ -135,6 +137,7 @@ class FocusTransformerEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 # Transformer Decoder Stage
 # ---------------------------------------------------------------------------
+
 
 class TransformerDecoderStage(nn.Module):
     """One decoder stage: upsample → concat skip → project → Transformer → DWConv.
@@ -165,7 +168,9 @@ class TransformerDecoderStage(nn.Module):
 
         stage_heads = max(1, out_dim // 32)
         self.spatial_transformer = SpatialTransformerBlock(
-            out_dim, num_heads=stage_heads, mlp_ratio=mlp_ratio,
+            out_dim,
+            num_heads=stage_heads,
+            mlp_ratio=mlp_ratio,
         )
         self.dw_conv = DepthwiseSeparableConv3d(out_dim, kernel_size=3)
 
@@ -176,14 +181,18 @@ class TransformerDecoderStage(nn.Module):
 
         # 1. Upsample spatially by 2x
         x5d = x.permute(0, 4, 1, 2, 3)
-        x5d = F.interpolate(x5d, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+        x5d = F.interpolate(
+            x5d, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False
+        )
         x5d = self.upsample_conv(x5d)
 
         # 2. Concat skip
         if self.has_skip and skip is not None:
             skip5d = skip.permute(0, 4, 1, 2, 3)
             if skip5d.shape[3:] != x5d.shape[3:]:
-                skip5d = F.interpolate(skip5d, size=x5d.shape[2:], mode="trilinear", align_corners=False)
+                skip5d = F.interpolate(
+                    skip5d, size=x5d.shape[2:], mode="trilinear", align_corners=False
+                )
             x5d = torch.cat([x5d, skip5d], dim=1)
             x5d = self.proj(x5d)
 
@@ -202,6 +211,7 @@ class TransformerDecoderStage(nn.Module):
 # Transformer Decoder
 # ---------------------------------------------------------------------------
 
+
 class FocusTransformerDecoder(nn.Module):
     """UNet decoder using Transformer blocks.  Mirrors FocusMambaDecoder exactly.
     Outputs metric depth via exp(log_depth) and optional uncertainty."""
@@ -218,17 +228,44 @@ class FocusTransformerDecoder(nn.Module):
     ):
         super().__init__()
         self.predict_uncertainty = predict_uncertainty
-        dims = [embed_dim * (2 ** i) for i in range(4)]
+        dims = [embed_dim * (2**i) for i in range(4)]
 
-        self.stages = nn.ModuleList([
-            TransformerDecoderStage(dims[3], dims[2], dims[2], num_heads=max(1, dims[2]//32), mlp_ratio=mlp_ratio),
-            TransformerDecoderStage(dims[2], dims[1], dims[1], num_heads=max(1, dims[1]//32), mlp_ratio=mlp_ratio),
-            TransformerDecoderStage(dims[1], dims[0], dims[0], num_heads=max(1, dims[0]//32), mlp_ratio=mlp_ratio),
-            TransformerDecoderStage(dims[0], 0,       dims[0], num_heads=max(1, dims[0]//32), mlp_ratio=mlp_ratio),
-        ])
+        self.stages = nn.ModuleList(
+            [
+                TransformerDecoderStage(
+                    dims[3],
+                    dims[2],
+                    dims[2],
+                    num_heads=max(1, dims[2] // 32),
+                    mlp_ratio=mlp_ratio,
+                ),
+                TransformerDecoderStage(
+                    dims[2],
+                    dims[1],
+                    dims[1],
+                    num_heads=max(1, dims[1] // 32),
+                    mlp_ratio=mlp_ratio,
+                ),
+                TransformerDecoderStage(
+                    dims[1],
+                    dims[0],
+                    dims[0],
+                    num_heads=max(1, dims[0] // 32),
+                    mlp_ratio=mlp_ratio,
+                ),
+                TransformerDecoderStage(
+                    dims[0],
+                    0,
+                    dims[0],
+                    num_heads=max(1, dims[0] // 32),
+                    mlp_ratio=mlp_ratio,
+                ),
+            ]
+        )
 
         self.temporal_smooth = nn.Conv3d(
-            dims[0], dims[0],
+            dims[0],
+            dims[0],
             kernel_size=(3, 1, 1),
             padding=(1, 0, 0),
             groups=dims[0],
@@ -271,6 +308,7 @@ class FocusTransformerDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 # Full FocusTransformer Model
 # ---------------------------------------------------------------------------
+
 
 class FocusTransformer(nn.Module):
     """End-to-end bidirectional Transformer model for metric depth estimation.
@@ -347,30 +385,37 @@ class FocusTransformer(nn.Module):
         for key in outputs:
             if outputs[key].shape[2:] != (T, H, W):
                 outputs[key] = F.interpolate(
-                    outputs[key], size=(T, H, W), mode="trilinear", align_corners=False,
+                    outputs[key],
+                    size=(T, H, W),
+                    mode="trilinear",
+                    align_corners=False,
                 )
         return outputs
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def estimate_flops(
-        self, input_shape: Tuple[int, ...] = (1, 3, 8, 256, 256)
-    ) -> int:
+    def estimate_flops(self, input_shape: Tuple[int, ...] = (1, 3, 8, 256, 256)) -> int:
         try:
             from fvcore.nn import FlopCountAnalysis
+
             dummy = torch.zeros(input_shape, device=next(self.parameters()).device)
             return int(FlopCountAnalysis(self, (dummy,)).total())
         except Exception:
             B, C, T, H, W = input_shape
-            n_tokens = (T // self.t_patch) * (H // self.patch_size) * (W // self.patch_size)
+            n_tokens = (
+                (T // self.t_patch) * (H // self.patch_size) * (W // self.patch_size)
+            )
             return 2 * self.count_parameters() * n_tokens
 
 
 if __name__ == "__main__":
     model = FocusTransformer(
-        in_channels=3, embed_dim=96, depths=[2, 2, 4, 2],
-        patch_size=4, t_patch=2,
+        in_channels=3,
+        embed_dim=96,
+        depths=[2, 2, 4, 2],
+        patch_size=4,
+        t_patch=2,
     )
     print(f"Parameters: {model.count_parameters():,}")
 

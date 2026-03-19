@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import logging
 import os
@@ -73,10 +74,10 @@ from training.callbacks.latency_profiler import LatencyProfiler
 from training.prefetch import CPUPrefetchLoader
 
 
-
 # ---------------------------------------------------------------------------
 # Checkpoint helper
 # ---------------------------------------------------------------------------
+
 
 def _save_ckpt(
     path: Path,
@@ -110,6 +111,7 @@ def _save_ckpt(
         save_dict["ema"] = ema.state_dict()
     torch.save(save_dict, path)
 
+
 def _name_matches_prefix(name: str, prefix: str) -> bool:
     p = prefix.strip()
     if not p:
@@ -130,18 +132,31 @@ def _normalize_selection_metric(metric: str | None) -> str:
     return key
 
 
-def _resolve_selection_metric(train_cfg: dict, loss_cfg: dict) -> str:
+def _resolve_selection_metric(
+    train_cfg: dict, loss_cfg: dict, validation_cfg: dict | None = None
+) -> str:
     explicit = train_cfg.get("selection_metric")
     if explicit is not None:
         metric = _normalize_selection_metric(explicit)
     else:
-        target_mode = str(loss_cfg.get("training_target", "metric")).lower()
-        if target_mode == "metric":
-            metric = "abs_rel"
-        elif target_mode == "relative":
-            metric = "rel_l1"
+        validation_cfg = validation_cfg or {}
+        robodepth_cfg = (
+            validation_cfg.get("robodepth", {})
+            if isinstance(validation_cfg.get("robodepth", {}), dict)
+            else {}
+        )
+        if robodepth_cfg.get("enabled", False):
+            metric = _normalize_selection_metric(
+                robodepth_cfg.get("selection_metric", "robodepth_dee2")
+            )
         else:
-            metric = "loss"
+            target_mode = str(loss_cfg.get("training_target", "metric")).lower()
+            if target_mode == "metric":
+                metric = "abs_rel"
+            elif target_mode == "relative":
+                metric = "rel_l1"
+            else:
+                metric = "loss"
     valid_metrics = {
         "loss",
         "abs_rel",
@@ -155,15 +170,45 @@ def _resolve_selection_metric(train_cfg: dict, loss_cfg: dict) -> str:
         "rel_l1",
         "rel_rmse",
         "rel_delta1",
+        "boundary_f1",
+        "edge_abs_rel",
+        "robodepth_dee1",
+        "robodepth_dee2",
+        "robodepth_dee3",
+        "robodepth_clean_abs_rel",
+        "robodepth_clean_delta1",
+        "robodepth_clean_dee1",
+        "robodepth_clean_dee2",
+        "robodepth_clean_dee3",
+        "robodepth_corruption_dee1_mean",
+        "robodepth_corruption_dee2_mean",
+        "robodepth_corruption_dee3_mean",
+        "robodepth_mce1",
+        "robodepth_mce2",
+        "robodepth_mce3",
+        "robodepth_rmce2",
+        "robodepth_mrr1",
+        "robodepth_mrr2",
+        "robodepth_mrr3",
+        "robodepth_fps",
     }
     if metric not in valid_metrics:
         valid_str = ", ".join(sorted(valid_metrics))
-        raise ValueError(f"Unsupported training.selection_metric={metric!r}. Valid options: {valid_str}")
+        raise ValueError(
+            f"Unsupported training.selection_metric={metric!r}. Valid options: {valid_str}"
+        )
     return metric
 
 
 def _selection_metric_higher_is_better(metric: str) -> bool:
-    return metric in {"delta1", "delta2", "delta3", "rel_delta1"}
+    return metric in {
+        "delta1",
+        "delta2",
+        "delta3",
+        "rel_delta1",
+        "boundary_f1",
+        "robodepth_fps",
+    } or metric.startswith("robodepth_mrr")
 
 
 def _initial_best_selection_value(metric: str) -> float:
@@ -184,6 +229,193 @@ def _is_better_selection_value(metric: str, current: float, best: float) -> bool
     if _selection_metric_higher_is_better(metric):
         return current > best
     return current < best
+
+
+def _is_robodepth_metric(metric: str) -> bool:
+    return str(metric).startswith("robodepth_")
+
+
+def _should_run_robodepth(
+    validation_cfg: dict, selection_metric: str, epoch: int, max_epochs: int
+) -> bool:
+    robodepth_cfg = validation_cfg.get("robodepth", {}) or {}
+    if not robodepth_cfg.get("enabled", False):
+        return False
+    every = max(int(robodepth_cfg.get("eval_every_n_epochs", 1)), 1)
+    if _is_robodepth_metric(selection_metric):
+        return True
+    return ((epoch + 1) % every == 0) or (epoch == max_epochs - 1)
+
+
+def _apply_vda_phase1_runtime_guards(cfg: dict, logger: logging.Logger) -> None:
+    model_cfg = cfg.get("model", {}) or {}
+    model_type = (
+        str(model_cfg.get("type", cfg.get("model_type", "mamba"))).strip().lower()
+    )
+    if model_type not in {"video_depth_anything", "vda"}:
+        return
+
+    loss_cfg = cfg.setdefault("loss", {})
+    uncertainty_weight = float(loss_cfg.get("uncertainty_nll_weight", 0.0) or 0.0)
+    if uncertainty_weight > 0.0:
+        logger.warning(
+            "Phase-1 VDA runs defer uncertainty-weighted regression. "
+            "Forcing loss.uncertainty_nll_weight from %.4f to 0.0.",
+            uncertainty_weight,
+        )
+        loss_cfg["uncertainty_nll_weight"] = 0.0
+
+
+def _deep_update_dict(dst: dict, src: dict) -> dict:
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            _deep_update_dict(dst[key], value)
+        else:
+            dst[key] = copy.deepcopy(value)
+    return dst
+
+
+def _apply_option_module_freeze_cfg(
+    model: nn.Module, train_cfg: dict, logger: logging.Logger
+) -> None:
+    if not bool(train_cfg.get("freeze_to_option_modules", False)):
+        return
+
+    freeze_fn = getattr(model, "set_bug_hunt_trainability", None)
+    if not callable(freeze_fn):
+        raise RuntimeError(
+            "training.freeze_to_option_modules=true requires the model to implement "
+            "set_bug_hunt_trainability(option_name=..., phase=...)."
+        )
+
+    option_name = train_cfg.get("bug_hunt_option_name")
+    phase = train_cfg.get("bug_hunt_phase", "phase_a_frozen")
+    if not option_name:
+        raise RuntimeError(
+            "training.freeze_to_option_modules=true requires training.bug_hunt_option_name "
+            "to identify which option module should remain trainable."
+        )
+    freeze_fn(option_name, phase=phase)
+    trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    total = int(sum(p.numel() for p in model.parameters()))
+    option_names = [
+        name for name, param in model.named_parameters() if param.requires_grad
+    ]
+    logger.info(
+        "Option-only freeze applied: trainable=%s/%s params across %d tensors",
+        f"{trainable:,}",
+        f"{total:,}",
+        len(option_names),
+    )
+    if option_names:
+        logger.info("  option_parameter_names=%s", option_names)
+
+
+def _audit_vda_checkpoint(model: nn.Module, cfg: dict, logger: logging.Logger) -> None:
+    train_cfg = cfg.get("training", {}) or {}
+    audit_cfg = train_cfg.get("checkpoint_audit", {}) or {}
+    if not bool(audit_cfg.get("enabled", False)):
+        return
+
+    model_cfg = cfg.get("model", {}) or {}
+    model_type = (
+        str(model_cfg.get("type", cfg.get("model_type", "mamba"))).strip().lower()
+    )
+    if model_type not in {"video_depth_anything", "vda"}:
+        return
+
+    checkpoint_path = model_cfg.get("checkpoint_path")
+    if not checkpoint_path:
+        raise RuntimeError(
+            "training.checkpoint_audit is enabled but model.checkpoint_path is empty."
+        )
+
+    expected_basename = audit_cfg.get("expected_basename")
+    if not expected_basename and audit_cfg.get("expected_checkpoint"):
+        expected_basename = Path(str(audit_cfg["expected_checkpoint"])).name
+    if expected_basename and Path(str(checkpoint_path)).name != str(expected_basename):
+        raise RuntimeError(
+            f"Checkpoint audit failed: expected basename {expected_basename!r}, "
+            f"got {Path(str(checkpoint_path)).name!r}."
+        )
+
+    report_fn = getattr(model, "get_checkpoint_audit_report", None)
+    if not callable(report_fn):
+        raise RuntimeError(
+            "training.checkpoint_audit is enabled but the model does not expose "
+            "get_checkpoint_audit_report()."
+        )
+    report = report_fn()
+    if not report:
+        raise RuntimeError(
+            "Checkpoint audit failed: model reported no checkpoint load metadata."
+        )
+
+    loaded_path = report.get("checkpoint_path")
+    loaded_keys = int(report.get("loaded_key_count", 0))
+    base_missing = list(report.get("base_missing_keys", ()))
+    base_shape = list(report.get("base_shape_mismatch_keys", ()))
+    option_missing = list(report.get("option_missing_keys", ()))
+    option_shape = list(report.get("option_shape_mismatch_keys", ()))
+    allowed_missing_prefixes = tuple(
+        str(prefix)
+        for prefix in audit_cfg.get("allowed_missing_prefixes", [])
+        if prefix
+    )
+    if allowed_missing_prefixes:
+        base_missing = [
+            key for key in base_missing if not key.startswith(allowed_missing_prefixes)
+        ]
+        base_shape = [
+            key for key in base_shape if not key.startswith(allowed_missing_prefixes)
+        ]
+
+    logger.info(
+        "Checkpoint audit: path=%s loaded_keys=%d base_missing=%d base_shape_mismatch=%d "
+        "option_missing=%d option_shape_mismatch=%d",
+        loaded_path,
+        loaded_keys,
+        len(base_missing),
+        len(base_shape),
+        len(option_missing),
+        len(option_shape),
+    )
+
+    if base_missing or base_shape:
+        raise RuntimeError(
+            "Checkpoint audit failed: pretrained VDA base weights did not fully load. "
+            f"base_missing={base_missing} base_shape_mismatch={base_shape}"
+        )
+
+    allow_option_missing = bool(
+        audit_cfg.get(
+            "allow_option_missing", audit_cfg.get("allow_partial_load", False)
+        )
+    )
+    if not allow_option_missing and (option_missing or option_shape):
+        raise RuntimeError(
+            "Checkpoint audit failed: option-module keys were missing or shape-mismatched, "
+            f"but allow_option_missing is false. option_missing={option_missing} "
+            f"option_shape_mismatch={option_shape}"
+        )
+
+
+def _flatten_validation_metrics(
+    metrics_by_name: Dict[str, Dict[str, float]],
+    *,
+    primary_name: str,
+) -> Dict[str, float]:
+    if primary_name not in metrics_by_name:
+        raise KeyError(
+            f"Primary validation set {primary_name!r} missing from validation metrics."
+        )
+
+    flat: Dict[str, float] = {}
+    for set_name, set_metrics in metrics_by_name.items():
+        for key, value in set_metrics.items():
+            flat[f"{set_name}_{key}"] = value
+    flat.update(metrics_by_name[primary_name])
+    return flat
 
 
 def _scheduled_lr_for_group(scheduler: WarmupCosineScheduler, base_lr: float) -> float:
@@ -218,7 +450,9 @@ def _unfreeze_backbone_group(
                 n_unfrozen += param.numel()
 
     if not params:
-        logger.info("Scheduled backbone unfreeze requested, but backbone is already trainable.")
+        logger.info(
+            "Scheduled backbone unfreeze requested, but backbone is already trainable."
+        )
         return 0
 
     base_lr = float(train_cfg.get("learning_rate", 2e-4))
@@ -244,14 +478,18 @@ def _unfreeze_backbone_group(
     return n_unfrozen
 
 
-def _apply_freeze_cfg(model: nn.Module, train_cfg: dict, logger: logging.Logger) -> None:
+def _apply_freeze_cfg(
+    model: nn.Module, train_cfg: dict, logger: logging.Logger
+) -> None:
     """Apply optional module freezing rules from config."""
     freeze_prefixes = [str(p) for p in train_cfg.get("freeze_prefixes", [])]
     unfreeze_prefixes = [str(p) for p in train_cfg.get("unfreeze_prefixes", [])]
 
     # Convenience flags for tiny dual-head VDA variants.
     if bool(train_cfg.get("freeze_backbone", False)):
-        freeze_prefixes.extend(["model.backbone", "backbone", "model.pretrained", "pretrained"])
+        freeze_prefixes.extend(
+            ["model.backbone", "backbone", "model.pretrained", "pretrained"]
+        )
     if bool(train_cfg.get("freeze_relative_head", False)):
         freeze_prefixes.extend(["model.relative_head", "relative_head"])
     if bool(train_cfg.get("freeze_metric_head", False)):
@@ -288,7 +526,9 @@ def _apply_freeze_cfg(model: nn.Module, train_cfg: dict, logger: logging.Logger)
         logger.info("  unfreeze_prefixes=%s", unfreeze_prefixes)
 
 
-def _build_optimizer(model: nn.Module, train_cfg: dict, logger: logging.Logger) -> torch.optim.Optimizer:
+def _build_optimizer(
+    model: nn.Module, train_cfg: dict, logger: logging.Logger
+) -> torch.optim.Optimizer:
     """Build AdamW with optional LR multipliers for backbone / metric head."""
     lr = float(train_cfg.get("learning_rate", 2e-4))
     weight_decay = float(train_cfg.get("weight_decay", 0.01))
@@ -302,7 +542,10 @@ def _build_optimizer(model: nn.Module, train_cfg: dict, logger: logging.Logger) 
         if not param.requires_grad:
             continue
         scale = 1.0
-        if any(_name_matches_prefix(name, p) for p in ("model.metric_calibrator", "metric_calibrator")):
+        if any(
+            _name_matches_prefix(name, p)
+            for p in ("model.metric_calibrator", "metric_calibrator")
+        ):
             scale *= metric_mult
         elif any(
             _name_matches_prefix(name, p)
@@ -335,12 +578,19 @@ def _build_optimizer(model: nn.Module, train_cfg: dict, logger: logging.Logger) 
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Train FocusMamba — Metric Depth")
-    parser.add_argument("--config", type=str, default="configs/experiments/tartanair_v2.yaml")
-    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
+    parser.add_argument(
+        "--config", type=str, default="configs/experiments/tartanair_v2.yaml"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="Resume from checkpoint"
+    )
     parser.add_argument("--device", type=str, default=None, help="Override device")
-    parser.add_argument("--verbose", action="store_true", help="Enable additional runtime logging")
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable additional runtime logging"
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -358,10 +608,11 @@ def main():
         log_file=artifacts.verbose_log_file,
         use_rich=True,
     )
+    _apply_vda_phase1_runtime_guards(cfg, logger)
 
     # ── Distributed setup ────────────────────────────────────────────────────
-    local_rank  = int(os.environ.get("LOCAL_RANK", 0))
-    world_size  = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
 
     if is_distributed:
@@ -373,7 +624,7 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    is_main = (local_rank == 0)  # only rank 0 does logging / checkpointing
+    is_main = local_rank == 0  # only rank 0 does logging / checkpointing
 
     # Only rank 0 writes logs to avoid 4× duplicate output
     if not is_main:
@@ -389,18 +640,33 @@ def main():
         args.debug,
     )
     if args.verbose or args.debug:
-        logger.info("Verbose/debug logs are being written to: %s", artifacts.verbose_log_file)
+        logger.info(
+            "Verbose/debug logs are being written to: %s", artifacts.verbose_log_file
+        )
 
     logger.debug("Loaded config:\n%s", pformat(cfg, sort_dicts=False))
 
-    logger.info("Device: %s  |  world_size=%d  local_rank=%d", device, world_size, local_rank)
+    logger.info(
+        "Device: %s  |  world_size=%d  local_rank=%d", device, world_size, local_rank
+    )
 
     data_cfg = cfg.get("data", {})
-    train_num_frames = int(data_cfg.get("train_num_frames", data_cfg.get("num_frames", 8)))
-    val_num_frames = int(data_cfg.get("val_num_frames", data_cfg.get("num_frames", train_num_frames)))
+    train_num_frames = int(
+        data_cfg.get("train_num_frames", data_cfg.get("num_frames", 8))
+    )
+    val_num_frames = int(
+        data_cfg.get("val_num_frames", data_cfg.get("num_frames", train_num_frames))
+    )
     use_fp16 = train_cfg.get("precision", "bf16") == "fp16" and device.type == "cuda"
-    use_amp  = train_cfg.get("precision", "bf16") in ("bf16", "fp16") and device.type == "cuda"
-    logger.info("Runtime settings: use_amp=%s use_fp16=%s precision=%s", use_amp, use_fp16, train_cfg.get("precision", "bf16"))
+    use_amp = (
+        train_cfg.get("precision", "bf16") in ("bf16", "fp16") and device.type == "cuda"
+    )
+    logger.info(
+        "Runtime settings: use_amp=%s use_fp16=%s precision=%s",
+        use_amp,
+        use_fp16,
+        train_cfg.get("precision", "bf16"),
+    )
     logger.debug("Training config:\n%s", pformat(train_cfg, sort_dicts=False))
     logger.debug("Data config:\n%s", pformat(data_cfg, sort_dicts=False))
     logger.info("Sequence lengths: train=%d val=%d", train_num_frames, val_num_frames)
@@ -409,7 +675,9 @@ def main():
     # Build student model
     # -----------------------------------------------------------------------
     model = build_model(cfg).to(device)
+    _apply_option_module_freeze_cfg(model, train_cfg, logger)
     _apply_freeze_cfg(model, train_cfg, logger)
+    _audit_vda_checkpoint(model, cfg, logger)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_type = cfg.get("model", {}).get("type", "mamba")
     logger.info("Student: %s | Parameters: %s", model_type, f"{n_params:,}")
@@ -424,7 +692,9 @@ def main():
             model = torch.compile(model)
             logger.info("torch.compile OK")
         except Exception as e:
-            logger.warning("torch.compile failed (%s), continuing without compilation", e)
+            logger.warning(
+                "torch.compile failed (%s), continuing without compilation", e
+            )
 
     # Video-Depth-Anything and FocusMamba-v2 (DPT temporal head) have a few
     # parameters that can be outside the active loss path. DDP must track
@@ -468,9 +738,13 @@ def main():
         if teacher_cfgs:
             logger.info("Distillation disabled in config; skipping teacher loading.")
         if _has_cache:
-            logger.info("Teacher cache present but distillation is disabled; cached teacher depths will be ignored.")
+            logger.info(
+                "Teacher cache present but distillation is disabled; cached teacher depths will be ignored."
+            )
     elif _skip_live and _has_cache:
-        logger.info("Teacher cache found — skipping live teacher loading (skip_live_teachers=True).")
+        logger.info(
+            "Teacher cache found — skipping live teacher loading (skip_live_teachers=True)."
+        )
         logger.info("Run tools/cache_teacher_labels.py to rebuild the cache if needed.")
     else:
         for t_cfg in teacher_cfgs:
@@ -498,8 +772,24 @@ def main():
     dataset_type = data_cfg.get("dataset", "tartanair_v2")
     loss_cfg = cfg.get("loss", {})
     validation_cfg = cfg.get("validation", {}) or {}
-    selection_metric = _resolve_selection_metric(train_cfg, loss_cfg)
+    selection_metric = _resolve_selection_metric(train_cfg, loss_cfg, validation_cfg)
     val_use_teacher_signals = bool(validation_cfg.get("use_teacher_signals", False))
+    robodepth_cfg = validation_cfg.get("robodepth", {}) or {}
+    return_degradation_metadata = bool(
+        cfg.get("degradation", {}).get("return_params", False)
+        or cfg.get("degradation", {}).get("summary", False)
+    )
+    validation_set_cfgs = (
+        validation_cfg.get("sets", [])
+        if isinstance(validation_cfg.get("sets", []), list)
+        else []
+    )
+    primary_validation_set = str(
+        validation_cfg.get(
+            "primary_set",
+            validation_set_cfgs[0].get("name", "val") if validation_set_cfgs else "val",
+        )
+    )
 
     if dataset_type == "tartanair_v2":
         from dataloader.degradation import build_degradation
@@ -510,26 +800,39 @@ def main():
         if _teacher_cache_dir:
             logger.info("Teacher cache: %s", _teacher_cache_dir)
         train_degradation = build_degradation(cfg)
-        val_degradation = build_degradation(cfg)
+        default_val_degradation = (
+            None if validation_set_cfgs else build_degradation(cfg)
+        )
         degradation = train_degradation
         if train_degradation is not None:
-            logger.info("Low-light degradation enabled for paired clean/degraded metric clips.")
-        auxiliary_cfg = loss_cfg.get("auxiliary", {}) or {}
-        need_clean_reference = (
-            train_degradation is not None
-            and (
-                bool(active_teachers)
-                or float(auxiliary_cfg.get("feature_alignment_weight", 0.0)) > 0
-                or float(auxiliary_cfg.get("clean_depth_consistency_weight", 0.0)) > 0
+            logger.info(
+                "Low-light degradation enabled for paired clean/degraded metric clips."
             )
+        auxiliary_cfg = loss_cfg.get("auxiliary", {}) or {}
+        need_clean_reference = train_degradation is not None and (
+            bool(active_teachers)
+            or float(auxiliary_cfg.get("feature_alignment_weight", 0.0)) > 0
+            or float(auxiliary_cfg.get("clean_depth_consistency_weight", 0.0)) > 0
         )
-        val_need_clean_reference = val_degradation is not None and bool(active_teachers) and val_use_teacher_signals
+        val_need_clean_reference = (
+            default_val_degradation is not None
+            and bool(active_teachers)
+            and val_use_teacher_signals
+        )
         if train_degradation is not None and not need_clean_reference:
-            logger.info("Degraded clips will omit clean-frame copies because no live teachers are active.")
-        if val_degradation is not None and not val_need_clean_reference:
-            logger.info("Validation clips will omit clean-frame copies because teacher signals are disabled in val.")
-        max_train_trajectories = data_cfg.get("max_train_trajectories", data_cfg.get("max_trajectories", None))
-        max_val_trajectories = data_cfg.get("max_val_trajectories", data_cfg.get("max_trajectories", None))
+            logger.info(
+                "Degraded clips will omit clean-frame copies because no live teachers are active."
+            )
+        if default_val_degradation is not None and not val_need_clean_reference:
+            logger.info(
+                "Validation clips will omit clean-frame copies because teacher signals are disabled in val."
+            )
+        max_train_trajectories = data_cfg.get(
+            "max_train_trajectories", data_cfg.get("max_trajectories", None)
+        )
+        max_val_trajectories = data_cfg.get(
+            "max_val_trajectories", data_cfg.get("max_trajectories", None)
+        )
         train_dataset = TartanAirV2Dataset(
             root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
             num_frames=train_num_frames,
@@ -548,26 +851,88 @@ def main():
             degradation=train_degradation,
             return_clean_and_degraded=train_degradation is not None,
             return_clean_reference=need_clean_reference,
+            return_degradation_metadata=return_degradation_metadata,
         )
-        val_dataset = TartanAirV2Dataset(
-            root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
-            num_frames=val_num_frames,
-            image_size=tuple(data_cfg.get("image_size", [256, 256])),
-            max_trajectories=max_val_trajectories,
-            clip_stride=data_cfg.get("clip_stride", 8),
-            frame_stride=data_cfg.get("frame_stride", 1),
-            split="val",
-            val_fraction=data_cfg.get("val_fraction", 0.1),
-            seed=data_cfg.get("seed", 42),
-            difficulty=data_cfg.get("difficulty", "Data_easy"),
-            camera=data_cfg.get("camera", "lcam_front"),
-            max_depth=data_cfg.get("max_depth", 80.0),
-            envs=data_cfg.get("envs", None),
-            teacher_cache_dir=_val_teacher_cache_dir,
-            degradation=val_degradation,
-            return_clean_and_degraded=val_degradation is not None,
-            return_clean_reference=val_need_clean_reference,
-        )
+        validation_sets: Dict[str, dict] = {}
+        if validation_set_cfgs:
+            for raw_set_cfg in validation_set_cfgs:
+                set_cfg = dict(raw_set_cfg or {})
+                set_name = str(set_cfg.get("name", "")).strip()
+                if not set_name:
+                    raise ValueError(
+                        f"validation.sets entries must define a non-empty name: {raw_set_cfg!r}"
+                    )
+                set_cfg_full = copy.deepcopy(cfg)
+                degradation_override = set_cfg.get("degradation")
+                if isinstance(degradation_override, dict):
+                    merged_degradation = copy.deepcopy(
+                        set_cfg_full.get("degradation", {}) or {}
+                    )
+                    _deep_update_dict(merged_degradation, degradation_override)
+                    set_cfg_full["degradation"] = merged_degradation
+                set_use_teacher_signals = bool(
+                    set_cfg.get("use_teacher_signals", val_use_teacher_signals)
+                )
+                set_degradation = build_degradation(set_cfg_full)
+                set_return_degradation_metadata = bool(
+                    set_cfg_full.get("degradation", {}).get("return_params", False)
+                    or set_cfg_full.get("degradation", {}).get("summary", False)
+                )
+                set_need_clean_reference = (
+                    set_degradation is not None
+                    and bool(active_teachers)
+                    and set_use_teacher_signals
+                )
+                validation_sets[set_name] = {
+                    "dataset": TartanAirV2Dataset(
+                        root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
+                        num_frames=val_num_frames,
+                        image_size=tuple(data_cfg.get("image_size", [256, 256])),
+                        max_trajectories=max_val_trajectories,
+                        clip_stride=data_cfg.get("clip_stride", 8),
+                        frame_stride=data_cfg.get("frame_stride", 1),
+                        split="val",
+                        val_fraction=data_cfg.get("val_fraction", 0.1),
+                        seed=data_cfg.get("seed", 42),
+                        difficulty=data_cfg.get("difficulty", "Data_easy"),
+                        camera=data_cfg.get("camera", "lcam_front"),
+                        max_depth=data_cfg.get("max_depth", 80.0),
+                        envs=data_cfg.get("envs", None),
+                        teacher_cache_dir=_val_teacher_cache_dir
+                        if set_use_teacher_signals
+                        else None,
+                        degradation=set_degradation,
+                        return_clean_and_degraded=set_degradation is not None,
+                        return_clean_reference=set_need_clean_reference,
+                        return_degradation_metadata=set_return_degradation_metadata,
+                    ),
+                    "use_teacher_signals": set_use_teacher_signals,
+                }
+        else:
+            val_degradation = default_val_degradation
+            validation_sets["val"] = {
+                "dataset": TartanAirV2Dataset(
+                    root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
+                    num_frames=val_num_frames,
+                    image_size=tuple(data_cfg.get("image_size", [256, 256])),
+                    max_trajectories=max_val_trajectories,
+                    clip_stride=data_cfg.get("clip_stride", 8),
+                    frame_stride=data_cfg.get("frame_stride", 1),
+                    split="val",
+                    val_fraction=data_cfg.get("val_fraction", 0.1),
+                    seed=data_cfg.get("seed", 42),
+                    difficulty=data_cfg.get("difficulty", "Data_easy"),
+                    camera=data_cfg.get("camera", "lcam_front"),
+                    max_depth=data_cfg.get("max_depth", 80.0),
+                    envs=data_cfg.get("envs", None),
+                    teacher_cache_dir=_val_teacher_cache_dir,
+                    degradation=val_degradation,
+                    return_clean_and_degraded=val_degradation is not None,
+                    return_clean_reference=val_need_clean_reference,
+                    return_degradation_metadata=return_degradation_metadata,
+                ),
+                "use_teacher_signals": val_use_teacher_signals,
+            }
     elif dataset_type == "youtube_vos":
         from dataloader.youtube_vos import YouTubeVOSDataset
 
@@ -593,8 +958,24 @@ def main():
             val_fraction=data_cfg.get("val_fraction", 0.1),
             seed=data_cfg.get("seed", 42),
         )
+        validation_sets = {
+            "val": {
+                "dataset": val_dataset,
+                "use_teacher_signals": val_use_teacher_signals,
+            }
+        }
+        primary_validation_set = "val"
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type!r}. Use 'tartanair_v2' or 'youtube_vos'.")
+        raise ValueError(
+            f"Unknown dataset type: {dataset_type!r}. Use 'tartanair_v2' or 'youtube_vos'."
+        )
+
+    if primary_validation_set not in validation_sets:
+        available = ", ".join(sorted(validation_sets))
+        raise ValueError(
+            f"validation.primary_set={primary_validation_set!r} not found. "
+            f"Available validation sets: {available}"
+        )
 
     batch_size = train_cfg.get("batch_size", 2)
     num_workers = train_cfg.get("num_workers", 4)
@@ -607,24 +988,39 @@ def main():
     # prefetch_factor lets workers queue up batches while the GPU is busy.
     _persistent = num_workers > 0
     _prefetch = 2 if num_workers > 0 else None
-    _val_persistent = bool(train_cfg.get("val_persistent_workers", False)) and val_num_workers > 0
-    _val_prefetch = int(train_cfg.get("val_prefetch_factor", 1)) if val_num_workers > 0 else None
+    _val_persistent = (
+        bool(train_cfg.get("val_persistent_workers", False)) and val_num_workers > 0
+    )
+    _val_prefetch = (
+        int(train_cfg.get("val_prefetch_factor", 1)) if val_num_workers > 0 else None
+    )
 
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=local_rank,
-        shuffle=True,
-        drop_last=True,
-    ) if is_distributed else None
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        if is_distributed
+        else None
+    )
 
-    val_sampler = DistributedSampler(
-        val_dataset,
-        num_replicas=world_size,
-        rank=local_rank,
-        shuffle=False,
-        drop_last=False,
-    ) if is_distributed else None
+    val_samplers = {
+        set_name: (
+            DistributedSampler(
+                set_bundle["dataset"],
+                num_replicas=world_size,
+                rank=local_rank,
+                shuffle=False,
+                drop_last=False,
+            )
+            if is_distributed
+            else None
+        )
+        for set_name, set_bundle in validation_sets.items()
+    }
 
     train_loader = DataLoader(
         train_dataset,
@@ -637,17 +1033,21 @@ def main():
         persistent_workers=_persistent,
         prefetch_factor=_prefetch,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=val_num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        persistent_workers=_val_persistent,
-        prefetch_factor=_val_prefetch,
-    )
+    val_loaders = {
+        set_name: DataLoader(
+            set_bundle["dataset"],
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_samplers[set_name],
+            num_workers=val_num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            persistent_workers=_val_persistent,
+            prefetch_factor=_val_prefetch,
+        )
+        for set_name, set_bundle in validation_sets.items()
+    }
+    primary_val_loader = val_loaders[primary_validation_set]
 
     # Compute batch count before optionally wrapping in CPUPrefetchLoader,
     # which may not implement __len__.
@@ -661,8 +1061,14 @@ def main():
         train_loader = CPUPrefetchLoader(train_loader, prefetch=cpu_prefetch_batches)
     if train_cfg.get("val_cpu_prefetch", False):
         val_cpu_prefetch_batches = int(train_cfg.get("val_cpu_prefetch_batches", 1))
-        val_loader = CPUPrefetchLoader(val_loader, prefetch=val_cpu_prefetch_batches)
-    logger.info("Train clips: %d | Val clips: %d", len(train_dataset), len(val_dataset))
+        val_loaders = {
+            set_name: CPUPrefetchLoader(loader, prefetch=val_cpu_prefetch_batches)
+            for set_name, loader in val_loaders.items()
+        }
+        primary_val_loader = val_loaders[primary_validation_set]
+    logger.info("Train clips: %d", len(train_dataset))
+    for set_name, set_bundle in validation_sets.items():
+        logger.info("Validation clips [%s]: %d", set_name, len(set_bundle["dataset"]))
     logger.info(
         "Train loader: batch_size=%d num_workers=%d persistent_workers=%s prefetch_factor=%s cpu_prefetch=%s",
         batch_size,
@@ -672,14 +1078,21 @@ def main():
         train_cfg.get("cpu_prefetch", True),
     )
     logger.info(
-        "Val loader: batch_size=%d num_workers=%d persistent_workers=%s prefetch_factor=%s cpu_prefetch=%s teacher_signals=%s",
+        "Validation loaders: primary=%s batch_size=%d num_workers=%d persistent_workers=%s "
+        "prefetch_factor=%s cpu_prefetch=%s",
+        primary_validation_set,
         batch_size,
         val_num_workers,
         _val_persistent,
         _val_prefetch,
         train_cfg.get("val_cpu_prefetch", False),
-        val_use_teacher_signals,
     )
+    for set_name, set_bundle in validation_sets.items():
+        logger.info(
+            "  validation_set[%s]: teacher_signals=%s",
+            set_name,
+            set_bundle["use_teacher_signals"],
+        )
 
     # -----------------------------------------------------------------------
     # Loss, optimizer, scheduler
@@ -700,7 +1113,11 @@ def main():
             distillation_cfg.setdefault(
                 "teachers",
                 [
-                    {"name": t["name"], "weight": float(t.get("weight", 1.0)), "loss": "si_log"}
+                    {
+                        "name": t["name"],
+                        "weight": float(t.get("weight", 1.0)),
+                        "loss": "si_log",
+                    }
                     for t in teacher_cfgs
                     if t.get("enabled", True)
                 ],
@@ -714,11 +1131,15 @@ def main():
                 "Distillation is enabled but no live teachers or teacher cache are available."
             )
     elif _has_cache and teacher_cfgs:
-        logger.info("Ignoring cached teacher depths because distillation.enabled=false.")
+        logger.info(
+            "Ignoring cached teacher depths because distillation.enabled=false."
+        )
     criterion = CombinedLoss(cfg=loss_cfg, distillation_cfg=distillation_cfg)
 
     optimizer = _build_optimizer(model, train_cfg, logger)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)  # bf16 has fp32 exponent range; no loss scaling needed
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_fp16
+    )  # bf16 has fp32 exponent range; no loss scaling needed
 
     max_epochs = int(train_cfg.get("max_epochs", 50))
     warmup_steps = train_cfg.get("warmup_steps", 200)
@@ -795,6 +1216,8 @@ def main():
             extra={
                 "dataset": dataset_type,
                 "selection_metric": selection_metric,
+                "primary_validation_set": primary_validation_set,
+                "validation_sets": sorted(validation_sets.keys()),
             },
         )
         writer = SummaryWriter(str(log_dir))
@@ -813,7 +1236,9 @@ def main():
         )
     else:
         writer = None
-    logger.info("TensorBoard logs -> %s (run: tensorboard --logdir %s)", log_dir, log_dir)
+    logger.info(
+        "TensorBoard logs -> %s (run: tensorboard --logdir %s)", log_dir, log_dir
+    )
     if is_main:
         logger.info(
             "Run artifacts -> verbose_log=%s metrics=%s metadata=%s config_snapshot=%s",
@@ -836,6 +1261,43 @@ def main():
         selection_metric,
         "higher" if _selection_metric_higher_is_better(selection_metric) else "lower",
     )
+
+    def _run_validation_suite(
+        *, epoch_index: int, writer_step: int | None, before_train: bool = False
+    ) -> tuple[Dict[str, float], Dict[str, float], Dict[str, Dict[str, float]]]:
+        metrics_by_name: Dict[str, Dict[str, float]] = {}
+        for set_name, loader in val_loaders.items():
+            metrics_by_name[set_name] = validate(
+                model=model,
+                loader=loader,
+                criterion=criterion,
+                device=device,
+                use_amp=use_amp,
+                writer=writer,
+                epoch=epoch_index,
+                teachers=active_teachers
+                if (
+                    active_teachers and validation_sets[set_name]["use_teacher_signals"]
+                )
+                else None,
+                teacher_weights=teacher_weights
+                if (
+                    active_teachers and validation_sets[set_name]["use_teacher_signals"]
+                )
+                else None,
+                log_img_max_B=log_img_max_B,
+                is_main=is_main,
+                use_teacher_signals=validation_sets[set_name]["use_teacher_signals"],
+                writer_prefix=(
+                    f"before_train/{set_name}" if before_train else set_name
+                ),
+                writer_step=writer_step,
+            )
+        primary_metrics = metrics_by_name[primary_validation_set]
+        combined_metrics = _flatten_validation_metrics(
+            metrics_by_name, primary_name=primary_validation_set
+        )
+        return primary_metrics, combined_metrics, metrics_by_name
 
     # -----------------------------------------------------------------------
     # Resume
@@ -890,7 +1352,10 @@ def main():
             ckpt_selection_metric = _normalize_selection_metric(
                 ckpt.get("best_selection_metric", selection_metric)
             )
-            if ckpt_selection_metric == selection_metric and "best_selection_value" in ckpt:
+            if (
+                ckpt_selection_metric == selection_metric
+                and "best_selection_value" in ckpt
+            ):
                 best_selection_value = float(ckpt["best_selection_value"])
             elif selection_metric == "loss":
                 best_selection_value = best_val_loss
@@ -936,6 +1401,41 @@ def main():
             "Increase training.max_epochs, or set training.resume_additional_epochs > 0, "
             "or set training.resume_model_only=true for stage transitions."
         )
+
+    if bool(train_cfg.get("validate_before_train", False)):
+        logger.info("Running validation before training starts.")
+        if hasattr(criterion, "set_progress"):
+            criterion.set_progress(
+                epoch=-1,
+                global_step=global_step,
+                max_epochs=max_epochs,
+                total_steps=total_steps,
+            )
+        pre_primary_metrics, pre_combined_metrics, pre_metrics_by_name = (
+            _run_validation_suite(
+                epoch_index=-1,
+                writer_step=0,
+                before_train=True,
+            )
+        )
+        if is_main:
+            for set_name, set_metrics in pre_metrics_by_name.items():
+                logger.info(
+                    "Before-train validation [%s] | loss=%.5f abs_rel=%.5f delta1=%.4f rmse=%.4f",
+                    set_name,
+                    set_metrics.get("loss", float("inf")),
+                    set_metrics.get("abs_rel", float("inf")),
+                    set_metrics.get("delta1", 0.0),
+                    set_metrics.get("rmse", float("inf")),
+                )
+            if metrics_logger is not None:
+                metrics_logger.log_event(
+                    "pretrain_validation",
+                    step=global_step,
+                    epoch=0,
+                    primary_validation_set=primary_validation_set,
+                    metrics=pre_combined_metrics,
+                )
 
     # -----------------------------------------------------------------------
     # Training loop
@@ -1000,9 +1500,23 @@ def main():
             if hasattr(degradation, "set_clean_probability"):
                 degradation.set_clean_probability(max(0.0, min(1.0, mix_prob)))
         if args.verbose or args.debug:
-            logger.info("Epoch %d/%d started | global_step=%d | deg_scale=%.3f", epoch + 1, max_epochs, global_step, deg_scale)
+            logger.info(
+                "Epoch %d/%d started | global_step=%d | deg_scale=%.3f",
+                epoch + 1,
+                max_epochs,
+                global_step,
+                deg_scale,
+            )
         if is_main:
             writer.add_scalar("train/degradation_scale", deg_scale, epoch)
+
+        if hasattr(criterion, "set_progress"):
+            criterion.set_progress(
+                epoch=epoch,
+                global_step=global_step,
+                max_epochs=max_epochs,
+                total_steps=total_steps,
+            )
 
         # Train one epoch
         avg_loss, global_step = train_one_epoch(
@@ -1027,7 +1541,12 @@ def main():
             step_log_every_n_steps=step_log_every,
             is_main=is_main,
         )
-        logger.info("Epoch %d finished | train_loss=%.6f | global_step=%d", epoch + 1, avg_loss, global_step)
+        logger.info(
+            "Epoch %d finished | train_loss=%.6f | global_step=%d",
+            epoch + 1,
+            avg_loss,
+            global_step,
+        )
         epoch_time = time.time() - epoch_t0
 
         # ETA
@@ -1067,54 +1586,123 @@ def main():
             if ema is not None:
                 ema.apply_shadow()
 
-            val_metrics = validate(
-                model=model,
-                loader=val_loader,
-                criterion=criterion,
-                device=device,
-                use_amp=use_amp,
-                writer=writer,
-                epoch=epoch,
-                teachers=active_teachers if (active_teachers and val_use_teacher_signals) else None,
-                teacher_weights=teacher_weights if (active_teachers and val_use_teacher_signals) else None,
-                log_img_max_B=log_img_max_B,
-                is_main=is_main,
-                use_teacher_signals=val_use_teacher_signals,
+            if hasattr(criterion, "set_progress"):
+                criterion.set_progress(
+                    epoch=epoch,
+                    global_step=global_step,
+                    max_epochs=max_epochs,
+                    total_steps=total_steps,
+                )
+
+            primary_val_metrics, combined_val_metrics, validation_metrics_by_name = (
+                _run_validation_suite(
+                    epoch_index=epoch,
+                    writer_step=epoch + 1,
+                    before_train=False,
+                )
             )
+            val_metrics = dict(combined_val_metrics)
+
+            robodepth_scalar_metrics: dict[str, float] = {}
+            robodepth_report: dict | None = None
+            if _should_run_robodepth(
+                validation_cfg, selection_metric, epoch, max_epochs
+            ):
+                if is_main:
+                    from evaluation.protocols.robodepth import run_robodepth_eval
+
+                    robodepth_output_dir = Path(
+                        robodepth_cfg.get(
+                            "output_dir",
+                            log_dir / "robodepth" / f"epoch_{epoch + 1:04d}",
+                        )
+                    )
+                    robodepth_report = run_robodepth_eval(
+                        model=model,
+                        config=cfg,
+                        device=device,
+                        output_dir=robodepth_output_dir,
+                    )
+                    robodepth_scalar_metrics = {
+                        key: float(value)
+                        for key, value in robodepth_report.items()
+                        if isinstance(value, (int, float))
+                    }
+                if dist.is_available() and dist.is_initialized():
+                    payload = [robodepth_scalar_metrics]
+                    dist.broadcast_object_list(payload, src=0)
+                    robodepth_scalar_metrics = payload[0]
+                val_metrics.update(robodepth_scalar_metrics)
+                if is_main and writer is not None:
+                    for key, value in robodepth_scalar_metrics.items():
+                        writer.add_scalar(f"val/{key}", value, epoch + 1)
+                if (
+                    is_main
+                    and robodepth_scalar_metrics.get("robodepth_meets_target_fps", 1.0)
+                    < 0.5
+                ):
+                    logger.warning(
+                        "RoboDepth validation fell below the configured FPS guardrail: "
+                        "fps=%.2f target=%.2f",
+                        float(
+                            robodepth_scalar_metrics.get("robodepth_fps", float("nan"))
+                        ),
+                        float(
+                            robodepth_scalar_metrics.get(
+                                "robodepth_target_fps", float("nan")
+                            )
+                        ),
+                    )
 
             if ema is not None:
                 ema.restore()
 
-            val_loss = val_metrics.get("loss", float("inf"))
-            abs_rel = val_metrics.get("abs_rel", float("inf"))
-            delta1 = val_metrics.get("delta1", 0.0)
+            val_loss = primary_val_metrics.get("loss", float("inf"))
+            abs_rel = primary_val_metrics.get("abs_rel", float("inf"))
+            delta1 = primary_val_metrics.get("delta1", 0.0)
             selection_value = _extract_selection_value(val_metrics, selection_metric)
             saved_best = False
             if is_main:
+                for set_name, set_metrics in validation_metrics_by_name.items():
+                    logger.info(
+                        "Validation epoch %d [%s] | loss=%.5f abs_rel=%.5f delta1=%.4f rmse=%.4f si_log=%.5f",
+                        epoch + 1,
+                        set_name,
+                        set_metrics.get("loss", float("inf")),
+                        set_metrics.get("abs_rel", float("inf")),
+                        set_metrics.get("delta1", 0.0),
+                        set_metrics.get("rmse", 0.0),
+                        set_metrics.get("si_log", 0.0),
+                    )
                 tqdm.write(
                     f"  Val — loss={val_loss:.5f}  "
                     f"AbsRel={abs_rel:.5f}  "
                     f"d1={delta1:.4f}  "
-                    f"RMSE={val_metrics.get('rmse', 0):.4f}  "
-                    f"SI-log={val_metrics.get('si_log', 0):.5f}"
+                    f"RMSE={primary_val_metrics.get('rmse', 0):.4f}  "
+                    f"SI-log={primary_val_metrics.get('si_log', 0):.5f}  "
+                    f"[primary={primary_validation_set}]"
                 )
                 epoch_bar.set_postfix(
                     train_loss=f"{avg_loss:.5f}",
                     val_loss=f"{val_loss:.5f}",
                 )
-                writer.add_scalar("val/epoch_loss", val_loss, epoch)
+                if writer is not None:
+                    writer.add_scalar("val/epoch_loss", val_loss, epoch + 1)
                 logger.info(
-                    "Validation epoch %d | loss=%.5f abs_rel=%.5f delta1=%.4f rmse=%.4f si_log=%.5f",
+                    "Validation epoch %d | primary=%s loss=%.5f abs_rel=%.5f delta1=%.4f rmse=%.4f si_log=%.5f",
                     epoch + 1,
+                    primary_validation_set,
                     val_loss,
                     abs_rel,
                     delta1,
-                    val_metrics.get("rmse", 0),
-                    val_metrics.get("si_log", 0),
+                    primary_val_metrics.get("rmse", 0),
+                    primary_val_metrics.get("si_log", 0),
                 )
 
             # Save best checkpoint (rank 0 only)
-            if is_main and _is_better_selection_value(selection_metric, selection_value, best_selection_value):
+            if is_main and _is_better_selection_value(
+                selection_metric, selection_value, best_selection_value
+            ):
                 best_val_loss = val_loss
                 best_selection_value = selection_value
                 saved_best = True
@@ -1123,20 +1711,40 @@ def main():
                     try:
                         _save_ckpt(
                             ckpt_dir / "best.pt",
-                            epoch, model, optimizer, scaler, scheduler,
-                            global_step, best_val_loss, selection_metric, best_selection_value,
-                            cfg, ema, model_is_ema=True,
+                            epoch,
+                            model,
+                            optimizer,
+                            scaler,
+                            scheduler,
+                            global_step,
+                            best_val_loss,
+                            selection_metric,
+                            best_selection_value,
+                            cfg,
+                            ema,
+                            model_is_ema=True,
                         )
                     finally:
                         ema.restore()
                 else:
                     _save_ckpt(
                         ckpt_dir / "best.pt",
-                        epoch, model, optimizer, scaler, scheduler,
-                        global_step, best_val_loss, selection_metric, best_selection_value,
-                        cfg, ema, model_is_ema=False,
+                        epoch,
+                        model,
+                        optimizer,
+                        scaler,
+                        scheduler,
+                        global_step,
+                        best_val_loss,
+                        selection_metric,
+                        best_selection_value,
+                        cfg,
+                        ema,
+                        model_is_ema=False,
                     )
-                tqdm.write(f"  -> Best saved ({selection_metric}={best_selection_value:.5f})")
+                tqdm.write(
+                    f"  -> Best saved ({selection_metric}={best_selection_value:.5f})"
+                )
                 logger.info(
                     "New best checkpoint saved: %s=%.5f (epoch=%d, val_loss=%.5f)",
                     selection_metric,
@@ -1150,18 +1758,36 @@ def main():
                     step=global_step,
                     epoch=epoch + 1,
                     metrics=val_metrics,
+                    validation_sets=validation_metrics_by_name,
+                    primary_validation_set=primary_validation_set,
                     selection_metric=selection_metric,
                     selection_value=selection_value,
                     checkpoint_saved=saved_best,
                 )
+                if robodepth_report is not None:
+                    metrics_logger.log_event(
+                        "robodepth_validation",
+                        step=global_step,
+                        epoch=epoch + 1,
+                        report=robodepth_report,
+                    )
 
         # Save latest checkpoint every epoch (rank 0 only)
         if is_main:
             _save_ckpt(
                 ckpt_dir / "latest.pt",
-                epoch, model, optimizer, scaler, scheduler,
-                global_step, best_val_loss, selection_metric, best_selection_value,
-                cfg, ema, model_is_ema=False,
+                epoch,
+                model,
+                optimizer,
+                scaler,
+                scheduler,
+                global_step,
+                best_val_loss,
+                selection_metric,
+                best_selection_value,
+                cfg,
+                ema,
+                model_is_ema=False,
             )
         logger.info("Saved latest checkpoint for epoch %d", epoch + 1)
 
@@ -1170,17 +1796,22 @@ def main():
     # -----------------------------------------------------------------------
     if is_main:
         image_size = tuple(data_cfg.get("image_size", [256, 256]))
+        target_fps = float((cfg.get("inference", {}) or {}).get("target_fps", 30.0))
         profiler = LatencyProfiler(
             input_shape=(1, 3, val_num_frames, int(image_size[0]), int(image_size[1])),
-            target_fps=30.0,
+            target_fps=target_fps,
         )
         try:
             latency = profiler.measure(model, device)
-            logger.info("Latency: %.1f FPS, %.1f ms/frame", latency["fps"], latency["ms_per_frame"])
+            logger.info(
+                "Latency: %.1f FPS, %.1f ms/frame",
+                latency["fps"],
+                latency["ms_per_frame"],
+            )
             if metrics_logger is not None:
                 metrics_logger.log_event("latency", metrics=latency)
             if not latency["meets_target"]:
-                logger.warning("Does not meet 30 FPS target")
+                logger.warning("Does not meet %.1f FPS target", target_fps)
         except Exception as e:
             logger.warning("Latency profiling skipped: %s", e)
 

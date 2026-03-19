@@ -29,6 +29,7 @@ from .mamba_block import SpatialMambaBlock, TemporalMambaBlock
 # Sinusoidal 3-D positional encoding
 # ---------------------------------------------------------------------------
 
+
 def sinusoidal_pos_encoding_3d(
     T: int, H: int, W: int, C: int, device: torch.device
 ) -> torch.Tensor:
@@ -44,7 +45,8 @@ def sinusoidal_pos_encoding_3d(
     def _encode_axis(length: int, d: int) -> torch.Tensor:
         pos = torch.arange(length, device=device, dtype=torch.float32).unsqueeze(1)
         div = torch.exp(
-            torch.arange(0, d, 2, device=device, dtype=torch.float32) * -(math.log(10000.0) / d)
+            torch.arange(0, d, 2, device=device, dtype=torch.float32)
+            * -(math.log(10000.0) / d)
         )
         pe = torch.zeros(length, d, device=device)
         pe[:, 0::2] = torch.sin(pos * div)
@@ -66,6 +68,7 @@ def sinusoidal_pos_encoding_3d(
 # ---------------------------------------------------------------------------
 # Tubelet Embedding
 # ---------------------------------------------------------------------------
+
 
 class TubeletEmbedding(nn.Module):
     """3-D convolutional tubelet embedding with positional encoding.
@@ -93,9 +96,7 @@ class TubeletEmbedding(nn.Module):
             stride=(t_patch, patch_size, patch_size),
         )
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (B, C, T, H, W) input video frames.
@@ -117,6 +118,7 @@ class TubeletEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 # Encoder Stage
 # ---------------------------------------------------------------------------
+
 
 class EncoderStage(nn.Module):
     """A single encoder stage: ``depth`` pairs of Spatial + Temporal Mamba blocks.
@@ -153,20 +155,22 @@ class EncoderStage(nn.Module):
 # Spatial Downsample (strided 3-D Conv, spatial only)
 # ---------------------------------------------------------------------------
 
+
 class SpatialDownsample(nn.Module):
     """Downsample spatial dims by 2x, double channels. Temporal dim untouched."""
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.conv = nn.Conv3d(
-            in_dim, out_dim,
+            in_dim,
+            out_dim,
             kernel_size=(1, 2, 2),
             stride=(1, 2, 2),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, H, W, C) → (B, T, H/2, W/2, out_dim)"""
-        x = x.permute(0, 4, 1, 2, 3)   # (B, C, T, H, W)
+        x = x.permute(0, 4, 1, 2, 3)  # (B, C, T, H, W)
         x = self.conv(x)
         return x.permute(0, 2, 3, 4, 1)  # (B, T, H', W', C')
 
@@ -174,6 +178,7 @@ class SpatialDownsample(nn.Module):
 # ---------------------------------------------------------------------------
 # Full Multi-Scale Encoder
 # ---------------------------------------------------------------------------
+
 
 class FocusMambaEncoder(nn.Module):
     """Multi-scale encoder with skip connections.
@@ -212,9 +217,7 @@ class FocusMambaEncoder(nn.Module):
                 self.downsamples.append(SpatialDownsample(dim, next_dim))
                 dim = next_dim
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Args:
             x: (B, C, T, H, W) input video.

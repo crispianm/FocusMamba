@@ -202,7 +202,10 @@ VARIANTS = [
             "model": {"state_gate_enabled": True},
             "training": {
                 "freeze_backbone": True,
-                "unfreeze_prefixes": ["model.head.motion_modules", "model.head.stage_gates"],
+                "unfreeze_prefixes": [
+                    "model.head.motion_modules",
+                    "model.head.stage_gates",
+                ],
             },
         },
     },
@@ -323,7 +326,9 @@ VARIANTS = [
         "name": "18_teacher_bugfix",
         "job": "rTBg",
         "overrides": {
-            "data": {"teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"},
+            "data": {
+                "teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"
+            },
             "teachers": TEACHERS,
             "distillation": {
                 "enabled": True,
@@ -340,7 +345,9 @@ VARIANTS = [
         "name": "19_teacher_aggregate",
         "job": "rTAg",
         "overrides": {
-            "data": {"teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"},
+            "data": {
+                "teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"
+            },
             "teachers": TEACHERS,
             "distillation": {
                 "enabled": True,
@@ -349,7 +356,12 @@ VARIANTS = [
                 "teachers": [{"name": t["name"], "weight": 1.0} for t in TEACHERS],
                 "confidence_weighted": True,
                 "lambda_si": 0.5,
-                "calibration": {"enabled": True, "min_depth": 0.1, "min_valid_pixels": 64, "use_gt": True},
+                "calibration": {
+                    "enabled": True,
+                    "min_depth": 0.1,
+                    "min_valid_pixels": 64,
+                    "use_gt": True,
+                },
                 "aggregate": {"weight": 1.0, "beta": 6.0},
             },
             "loss": {"distillation_weight": 0.15},
@@ -359,7 +371,9 @@ VARIANTS = [
         "name": "20_teacher_hetero",
         "job": "rTHt",
         "overrides": {
-            "data": {"teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"},
+            "data": {
+                "teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"
+            },
             "teachers": TEACHERS,
             "distillation": {
                 "enabled": True,
@@ -368,7 +382,12 @@ VARIANTS = [
                 "teachers": [{"name": t["name"], "weight": 1.0} for t in TEACHERS],
                 "confidence_weighted": True,
                 "lambda_si": 0.5,
-                "calibration": {"enabled": True, "min_depth": 0.1, "min_valid_pixels": 64, "use_gt": True},
+                "calibration": {
+                    "enabled": True,
+                    "min_depth": 0.1,
+                    "min_valid_pixels": 64,
+                    "use_gt": True,
+                },
                 "aggregate": {"weight": 0.5, "beta": 6.0},
                 "auxiliary": {
                     "vda_weight": 0.3,
@@ -387,7 +406,9 @@ VARIANTS = [
         "job": "rTGt",
         "overrides": {
             "model": {"state_gate_enabled": True},
-            "data": {"teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"},
+            "data": {
+                "teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"
+            },
             "teachers": TEACHERS,
             "distillation": {
                 "enabled": True,
@@ -396,7 +417,12 @@ VARIANTS = [
                 "teachers": [{"name": t["name"], "weight": 1.0} for t in TEACHERS],
                 "confidence_weighted": True,
                 "lambda_si": 0.5,
-                "calibration": {"enabled": True, "min_depth": 0.1, "min_valid_pixels": 64, "use_gt": True},
+                "calibration": {
+                    "enabled": True,
+                    "min_depth": 0.1,
+                    "min_valid_pixels": 64,
+                    "use_gt": True,
+                },
                 "aggregate": {"weight": 0.5, "beta": 6.0},
                 "auxiliary": {
                     "vda_weight": 0.3,
@@ -414,7 +440,9 @@ VARIANTS = [
         "name": "22_teacher_single_da3",
         "job": "rTSg",
         "overrides": {
-            "data": {"teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"},
+            "data": {
+                "teacher_cache_dir": "/projects/b5dh/data/teacher_cache/tartanair_v2"
+            },
             "teachers": [TEACHERS[1]],
             "distillation": {
                 "enabled": True,
@@ -423,7 +451,12 @@ VARIANTS = [
                 "teachers": [{"name": "depth_anything_v3", "weight": 1.0}],
                 "confidence_weighted": True,
                 "lambda_si": 0.5,
-                "calibration": {"enabled": True, "min_depth": 0.1, "min_valid_pixels": 64, "use_gt": True},
+                "calibration": {
+                    "enabled": True,
+                    "min_depth": 0.1,
+                    "min_valid_pixels": 64,
+                    "use_gt": True,
+                },
                 "aggregate": {"weight": 1.0, "beta": 6.0},
             },
             "loss": {"distillation_weight": 0.15},
@@ -449,7 +482,7 @@ VARIANTS = [
                 "auxiliary": {
                     "feature_alignment_weight": 0.05,
                 }
-            }
+            },
         },
     },
     {

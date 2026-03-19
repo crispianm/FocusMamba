@@ -22,6 +22,7 @@ import torch.nn as nn
 # RMSNorm (shared with Mamba blocks for consistency)
 # ---------------------------------------------------------------------------
 
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -36,6 +37,7 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 # Standard Bidirectional Transformer Encoder Block
 # ---------------------------------------------------------------------------
+
 
 class TransformerBlock(nn.Module):
     """Standard Transformer encoder block: pre-norm MHSA + pre-norm MLP.
@@ -88,6 +90,7 @@ class TransformerBlock(nn.Module):
 # Cross-Scan Transformer Block (matches CrossScanMambaBlock interface)
 # ---------------------------------------------------------------------------
 
+
 class CrossScanTransformerBlock(nn.Module):
     """Bidirectional self-attention over spatial tokens.
 
@@ -131,6 +134,7 @@ class CrossScanTransformerBlock(nn.Module):
 # Spatial Transformer Block: (B, T, H, W, C) → attention over spatial dims
 # ---------------------------------------------------------------------------
 
+
 class SpatialTransformerBlock(nn.Module):
     """Applies bidirectional self-attention over the spatial dimensions.
 
@@ -162,6 +166,7 @@ class SpatialTransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Temporal Transformer Block: (B, T, H, W, C) → attention over temporal dim
 # ---------------------------------------------------------------------------
+
 
 class TemporalTransformerBlock(nn.Module):
     """Applies bidirectional self-attention along the temporal dimension.

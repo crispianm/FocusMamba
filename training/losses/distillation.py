@@ -37,8 +37,12 @@ class DistillationLoss(nn.Module):
     ):
         super().__init__()
         self.teacher_configs: List[Dict] = list(distillation_cfg.get("teachers", []))
-        self.teacher_names = [cfg["name"] for cfg in self.teacher_configs if "name" in cfg]
-        self.confidence_weighted = bool(distillation_cfg.get("confidence_weighted", True))
+        self.teacher_names = [
+            cfg["name"] for cfg in self.teacher_configs if "name" in cfg
+        ]
+        self.confidence_weighted = bool(
+            distillation_cfg.get("confidence_weighted", True)
+        )
         self.lambda_si = float(distillation_cfg.get("lambda_si", 0.5))
         self.eps = 1e-6
         self.si_log = ScaleInvariantLogLoss(lambda_si=self.lambda_si, eps=self.eps)
@@ -56,13 +60,19 @@ class DistillationLoss(nn.Module):
         self.strategy = str(distillation_cfg.get("strategy", "legacy")).lower()
         if self.strategy not in self._VALID_STRATEGIES:
             valid = ", ".join(sorted(self._VALID_STRATEGIES))
-            raise ValueError(f"Unknown distillation.strategy={self.strategy!r}. Valid: {valid}")
+            raise ValueError(
+                f"Unknown distillation.strategy={self.strategy!r}. Valid: {valid}"
+            )
 
         self.max_depth = float(distillation_cfg.get("max_depth", 80.0))
         calibration_cfg = distillation_cfg.get("calibration", {}) or {}
-        self.calibration_enabled = bool(calibration_cfg.get("enabled", self.strategy != "legacy"))
+        self.calibration_enabled = bool(
+            calibration_cfg.get("enabled", self.strategy != "legacy")
+        )
         self.calibration_min_depth = float(calibration_cfg.get("min_depth", 0.1))
-        self.calibration_min_valid_pixels = int(calibration_cfg.get("min_valid_pixels", 64))
+        self.calibration_min_valid_pixels = int(
+            calibration_cfg.get("min_valid_pixels", 64)
+        )
         self.calibration_use_gt = bool(calibration_cfg.get("use_gt", True))
 
         mtkd_cfg = distillation_cfg.get("mtkd", {}) or {}
@@ -77,7 +87,9 @@ class DistillationLoss(nn.Module):
         aggregate_cfg = distillation_cfg.get("aggregate", {}) or {}
         default_agg_weight = 1.0 if self.strategy == "calibrated_aggregate" else 0.5
         self.aggregate_weight = float(aggregate_cfg.get("weight", default_agg_weight))
-        self.aggregate_beta = float(aggregate_cfg.get("beta", self.mtkd_reliability_beta))
+        self.aggregate_beta = float(
+            aggregate_cfg.get("beta", self.mtkd_reliability_beta)
+        )
 
         priors_cfg = distillation_cfg.get("teacher_priors", {}) or {}
         self.teacher_priors = {
@@ -206,7 +218,9 @@ class DistillationLoss(nn.Module):
 
         mtkd_total = None
         if self.mtkd_enabled and len(teacher_targets) > 0:
-            agg_depth, teacher_mix = self._aggregate_teachers(teacher_targets, mode=mode)
+            agg_depth, teacher_mix = self._aggregate_teachers(
+                teacher_targets, mode=mode
+            )
 
             if mode == "relative":
                 agg_main = self._relative_l1_weighted(
@@ -245,13 +259,19 @@ class DistillationLoss(nn.Module):
                 )
                 losses["distill/mtkd_temporal"] = t_loss.detach()
 
-            mtkd_total = agg_main + self.mtkd_wavelet_weight * dwt_loss + self.mtkd_temporal_weight * t_loss
+            mtkd_total = (
+                agg_main
+                + self.mtkd_wavelet_weight * dwt_loss
+                + self.mtkd_temporal_weight * t_loss
+            )
             losses["distill/mtkd_total"] = mtkd_total.detach()
             for name, w in teacher_mix.items():
                 losses[f"distill/mtkd_mix_{name}"] = w.detach()
 
         if base_total is not None and mtkd_total is not None:
-            losses["total"] = (1.0 - self.mtkd_alpha) * base_total + self.mtkd_alpha * mtkd_total
+            losses["total"] = (
+                1.0 - self.mtkd_alpha
+            ) * base_total + self.mtkd_alpha * mtkd_total
         elif mtkd_total is not None:
             losses["total"] = mtkd_total
         elif base_total is not None:
@@ -273,7 +293,9 @@ class DistillationLoss(nn.Module):
                 f"Heterogeneous distillation strategies require metric supervision, got {self.target_mode!r}"
             )
 
-        prepared = self._prepare_teacher_targets(teacher_depths, gt_depth=gt_depth, mask=mask)
+        prepared = self._prepare_teacher_targets(
+            teacher_depths, gt_depth=gt_depth, mask=mask
+        )
         if not prepared:
             return {"total": self._zero_loss(student_depth.device)}
 
@@ -289,7 +311,9 @@ class DistillationLoss(nn.Module):
         for name in self.teacher_names:
             mix = teacher_mix.get(
                 name,
-                torch.tensor(0.0, device=student_depth.device, dtype=student_depth.dtype),
+                torch.tensor(
+                    0.0, device=student_depth.device, dtype=student_depth.dtype
+                ),
             )
             losses[f"distill/mtkd_mix_{name}"] = mix.detach()
 
@@ -310,7 +334,9 @@ class DistillationLoss(nn.Module):
                     losses[f"distill/{name}_{metric_name}"] = metric_value.detach()
 
         for name, info in prepared.items():
-            losses[f"distill/{name}_valid_fraction"] = info["valid_mask"].float().mean().detach()
+            losses[f"distill/{name}_valid_fraction"] = (
+                info["valid_mask"].float().mean().detach()
+            )
             losses[f"distill/{name}_shift"] = info["shift"].mean().detach()
 
         total = self._renormalize_components(components, device=student_depth.device)
@@ -336,7 +362,7 @@ class DistillationLoss(nn.Module):
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         gt_valid = None
         if gt_depth is not None:
-            gt_valid = (gt_depth > 0)
+            gt_valid = gt_depth > 0
         if mask is not None:
             gt_valid = mask.bool() if gt_valid is None else (gt_valid & mask.bool())
 
@@ -402,13 +428,21 @@ class DistillationLoss(nn.Module):
             valid = valid_mask[batch_idx].bool()
             if valid.sum() < self.calibration_min_valid_pixels:
                 continue
-            delta = torch.median(gt_log[batch_idx][valid] - teacher_log[batch_idx][valid])
+            delta = torch.median(
+                gt_log[batch_idx][valid] - teacher_log[batch_idx][valid]
+            )
             shift[batch_idx] = delta
 
         calibrated = torch.exp(teacher_log + shift)
-        calibrated = calibrated.clamp(min=self.calibration_min_depth, max=self.max_depth)
+        calibrated = calibrated.clamp(
+            min=self.calibration_min_depth, max=self.max_depth
+        )
         calibrated_valid = valid_mask & torch.isfinite(calibrated)
-        calibrated_valid = calibrated_valid & (calibrated >= self.calibration_min_depth) & (calibrated <= self.max_depth)
+        calibrated_valid = (
+            calibrated_valid
+            & (calibrated >= self.calibration_min_depth)
+            & (calibrated <= self.max_depth)
+        )
         return calibrated, shift, calibrated_valid
 
     def _compute_calibrated_aggregate(
@@ -426,7 +460,9 @@ class DistillationLoss(nn.Module):
             depth = prepared[name]["calibrated_depth"]
             valid = prepared[name]["valid_mask"].bool()
             log_depth = torch.log(depth.clamp(min=self.eps))
-            log_payload.append(torch.where(valid, log_depth, torch.full_like(log_depth, float("nan"))))
+            log_payload.append(
+                torch.where(valid, log_depth, torch.full_like(log_depth, float("nan")))
+            )
             valid_payload.append(valid)
             prior_payload.append(self.teacher_priors.get(name, 1.0))
 
@@ -440,7 +476,9 @@ class DistillationLoss(nn.Module):
             device=stacked_logs.device,
             dtype=stacked_logs.dtype,
         ).view(-1, 1, 1, 1, 1, 1)
-        reliability = priors * torch.exp(-self.aggregate_beta * (stacked_logs - center).abs())
+        reliability = priors * torch.exp(
+            -self.aggregate_beta * (stacked_logs - center).abs()
+        )
         reliability = reliability * stacked_valid.to(dtype=stacked_logs.dtype)
         reliability_sum = reliability.sum(dim=0, keepdim=True)
         agg_valid = reliability_sum.squeeze(0) > 0
@@ -457,7 +495,9 @@ class DistillationLoss(nn.Module):
             if agg_valid.any():
                 teacher_mix[name] = weights[idx][agg_valid].mean()
             else:
-                teacher_mix[name] = torch.tensor(0.0, device=agg_depth.device, dtype=agg_depth.dtype)
+                teacher_mix[name] = torch.tensor(
+                    0.0, device=agg_depth.device, dtype=agg_depth.dtype
+                )
         return agg_depth, agg_valid, teacher_mix
 
     def _compute_teacher_aux_loss(
@@ -487,7 +527,9 @@ class DistillationLoss(nn.Module):
 
         if mode == "metric_structure":
             si = self._si_log_weighted(student_depth, teacher_depth, mask=valid_mask)
-            grad = self.gradient_metric(student_depth, teacher_depth, mask=valid_mask.float())
+            grad = self.gradient_metric(
+                student_depth, teacher_depth, mask=valid_mask.float()
+            )
             metrics["si_log"] = si.detach()
             metrics["gradient"] = grad.detach()
             return si + self.structure_weight * grad, metrics
@@ -500,8 +542,12 @@ class DistillationLoss(nn.Module):
         if mode in {"relative_structure", "structure_only"}:
             student_rel = self._normalize_relative_depth(student_depth, valid_mask)
             teacher_rel = self._normalize_relative_depth(teacher_depth, valid_mask)
-            rel_l1 = self._relative_l1_weighted(student_rel, teacher_rel, mask=valid_mask)
-            grad = self.gradient_relative(student_rel, teacher_rel, mask=valid_mask.float())
+            rel_l1 = self._relative_l1_weighted(
+                student_rel, teacher_rel, mask=valid_mask
+            )
+            grad = self.gradient_relative(
+                student_rel, teacher_rel, mask=valid_mask.float()
+            )
             metrics["rel_l1"] = rel_l1.detach()
             metrics["gradient"] = grad.detach()
             return rel_l1 + self.structure_weight * grad, metrics
@@ -576,7 +622,9 @@ class DistillationLoss(nn.Module):
             normalized = (base[batch_idx] - q_low) / denom
             if self.relative_clamp:
                 normalized = normalized.clamp(0.0, 1.0)
-            norm[batch_idx] = torch.where(valid_batch, normalized, torch.zeros_like(normalized))
+            norm[batch_idx] = torch.where(
+                valid_batch, normalized, torch.zeros_like(normalized)
+            )
         return norm
 
     def _si_log_weighted(
@@ -586,7 +634,9 @@ class DistillationLoss(nn.Module):
         mask: Optional[torch.Tensor] = None,
         weight_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        log_diff = torch.log(pred.clamp(min=self.eps)) - torch.log(gt.clamp(min=self.eps))
+        log_diff = torch.log(pred.clamp(min=self.eps)) - torch.log(
+            gt.clamp(min=self.eps)
+        )
 
         valid = torch.isfinite(log_diff)
         if mask is not None:
@@ -595,7 +645,9 @@ class DistillationLoss(nn.Module):
         if weight_map is None:
             weights = valid.to(dtype=log_diff.dtype)
         else:
-            weights = weight_map.to(dtype=log_diff.dtype) * valid.to(dtype=log_diff.dtype)
+            weights = weight_map.to(dtype=log_diff.dtype) * valid.to(
+                dtype=log_diff.dtype
+            )
 
         weight_sum = weights.sum()
         if weight_sum <= 0:
@@ -666,7 +718,9 @@ class DistillationLoss(nn.Module):
             return torch.ones_like(depths[0])
 
         if log_space:
-            stacked = torch.stack([torch.log(depth.clamp(min=1e-6)) for depth in depths], dim=0)
+            stacked = torch.stack(
+                [torch.log(depth.clamp(min=1e-6)) for depth in depths], dim=0
+            )
         else:
             stacked = torch.stack(depths, dim=0)
         variance = stacked.var(dim=0)
@@ -696,7 +750,9 @@ class DistillationLoss(nn.Module):
             return any_depth, {}
 
         stacked = torch.stack(payload, dim=0)
-        static_w = torch.tensor(static_weights, device=stacked.device, dtype=stacked.dtype)
+        static_w = torch.tensor(
+            static_weights, device=stacked.device, dtype=stacked.dtype
+        )
         static_w = static_w / static_w.sum().clamp(min=self.eps)
         static_w = static_w.view(-1, 1, 1, 1, 1, 1)
 

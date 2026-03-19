@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.aux_restoration import AuxRestorationDecoder
+from models.prefilter import build_prefilter as build_shared_prefilter
+from models.quality import QualityNet
+from models.refiner import RefineNetLite
+from models.vda_conditioning import (
+    DegradationMetadataConditioner,
+    build_degradation_quality_features,
+)
 from models.teachers.vendor.video_depth_anything import VideoDepthAnything
 
 
@@ -50,13 +58,22 @@ _STREAM_MODES = {"offline", "streaming_emulated"}
 _NUM_TEMPORAL_STAGES = 4
 
 
-def _materialize_const_tensor(tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _materialize_const_tensor(
+    tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
     """Clone non-trainable tensors so repeated forwards stay safe under DDP buffer broadcasts."""
 
     materialized = tensor.to(device=device, dtype=dtype)
     if materialized.requires_grad:
         return materialized
     return materialized.clone()
+
+
+def _set_requires_grad(module: nn.Module | None, requires_grad: bool) -> None:
+    if module is None:
+        return
+    for parameter in module.parameters():
+        parameter.requires_grad_(requires_grad)
 
 
 class FastClassicalPrefilter(nn.Module):
@@ -77,21 +94,39 @@ class FastClassicalPrefilter(nn.Module):
     ) -> None:
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 == 0:
-            raise ValueError(f"prefilter kernel_size must be a positive odd integer, got {kernel_size}")
+            raise ValueError(
+                f"prefilter kernel_size must be a positive odd integer, got {kernel_size}"
+            )
 
         self.kernel_size = int(kernel_size)
         self.sigma = float(max(sigma, 1e-3))
         self.learnable = bool(learnable)
-        self.register_buffer("kernel", self._build_gaussian_kernel(self.kernel_size, self.sigma), persistent=False)
+        self.register_buffer(
+            "kernel",
+            self._build_gaussian_kernel(self.kernel_size, self.sigma),
+            persistent=False,
+        )
 
         denoise_logit = self._to_logit(denoise_init)
         sharpen_logit = self._to_logit(sharpen_init)
         if self.learnable:
-            self.denoise_logit = nn.Parameter(torch.tensor(denoise_logit, dtype=torch.float32))
-            self.sharpen_logit = nn.Parameter(torch.tensor(sharpen_logit, dtype=torch.float32))
+            self.denoise_logit = nn.Parameter(
+                torch.tensor(denoise_logit, dtype=torch.float32)
+            )
+            self.sharpen_logit = nn.Parameter(
+                torch.tensor(sharpen_logit, dtype=torch.float32)
+            )
         else:
-            self.register_buffer("denoise_logit", torch.tensor(denoise_logit, dtype=torch.float32), persistent=False)
-            self.register_buffer("sharpen_logit", torch.tensor(sharpen_logit, dtype=torch.float32), persistent=False)
+            self.register_buffer(
+                "denoise_logit",
+                torch.tensor(denoise_logit, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "sharpen_logit",
+                torch.tensor(sharpen_logit, dtype=torch.float32),
+                persistent=False,
+            )
 
     @staticmethod
     def _to_logit(value: float) -> float:
@@ -111,13 +146,17 @@ class FastClassicalPrefilter(nn.Module):
     def _blur(self, x: torch.Tensor) -> torch.Tensor:
         pad = self.kernel_size // 2
         x = F.pad(x, (pad, pad, pad, pad), mode="reflect")
-        kernel = _materialize_const_tensor(self.kernel, device=x.device, dtype=x.dtype).expand(x.shape[1], 1, -1, -1)
+        kernel = _materialize_const_tensor(
+            self.kernel, device=x.device, dtype=x.dtype
+        ).expand(x.shape[1], 1, -1, -1)
         return F.conv2d(x, kernel, groups=x.shape[1])
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         batch_size, channels, num_frames, height, width = frames.shape
         input_dtype = frames.dtype
-        x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        x = frames.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
 
         # Keep the cheap classical prefilter numerically stable and dtype-consistent
         # under bf16 autocast, then restore the caller's dtype at the end.
@@ -125,16 +164,28 @@ class FastClassicalPrefilter(nn.Module):
             x = x.float()
             blurred = self._blur(x).to(dtype=x.dtype)
 
-            denoise_strength = torch.sigmoid(self.denoise_logit).to(device=x.device, dtype=x.dtype).view(1, 1, 1, 1)
+            denoise_strength = (
+                torch.sigmoid(self.denoise_logit)
+                .to(device=x.device, dtype=x.dtype)
+                .view(1, 1, 1, 1)
+            )
             denoised = torch.lerp(x, blurred, denoise_strength)
 
             lowpass = self._blur(denoised).to(dtype=x.dtype)
-            sharpen_strength = torch.sigmoid(self.sharpen_logit).to(device=x.device, dtype=x.dtype).view(1, 1, 1, 1)
+            sharpen_strength = (
+                torch.sigmoid(self.sharpen_logit)
+                .to(device=x.device, dtype=x.dtype)
+                .view(1, 1, 1, 1)
+            )
             sharpened = denoised + sharpen_strength * (denoised - lowpass)
             filtered = sharpened.clamp(0.0, 1.0)
 
         filtered = filtered.to(dtype=input_dtype)
-        return filtered.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
+        return (
+            filtered.reshape(batch_size, num_frames, channels, height, width)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
 
 
 class ChannelStatsAlignPrefilter(nn.Module):
@@ -153,7 +204,9 @@ class ChannelStatsAlignPrefilter(nn.Module):
             raise ValueError("target_mean/target_std must have length 3 for RGB input")
         self.eps = float(eps)
         mean_tensor = torch.tensor(target_mean, dtype=torch.float32).view(1, 3, 1, 1)
-        log_std_tensor = torch.log(torch.tensor(target_std, dtype=torch.float32).clamp_min(self.eps)).view(1, 3, 1, 1)
+        log_std_tensor = torch.log(
+            torch.tensor(target_std, dtype=torch.float32).clamp_min(self.eps)
+        ).view(1, 3, 1, 1)
         if learnable:
             self.target_mean = nn.Parameter(mean_tensor)
             self.target_log_std = nn.Parameter(log_std_tensor)
@@ -163,17 +216,25 @@ class ChannelStatsAlignPrefilter(nn.Module):
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         batch_size, channels, num_frames, height, width = frames.shape
-        x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        x = frames.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
         frame_mean = x.mean(dim=(2, 3), keepdim=True)
         frame_std = x.std(dim=(2, 3), keepdim=True, unbiased=False).clamp_min(self.eps)
-        target_mean = _materialize_const_tensor(self.target_mean, device=x.device, dtype=x.dtype)
+        target_mean = _materialize_const_tensor(
+            self.target_mean, device=x.device, dtype=x.dtype
+        )
         target_log_std = self.target_log_std.to(device=x.device, dtype=x.dtype)
         if not target_log_std.requires_grad:
             target_log_std = target_log_std.clone()
         target_std = target_log_std.exp().clamp_min(self.eps)
         aligned = (x - frame_mean) / frame_std * target_std + target_mean
         aligned = aligned.clamp(0.0, 1.0)
-        return aligned.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
+        return (
+            aligned.reshape(batch_size, num_frames, channels, height, width)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
 
 
 class StatsConditionSE(nn.Module):
@@ -225,7 +286,11 @@ class StatsGuidedResidualBlock(nn.Module):
         residual = self.conv_in(x)
         residual = self.depthwise(residual)
         if self.condition is not None:
-            gate = self.condition(stats).to(device=x.device, dtype=x.dtype).view(x.shape[0], -1, 1, 1)
+            gate = (
+                self.condition(stats)
+                .to(device=x.device, dtype=x.dtype)
+                .view(x.shape[0], -1, 1, 1)
+            )
             residual = residual * (1.0 + 0.1 * gate)
         residual = self.act(residual)
         residual = self.conv_out(residual)
@@ -266,16 +331,24 @@ class StatsGuidedFrontAdapter(nn.Module):
         if self.stats_align is not None:
             frames = self.stats_align(frames)
         batch_size, channels, num_frames, height, width = frames.shape
-        x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        x = frames.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
         for block in self.blocks:
             x = block(x)
-        return x.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
+        return (
+            x.reshape(batch_size, num_frames, channels, height, width)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
 
 
 class TinyAffineNormalizer(nn.Module):
     """Tiny per-frame affine normalizer predicted from shallow depthwise features."""
 
-    def __init__(self, *, max_scale_delta: float = 0.25, max_shift: float = 0.10) -> None:
+    def __init__(
+        self, *, max_scale_delta: float = 0.25, max_shift: float = 0.10
+    ) -> None:
         super().__init__()
         self.max_scale_delta = float(max_scale_delta)
         self.max_shift = float(max_shift)
@@ -292,13 +365,21 @@ class TinyAffineNormalizer(nn.Module):
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         batch_size, channels, num_frames, height, width = frames.shape
-        x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        x = frames.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
         stats = self.encoder(x).flatten(1)
         scale_delta, shift = stats[:, :channels], stats[:, channels:]
-        scale = 1.0 + self.max_scale_delta * torch.tanh(scale_delta).view(-1, channels, 1, 1)
+        scale = 1.0 + self.max_scale_delta * torch.tanh(scale_delta).view(
+            -1, channels, 1, 1
+        )
         shift = self.max_shift * torch.tanh(shift).view(-1, channels, 1, 1)
         normalized = (x * scale + shift).clamp(0.0, 1.0)
-        return normalized.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
+        return (
+            normalized.reshape(batch_size, num_frames, channels, height, width)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
 
 
 class DepthwiseResidualNormalizer(nn.Module):
@@ -308,15 +389,25 @@ class DepthwiseResidualNormalizer(nn.Module):
         super().__init__()
         self.depthwise = nn.Conv2d(3, 3, kernel_size=3, padding=1, groups=3, bias=False)
         nn.init.zeros_(self.depthwise.weight)
-        self.residual_logit = nn.Parameter(torch.tensor(float(residual_scale_init), dtype=torch.float32))
+        self.residual_logit = nn.Parameter(
+            torch.tensor(float(residual_scale_init), dtype=torch.float32)
+        )
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         batch_size, channels, num_frames, height, width = frames.shape
-        x = frames.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        x = frames.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
         residual = self.depthwise(x)
-        scale = 0.25 * torch.tanh(self.residual_logit).to(device=x.device, dtype=x.dtype)
+        scale = 0.25 * torch.tanh(self.residual_logit).to(
+            device=x.device, dtype=x.dtype
+        )
         normalized = (x + scale * residual).clamp(0.0, 1.0)
-        return normalized.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4).contiguous()
+        return (
+            normalized.reshape(batch_size, num_frames, channels, height, width)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
 
 
 def _clean_checkpoint_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
@@ -369,9 +460,24 @@ class VideoDepthAnythingModel(nn.Module):
         front_adapter_blocks: int = 2,
         front_adapter_use_stats_align: bool = True,
         front_adapter_use_se: bool = True,
+        refiner_enabled: bool = False,
+        refiner_channels: int = 32,
+        refiner_scale: float = 0.5,
+        refiner_predict_edges: bool = False,
+        quality_conditioning_enabled: bool = False,
+        quality_embedding_dim: int = 16,
+        quality_hidden_channels: int = 16,
+        aux_reconstruction_enabled: bool = False,
+        aux_reconstruction_channels: int = 32,
+        degradation_conditioning_enabled: bool = False,
+        degradation_conditioning_hidden: int = 32,
         pre_temporal_stage_adapter_enabled: bool = False,
         pre_temporal_stage_adapter_stages: Sequence[str] | None = None,
         pre_temporal_stage_adapter_bottleneck_ratio: int = 4,
+        temporal_module_type: str = "attention",
+        temporal_mamba_d_state: int = 16,
+        temporal_mamba_d_conv: int = 4,
+        temporal_mamba_expand: int = 2,
     ) -> None:
         super().__init__()
 
@@ -381,7 +487,9 @@ class VideoDepthAnythingModel(nn.Module):
             raise ValueError(f"Unknown VDA variant '{variant}'. Available: {valid}")
         if mode not in _STREAM_MODES:
             valid = ", ".join(sorted(_STREAM_MODES))
-            raise ValueError(f"Unsupported VideoDepthAnything mode '{mode}'. Use one of: {valid}")
+            raise ValueError(
+                f"Unsupported VideoDepthAnything mode '{mode}'. Use one of: {valid}"
+            )
 
         cfg = _VDA_VARIANTS[key]
         self.variant = key
@@ -390,11 +498,28 @@ class VideoDepthAnythingModel(nn.Module):
         self.max_temporal_length = int(num_frames)
         self.default_mode = mode
         self.stream_reset_interval = max(0, int(stream_reset_interval))
-        cache_limit = self.max_temporal_length if stream_max_cache_len is None else int(stream_max_cache_len)
+        cache_limit = (
+            self.max_temporal_length
+            if stream_max_cache_len is None
+            else int(stream_max_cache_len)
+        )
         self.stream_max_cache_len = max(1, cache_limit)
         self.state_gate_enabled = bool(state_gate_enabled)
+        self.supports_degradation_inputs = True
         self.prefilter_enabled = bool(prefilter_enabled)
         self.prefilter_type = str(prefilter_type).lower()
+        self.refiner_enabled = bool(refiner_enabled)
+        self.quality_conditioning_enabled = bool(quality_conditioning_enabled)
+        self.quality_embedding_dim = max(int(quality_embedding_dim), 1)
+        self.quality_hidden_channels = int(quality_hidden_channels)
+        self.aux_reconstruction_enabled = bool(aux_reconstruction_enabled)
+        self.degradation_conditioning_enabled = bool(degradation_conditioning_enabled)
+        self.degradation_conditioning_hidden = int(degradation_conditioning_hidden)
+        self.pre_temporal_stage_adapter_enabled = bool(
+            pre_temporal_stage_adapter_enabled
+        )
+        self.refiner_scale = float(refiner_scale)
+        self.refiner_predict_edges = bool(refiner_predict_edges)
 
         self.model = VideoDepthAnything(
             encoder=cfg["encoder"],
@@ -410,7 +535,13 @@ class VideoDepthAnythingModel(nn.Module):
             state_gate_stage_mask=state_gate_stage_mask,
             pre_temporal_stage_adapter_enabled=bool(pre_temporal_stage_adapter_enabled),
             pre_temporal_stage_adapter_stages=pre_temporal_stage_adapter_stages,
-            pre_temporal_stage_adapter_bottleneck_ratio=int(pre_temporal_stage_adapter_bottleneck_ratio),
+            pre_temporal_stage_adapter_bottleneck_ratio=int(
+                pre_temporal_stage_adapter_bottleneck_ratio
+            ),
+            temporal_module_type=str(temporal_module_type),
+            temporal_mamba_d_state=int(temporal_mamba_d_state),
+            temporal_mamba_d_conv=int(temporal_mamba_d_conv),
+            temporal_mamba_expand=int(temporal_mamba_expand),
         )
         self.prefilter = self._build_prefilter(
             enabled=self.prefilter_enabled,
@@ -428,16 +559,55 @@ class VideoDepthAnythingModel(nn.Module):
             front_adapter_use_se=bool(front_adapter_use_se),
         )
 
+        self.refiner = (
+            RefineNetLite(
+                hidden_channels=int(refiner_channels),
+                refine_scale=float(refiner_scale),
+                predict_edges=bool(refiner_predict_edges),
+            )
+            if self.refiner_enabled
+            else None
+        )
+        self.quality_net = (
+            QualityNet(
+                in_channels=3,
+                embedding_dim=self.quality_embedding_dim,
+                hidden_channels=self.quality_hidden_channels,
+            )
+            if self.quality_conditioning_enabled
+            else None
+        )
+        self.aux_restoration_decoder = (
+            AuxRestorationDecoder(hidden_channels=int(aux_reconstruction_channels))
+            if self.aux_reconstruction_enabled
+            else None
+        )
+        self.degradation_conditioner = (
+            DegradationMetadataConditioner(
+                input_dim=16,
+                hidden_dim=self.degradation_conditioning_hidden,
+                embedding_dim=self.quality_embedding_dim,
+            )
+            if self.degradation_conditioning_enabled
+            else None
+        )
+        self._configure_quality_conditioning_modules()
+
         self.register_buffer(
             "_mean",
-            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 1, 3, 1, 1),
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(
+                1, 1, 3, 1, 1
+            ),
             persistent=False,
         )
         self.register_buffer(
             "_std",
-            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1),
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(
+                1, 1, 3, 1, 1
+            ),
             persistent=False,
         )
+        self._checkpoint_audit_report: dict[str, Any] | None = None
 
         if checkpoint_path:
             self.load_checkpoint(checkpoint_path, strict=strict_checkpoint)
@@ -470,13 +640,195 @@ class VideoDepthAnythingModel(nn.Module):
             if key in model_state:
                 skipped_shape.append(model_key)
 
-        missing_keys, unexpected_keys = self.load_state_dict(compatible_state, strict=False)
+        missing_keys, unexpected_keys = self.load_state_dict(
+            compatible_state, strict=False
+        )
+        option_missing = [key for key in missing_keys if self._is_option_state_key(key)]
+        base_missing = [
+            key for key in missing_keys if not self._is_option_state_key(key)
+        ]
+        option_shape = [key for key in skipped_shape if self._is_option_state_key(key)]
+        base_shape = [
+            key for key in skipped_shape if not self._is_option_state_key(key)
+        ]
+        self._checkpoint_audit_report = {
+            "checkpoint_path": str(ckpt_path),
+            "loaded_key_count": len(compatible_state),
+            "missing_keys": list(missing_keys),
+            "unexpected_keys": list(unexpected_keys),
+            "shape_mismatch_keys": list(skipped_shape),
+            "base_missing_keys": base_missing,
+            "option_missing_keys": option_missing,
+            "base_shape_mismatch_keys": base_shape,
+            "option_shape_mismatch_keys": option_shape,
+        }
         if strict and (missing_keys or unexpected_keys or skipped_shape):
             raise RuntimeError(
                 "Strict checkpoint loading failed for VideoDepthAnythingModel. "
                 f"missing={len(missing_keys)} unexpected={len(unexpected_keys)} "
                 f"shape_mismatch={len(skipped_shape)}"
             )
+
+    def _is_option_state_key(self, key: str) -> bool:
+        if key.startswith(
+            (
+                "prefilter.",
+                "refiner.",
+                "quality_net.",
+                "aux_restoration_decoder.",
+                "degradation_conditioner.",
+            )
+        ):
+            return True
+        if key.startswith(
+            (
+                "model.head.pre_temporal_stage_adapters.",
+                "model.head.stage_quality_cache_scales.",
+            )
+        ):
+            return True
+        return ".quality_proj." in key
+
+    def get_checkpoint_audit_report(self) -> dict[str, Any] | None:
+        if self._checkpoint_audit_report is None:
+            return None
+        return dict(self._checkpoint_audit_report)
+
+    def _configure_quality_conditioning_modules(self) -> None:
+        quality_enabled = bool(
+            self.quality_conditioning_enabled or self.degradation_conditioning_enabled
+        )
+        if not quality_enabled:
+            self.model.head.stage_quality_cache_scales = None
+            for motion_module in getattr(self.model.head, "motion_modules", []):
+                if hasattr(motion_module, "quality_proj"):
+                    motion_module.quality_proj = None
+            return
+
+        quality_dim = int(self.quality_embedding_dim)
+        stage_gates = []
+        for _ in range(_NUM_TEMPORAL_STAGES):
+            gate = nn.Linear(quality_dim, 1)
+            nn.init.zeros_(gate.weight)
+            nn.init.zeros_(gate.bias)
+            stage_gates.append(gate)
+        self.model.head.quality_dim = quality_dim
+        self.model.head.stage_quality_cache_scales = nn.ModuleList(stage_gates)
+
+        for motion_module in getattr(self.model.head, "motion_modules", []):
+            temporal_model = getattr(motion_module, "temporal_model", None)
+            norm = getattr(temporal_model, "norm", None)
+            if norm is None or not hasattr(norm, "num_channels"):
+                raise AttributeError(
+                    "Could not infer temporal channel width for VDA quality conditioning"
+                )
+            quality_proj = nn.Linear(quality_dim, int(norm.num_channels))
+            nn.init.zeros_(quality_proj.weight)
+            nn.init.zeros_(quality_proj.bias)
+            motion_module.quality_dim = quality_dim
+            motion_module.quality_proj = quality_proj
+
+    def _build_quality_embedding(
+        self,
+        frames: torch.Tensor,
+        *,
+        degradation_params: Mapping[str, Any] | None,
+        degradation_summary: Mapping[str, Any] | None,
+    ) -> torch.Tensor | None:
+        embedding: torch.Tensor | None = None
+        if self.quality_net is not None:
+            embedding = self.quality_net(frames)
+
+        if self.degradation_conditioner is not None:
+            metadata = build_degradation_quality_features(
+                degradation_params,
+                degradation_summary,
+                batch_size=frames.shape[0],
+                device=frames.device,
+                dtype=frames.dtype,
+            )
+            if metadata is not None:
+                metadata_embedding = self.degradation_conditioner(metadata)
+                if metadata_embedding.ndim == 2 and frames.ndim == 5:
+                    metadata_embedding = (
+                        metadata_embedding.unsqueeze(1)
+                        .expand(-1, frames.shape[2], -1)
+                        .contiguous()
+                    )
+                embedding = (
+                    metadata_embedding
+                    if embedding is None
+                    else (embedding + metadata_embedding)
+                )
+        return embedding
+
+    def _option_trainable_prefixes(self, option_name: str) -> tuple[str, ...]:
+        name = str(option_name).strip().lower()
+        motion_prefixes = tuple(
+            f"model.head.motion_modules.{idx}.quality_proj"
+            for idx, _ in enumerate(getattr(self.model.head, "motion_modules", []))
+        )
+        if name in {"option1", "prefilter", "option1_prefilter"}:
+            return ("prefilter",)
+        if name in {"option2", "refiner", "option2_refiner"}:
+            return ("refiner",)
+        if name in {"option3", "quality", "quality_gate", "option3_quality_gate"}:
+            return (
+                "quality_net",
+                "model.head.stage_quality_cache_scales",
+                *motion_prefixes,
+            )
+        if name in {
+            "option4",
+            "pre_temporal_adapter",
+            "pre_temporal_stage_adapter",
+            "option4_pre_temporal_adapter",
+        }:
+            return ("model.head.pre_temporal_stage_adapters",)
+        if name in {"option5", "aux_recon", "aux_restoration", "option5_aux_recon"}:
+            return ("aux_restoration_decoder",)
+        if name in {
+            "option6",
+            "degradation",
+            "degradation_gate",
+            "degradation_conditioned_gate",
+            "option6_degradation_conditioned_gate",
+        }:
+            return (
+                "degradation_conditioner",
+                "model.head.stage_quality_cache_scales",
+                *motion_prefixes,
+            )
+        if name in {"all", "full", "phase_b", "phase_b_unfrozen"}:
+            return tuple()
+        raise ValueError(
+            "Unknown bug-hunt option name "
+            f"{option_name!r}. Valid options: option1/option2/option3/option4/option5/option6."
+        )
+
+    def set_bug_hunt_trainability(self, option_name: str | None, *, phase: str) -> None:
+        phase_name = str(phase).strip().lower()
+        if phase_name in {
+            "full",
+            "phase_b",
+            "phase_b_unfrozen",
+            "unfrozen",
+        } or option_name in {"all", "full"}:
+            _set_requires_grad(self, True)
+            return
+        if phase_name not in {"phase_a", "phase_a_frozen", "frozen"}:
+            raise ValueError(
+                f"Unsupported bug-hunt phase {phase!r}. Use phase_a or phase_b."
+            )
+        if option_name is None:
+            raise ValueError(
+                "phase_a requires an explicit option_name so only that surface is trainable"
+            )
+        _set_requires_grad(self, False)
+        prefixes = self._option_trainable_prefixes(option_name)
+        for name, param in self.named_parameters():
+            if any(name.startswith(prefix) for prefix in prefixes):
+                param.requires_grad_(True)
 
     def reset_stream_state(
         self,
@@ -496,6 +848,7 @@ class VideoDepthAnythingModel(nn.Module):
         state: dict[str, Any] | None,
         return_gate_stats: bool = False,
         return_feature_summary: bool = False,
+        quality_embedding: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | dict[str, Any]]:
         if frame_t.ndim == 4:
             clip = frame_t.unsqueeze(2)
@@ -517,6 +870,7 @@ class VideoDepthAnythingModel(nn.Module):
             cached_hidden_state_list=self._flatten_stage_caches(state["stage_caches"]),
             return_gate_stats=return_gate_stats,
             return_feature_summary=return_feature_summary,
+            quality_embedding=quality_embedding,
         )
 
         next_state = {
@@ -537,8 +891,10 @@ class VideoDepthAnythingModel(nn.Module):
             outputs["feature_summary"] = head_outputs["feature_summary"]
         if "gate_stats" in head_outputs:
             outputs["gate_stats"] = head_outputs["gate_stats"]
-        if "feature_summary" in head_outputs:
-            outputs["feature_summary"] = head_outputs["feature_summary"]
+        if "edge_logits" in head_outputs:
+            outputs["edge_logits"] = head_outputs["edge_logits"]
+        if "reconstruction" in head_outputs:
+            outputs["reconstruction"] = head_outputs["reconstruction"]
         return outputs
 
     def forward(
@@ -548,45 +904,80 @@ class VideoDepthAnythingModel(nn.Module):
         return_state: bool = False,
         return_gate_stats: bool = False,
         return_feature_summary: bool = False,
+        degradation_params: Mapping[str, Any] | None = None,
+        degradation_summary: Mapping[str, Any] | None = None,
     ) -> dict[str, torch.Tensor | dict[str, Any]]:
         active_mode = self.default_mode if mode is None else str(mode)
         if active_mode not in _STREAM_MODES:
             valid = ", ".join(sorted(_STREAM_MODES))
-            raise ValueError(f"Unsupported forward mode '{active_mode}'. Use one of: {valid}")
+            raise ValueError(
+                f"Unsupported forward mode '{active_mode}'. Use one of: {valid}"
+            )
 
         if active_mode == "offline":
+            quality_embedding = self._build_quality_embedding(
+                frames,
+                degradation_params=degradation_params,
+                degradation_summary=degradation_summary,
+            )
             outputs = self._run_vda_head(
                 frames,
                 cached_hidden_state_list=None,
-                return_gate_stats=False,
+                return_gate_stats=return_gate_stats,
                 return_feature_summary=return_feature_summary,
+                quality_embedding=quality_embedding,
             )
-            result: dict[str, torch.Tensor | dict[str, Any]] = {"depth": outputs["depth"]}
-            if "feature_summary" in outputs:
-                result["feature_summary"] = outputs["feature_summary"]
+            result: dict[str, torch.Tensor | dict[str, Any]] = {
+                "depth": outputs["depth"]
+            }
+            for key in (
+                "feature_summary",
+                "gate_stats",
+                "edge_logits",
+                "reconstruction",
+            ):
+                if key in outputs:
+                    result[key] = outputs[key]
             if return_state:
-                result["stream_state"] = self.reset_stream_state(frames.shape[0], frames.device)
+                result["stream_state"] = self.reset_stream_state(
+                    frames.shape[0], frames.device
+                )
             return result
 
         batch_size, _, num_frames, _, _ = self._validate_frames(frames)
         state = self.reset_stream_state(batch_size=batch_size, device=frames.device)
+        quality_embedding = self._build_quality_embedding(
+            frames,
+            degradation_params=degradation_params,
+            degradation_summary=degradation_summary,
+        )
         depth_steps: list[torch.Tensor] = []
         gate_steps: list[torch.Tensor] = []
         feature_steps: list[torch.Tensor] = []
+        edge_steps: list[torch.Tensor] = []
+        reconstruction_steps: list[torch.Tensor] = []
         collect_gate_stats = bool(return_gate_stats and self.state_gate_enabled)
 
         for frame_idx in range(num_frames):
+            frame_quality = None
+            if quality_embedding is not None:
+                frame_quality = quality_embedding[:, frame_idx : frame_idx + 1, :]
             step_outputs = self.stream_step(
                 frames[:, :, frame_idx],
                 state,
                 return_gate_stats=collect_gate_stats,
                 return_feature_summary=return_feature_summary,
+                quality_embedding=frame_quality,
             )
             depth_steps.append(step_outputs["depth"])
             if "feature_summary" in step_outputs:
                 feature_steps.append(step_outputs["feature_summary"])
             if "gate_stats" in step_outputs:
                 gate_steps.append(step_outputs["gate_stats"])
+            if "edge_logits" in step_outputs:
+                edge_steps.append(step_outputs["edge_logits"])
+            if "reconstruction" in step_outputs:
+                reconstruction_steps.append(step_outputs["reconstruction"])
             state = step_outputs["stream_state"]
 
         outputs = {"depth": torch.cat(depth_steps, dim=2)}
@@ -594,16 +985,24 @@ class VideoDepthAnythingModel(nn.Module):
             outputs["feature_summary"] = torch.cat(feature_steps, dim=1)
         if gate_steps:
             outputs["gate_stats"] = torch.stack(gate_steps, dim=1)
+        if edge_steps:
+            outputs["edge_logits"] = torch.cat(edge_steps, dim=2)
+        if reconstruction_steps:
+            outputs["reconstruction"] = torch.cat(reconstruction_steps, dim=2)
         if return_state:
             outputs["stream_state"] = state
         return outputs
 
     def _validate_frames(self, frames: torch.Tensor) -> tuple[int, int, int, int, int]:
         if frames.ndim != 5:
-            raise ValueError(f"Expected input shape (B, C, T, H, W), got {tuple(frames.shape)}")
+            raise ValueError(
+                f"Expected input shape (B, C, T, H, W), got {tuple(frames.shape)}"
+            )
         batch_size, channels, num_frames, height, width = frames.shape
         if channels != 3:
-            raise ValueError(f"VideoDepthAnythingModel expects 3 RGB channels, got {channels}")
+            raise ValueError(
+                f"VideoDepthAnythingModel expects 3 RGB channels, got {channels}"
+            )
         return batch_size, channels, num_frames, height, width
 
     def _prepare_frames(
@@ -632,8 +1031,12 @@ class VideoDepthAnythingModel(nn.Module):
         cached_hidden_state_list: Sequence[torch.Tensor] | None,
         return_gate_stats: bool,
         return_feature_summary: bool,
+        quality_embedding: torch.Tensor | None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
-        x, batch_size, num_frames, height, width, padded_h, padded_w = self._prepare_frames(frames)
+        raw_frames = frames
+        x, batch_size, num_frames, height, width, padded_h, padded_w = (
+            self._prepare_frames(frames)
+        )
         patch_h = padded_h // self.patch_size
         patch_w = padded_w // self.patch_size
 
@@ -644,8 +1047,16 @@ class VideoDepthAnythingModel(nn.Module):
         )
         feature_summary = None
         if return_feature_summary and features:
-            last_tokens = features[-1][0] if isinstance(features[-1], (tuple, list)) else features[-1]
-            feature_summary = last_tokens.mean(dim=1).unflatten(0, (batch_size, num_frames)).contiguous()
+            last_tokens = (
+                features[-1][0]
+                if isinstance(features[-1], (tuple, list))
+                else features[-1]
+            )
+            feature_summary = (
+                last_tokens.mean(dim=1)
+                .unflatten(0, (batch_size, num_frames))
+                .contiguous()
+            )
 
         head_outputs = self.model.head(
             features,
@@ -654,15 +1065,27 @@ class VideoDepthAnythingModel(nn.Module):
             num_frames,
             cached_hidden_state_list=cached_hidden_state_list,
             return_gate_stats=return_gate_stats,
+            quality_embedding=quality_embedding,
         )
         depth_bt = head_outputs[0]
         hidden_state_list = head_outputs[1]
         gate_stats = head_outputs[2] if len(head_outputs) > 2 else None
 
-        depth_bt = F.interpolate(depth_bt, size=(padded_h, padded_w), mode="bilinear", align_corners=True)
+        depth_bt = F.interpolate(
+            depth_bt, size=(padded_h, padded_w), mode="bilinear", align_corners=True
+        )
         depth_bt = F.relu(depth_bt)
         depth_bt = depth_bt[:, :, :height, :width]
-        depth = depth_bt.unflatten(0, (batch_size, num_frames)).permute(0, 2, 1, 3, 4).contiguous()
+        depth = (
+            depth_bt.unflatten(0, (batch_size, num_frames))
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+
+        edge_logits = None
+        if self.refiner is not None:
+            depth, edge_logits = self.refiner(depth, raw_frames)
+            depth = depth.clamp_min(1e-6)
 
         outputs: dict[str, torch.Tensor | list[torch.Tensor]] = {
             "depth": depth,
@@ -672,6 +1095,10 @@ class VideoDepthAnythingModel(nn.Module):
             outputs["feature_summary"] = feature_summary
         if gate_stats is not None:
             outputs["gate_stats"] = gate_stats
+        if edge_logits is not None:
+            outputs["edge_logits"] = edge_logits
+        if self.aux_restoration_decoder is not None and self.training:
+            outputs["reconstruction"] = self.aux_restoration_decoder(raw_frames, depth)
         return outputs
 
     def _maybe_reset_stream_state(
@@ -680,9 +1107,15 @@ class VideoDepthAnythingModel(nn.Module):
         device: torch.device,
     ) -> dict[str, Any]:
         step = int(state.get("step", 0))
-        if self.stream_reset_interval <= 0 or step == 0 or (step % self.stream_reset_interval) != 0:
+        if (
+            self.stream_reset_interval <= 0
+            or step == 0
+            or (step % self.stream_reset_interval) != 0
+        ):
             return state
-        return self.reset_stream_state(batch_size=int(state["batch_size"]), device=device)
+        return self.reset_stream_state(
+            batch_size=int(state["batch_size"]), device=device
+        )
 
     def _flatten_stage_caches(
         self,
@@ -712,10 +1145,16 @@ class VideoDepthAnythingModel(nn.Module):
         for stage_idx in range(_NUM_TEMPORAL_STAGES):
             start = stage_idx * tensors_per_stage
             end = (stage_idx + 1) * tensors_per_stage
-            prev_stage = list(previous_stage_caches[stage_idx]) if stage_idx < len(previous_stage_caches) else []
+            prev_stage = (
+                list(previous_stage_caches[stage_idx])
+                if stage_idx < len(previous_stage_caches)
+                else []
+            )
             new_stage = [tensor.detach() for tensor in new_hidden_state_list[start:end]]
             if not prev_stage:
-                stage_cache = [self._truncate_cache_tensor(tensor) for tensor in new_stage]
+                stage_cache = [
+                    self._truncate_cache_tensor(tensor) for tensor in new_stage
+                ]
             else:
                 if len(prev_stage) != len(new_stage):
                     raise ValueError(
@@ -751,35 +1190,18 @@ class VideoDepthAnythingModel(nn.Module):
         front_adapter_use_stats_align: bool,
         front_adapter_use_se: bool,
     ) -> nn.Module | None:
-        if not enabled:
-            return None
-        if prefilter_type == "fast_classical":
-            return FastClassicalPrefilter(
-                kernel_size=kernel_size,
-                sigma=sigma,
-                denoise_init=denoise_init,
-                sharpen_init=sharpen_init,
-                learnable=learnable,
-            )
-        if prefilter_type == "stats_align":
-            return ChannelStatsAlignPrefilter(
-                target_mean=(0.485, 0.456, 0.406) if target_mean is None else target_mean,
-                target_std=(0.229, 0.224, 0.225) if target_std is None else target_std,
-                learnable=learnable,
-            )
-        if prefilter_type == "learned_affine":
-            return TinyAffineNormalizer()
-        if prefilter_type == "depthwise":
-            return DepthwiseResidualNormalizer()
-        if prefilter_type == "stats_guided_front_adapter":
-            return StatsGuidedFrontAdapter(
-                hidden_channels=front_adapter_hidden,
-                num_blocks=front_adapter_blocks,
-                use_stats_align=front_adapter_use_stats_align,
-                use_se=front_adapter_use_se,
-                target_mean=(0.485, 0.456, 0.406) if target_mean is None else target_mean,
-                target_std=(0.229, 0.224, 0.225) if target_std is None else target_std,
-                learnable_stats=learnable,
-            )
-        valid = ", ".join(("fast_classical", "stats_align", "learned_affine", "depthwise", "stats_guided_front_adapter"))
-        raise ValueError(f"Unknown prefilter_type={prefilter_type!r}. Valid: {valid}")
+        return build_shared_prefilter(
+            enabled=enabled,
+            prefilter_type=prefilter_type,
+            target_mean=target_mean,
+            target_std=target_std,
+            kernel_size=kernel_size,
+            sigma=sigma,
+            denoise_init=denoise_init,
+            sharpen_init=sharpen_init,
+            learnable=learnable,
+            front_adapter_hidden=front_adapter_hidden,
+            front_adapter_blocks=front_adapter_blocks,
+            front_adapter_use_stats_align=front_adapter_use_stats_align,
+            front_adapter_use_se=front_adapter_use_se,
+        )

@@ -54,7 +54,8 @@ class DepthProEncoder(nn.Module):
         image_encoder_embed_dim = image_encoder.embed_dim
 
         self.out_size = int(
-            patch_encoder.patch_embed.img_size[0] // patch_encoder.patch_embed.patch_size[0]
+            patch_encoder.patch_embed.img_size[0]
+            // patch_encoder.patch_embed.patch_size[0]
         )
 
         def _create_project_upsample_block(
@@ -99,17 +100,25 @@ class DepthProEncoder(nn.Module):
             upsample_layers=3,
         )
         self.upsample_latent1 = _create_project_upsample_block(
-            dim_in=patch_encoder_embed_dim, dim_out=self.dims_encoder[0], upsample_layers=2
+            dim_in=patch_encoder_embed_dim,
+            dim_out=self.dims_encoder[0],
+            upsample_layers=2,
         )
 
         self.upsample0 = _create_project_upsample_block(
-            dim_in=patch_encoder_embed_dim, dim_out=self.dims_encoder[1], upsample_layers=1
+            dim_in=patch_encoder_embed_dim,
+            dim_out=self.dims_encoder[1],
+            upsample_layers=1,
         )
         self.upsample1 = _create_project_upsample_block(
-            dim_in=patch_encoder_embed_dim, dim_out=self.dims_encoder[2], upsample_layers=1
+            dim_in=patch_encoder_embed_dim,
+            dim_out=self.dims_encoder[2],
+            upsample_layers=1,
         )
         self.upsample2 = _create_project_upsample_block(
-            dim_in=patch_encoder_embed_dim, dim_out=self.dims_encoder[3], upsample_layers=1
+            dim_in=patch_encoder_embed_dim,
+            dim_out=self.dims_encoder[3],
+            upsample_layers=1,
         )
 
         self.upsample_lowres = nn.ConvTranspose2d(

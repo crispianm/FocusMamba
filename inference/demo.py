@@ -42,7 +42,9 @@ def _resolve_device(requested: str) -> torch.device:
         return torch.device("cpu")
     if key == "mps":
         if not torch.backends.mps.is_available():
-            raise RuntimeError("Requested device 'mps' but torch.backends.mps.is_available() is False.")
+            raise RuntimeError(
+                "Requested device 'mps' but torch.backends.mps.is_available() is False."
+            )
         return torch.device("mps")
     if key == "cuda":
         if not torch.cuda.is_available():
@@ -221,7 +223,9 @@ def _resize_for_model(frame_bgr: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(frame_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
 
-def _frame_to_tensor(frame_bgr: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _frame_to_tensor(
+    frame_bgr: np.ndarray, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).contiguous()
     tensor = tensor.to(device=device, dtype=dtype).div_(255.0)
@@ -254,8 +258,12 @@ def _colorize_depth(
             range_state["lo"] = lo
             range_state["hi"] = hi
         else:
-            range_state["lo"] = ema_decay * float(range_state["lo"]) + (1.0 - ema_decay) * lo
-            range_state["hi"] = ema_decay * float(range_state["hi"]) + (1.0 - ema_decay) * hi
+            range_state["lo"] = (
+                ema_decay * float(range_state["lo"]) + (1.0 - ema_decay) * lo
+            )
+            range_state["hi"] = (
+                ema_decay * float(range_state["hi"]) + (1.0 - ema_decay) * hi
+            )
 
         denom = max(float(range_state["hi"]) - float(range_state["lo"]), 1e-6)
         norm = np.clip((values - float(range_state["lo"])) / denom, 0.0, 1.0)
@@ -274,7 +282,9 @@ def _compose_view(
     if view_mode == "depth":
         return depth_bgr
     if view_mode == "overlay":
-        return cv2.addWeighted(frame_bgr, 1.0 - overlay_alpha, depth_bgr, overlay_alpha, 0.0)
+        return cv2.addWeighted(
+            frame_bgr, 1.0 - overlay_alpha, depth_bgr, overlay_alpha, 0.0
+        )
     return np.hstack([frame_bgr, depth_bgr])
 
 
@@ -296,8 +306,26 @@ def _draw_hud(
     ]
     y = 24
     for line in text_lines:
-        cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
         y += 22
     return frame
 
@@ -367,14 +395,24 @@ def run_demo(
         stream_reset_interval=stream_reset_interval,
     )
     streaming = hasattr(model, "stream_step") and hasattr(model, "reset_stream_state")
-    stream_state = model.reset_stream_state(batch_size=1, device=torch_device) if streaming else None
+    stream_state = (
+        model.reset_stream_state(batch_size=1, device=torch_device)
+        if streaming
+        else None
+    )
 
-    checkpoint_label = checkpoint.parent.name if checkpoint.parent != checkpoint.parent.parent else checkpoint.stem
+    checkpoint_label = (
+        checkpoint.parent.name
+        if checkpoint.parent != checkpoint.parent.parent
+        else checkpoint.stem
+    )
     print(f"[demo] load_mode={load_mode}")
     print(f"[demo] device={torch_device} dtype={run_dtype}")
     print(f"[demo] source={source} max_side={max_side} view={view_mode}")
     if "model" in cfg:
-        print(f"[demo] model.type={cfg['model'].get('type')} variant={cfg['model'].get('variant')}")
+        print(
+            f"[demo] model.type={cfg['model'].get('type')} variant={cfg['model'].get('variant')}"
+        )
 
     cap = _open_capture(
         source,
@@ -401,14 +439,26 @@ def run_demo(
             if auto_reset_threshold > 0.0 and streaming:
                 reset_probe = cv2.resize(frame, (96, 54), interpolation=cv2.INTER_AREA)
                 if prev_reset_frame is not None:
-                    diff = np.mean(np.abs(reset_probe.astype(np.float32) - prev_reset_frame.astype(np.float32))) / 255.0
+                    diff = (
+                        np.mean(
+                            np.abs(
+                                reset_probe.astype(np.float32)
+                                - prev_reset_frame.astype(np.float32)
+                            )
+                        )
+                        / 255.0
+                    )
                     if diff > auto_reset_threshold:
-                        stream_state = model.reset_stream_state(batch_size=1, device=torch_device)
+                        stream_state = model.reset_stream_state(
+                            batch_size=1, device=torch_device
+                        )
                         print(f"[demo] auto-reset stream state (diff={diff:.3f})")
                 prev_reset_frame = reset_probe
 
             input_frame = _resize_for_model(frame, max_side=max_side)
-            input_tensor = _frame_to_tensor(input_frame, device=torch_device, dtype=run_dtype)
+            input_tensor = _frame_to_tensor(
+                input_frame, device=torch_device, dtype=run_dtype
+            )
 
             start = time.perf_counter()
             with torch.inference_mode():
@@ -426,7 +476,9 @@ def run_demo(
             frame_times.append(time.perf_counter())
             fps = 0.0
             if len(frame_times) >= 2:
-                fps = (len(frame_times) - 1) / max(frame_times[-1] - frame_times[0], 1e-6)
+                fps = (len(frame_times) - 1) / max(
+                    frame_times[-1] - frame_times[0], 1e-6
+                )
 
             depth_bgr = _colorize_depth(
                 depth_map,
@@ -434,14 +486,20 @@ def run_demo(
                 range_state=range_state,
                 ema_decay=range_ema,
             )
-            depth_bgr = cv2.resize(depth_bgr, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+            depth_bgr = cv2.resize(
+                depth_bgr,
+                (frame.shape[1], frame.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
             composed = _compose_view(
                 frame_bgr=frame,
                 depth_bgr=depth_bgr,
                 view_mode=view_mode,
                 overlay_alpha=overlay_alpha,
             )
-            avg_infer_ms = float(np.mean(infer_times_ms)) if infer_times_ms else infer_ms
+            avg_infer_ms = (
+                float(np.mean(infer_times_ms)) if infer_times_ms else infer_ms
+            )
             composed = _draw_hud(
                 composed,
                 fps=fps,
@@ -457,7 +515,9 @@ def run_demo(
             if key in {27, ord("q")}:
                 break
             if key == ord("r") and streaming:
-                stream_state = model.reset_stream_state(batch_size=1, device=torch_device)
+                stream_state = model.reset_stream_state(
+                    batch_size=1, device=torch_device
+                )
                 print("[demo] manual stream-state reset")
     finally:
         cap.release()
@@ -466,24 +526,98 @@ def run_demo(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real-time webcam/video depth demo")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Training checkpoint (best.pt/latest.pt) or raw VDA checkpoint.")
-    parser.add_argument("--config", type=str, default=None, help="Optional YAML config. If omitted, the script uses the checkpoint's embedded config when available.")
-    parser.add_argument("--source", type=str, default="webcam", help="'webcam', camera index like '0', or a video path.")
-    parser.add_argument("--device", type=str, default="auto", help="auto, mps, cuda, or cpu.")
-    parser.add_argument("--dtype", type=str, default="auto", help="auto, float16, or float32.")
-    parser.add_argument("--variant", type=str, default="small", help="Fallback VDA variant when loading a raw base checkpoint.")
-    parser.add_argument("--max-side", type=int, default=320, help="Maximum model input side length. Lower is faster.")
-    parser.add_argument("--camera-width", type=int, default=640, help="Requested webcam capture width.")
-    parser.add_argument("--camera-height", type=int, default=360, help="Requested webcam capture height.")
-    parser.add_argument("--camera-fps", type=int, default=30, help="Requested webcam capture FPS.")
-    parser.add_argument("--stream-max-cache-len", type=int, default=16, help="Streaming cache length override for compatible models.")
-    parser.add_argument("--stream-reset-interval", type=int, default=0, help="Periodic state reset interval override. 0 disables resets.")
-    parser.add_argument("--view-mode", choices=("side-by-side", "overlay", "depth"), default="side-by-side")
-    parser.add_argument("--overlay-alpha", type=float, default=0.45, help="Blend factor for overlay view.")
-    parser.add_argument("--display-mode", choices=("inverse", "depth"), default="inverse", help="Use inverse depth for more contrast in live scenes.")
-    parser.add_argument("--mirror", action="store_true", help="Mirror the camera preview horizontally.")
-    parser.add_argument("--auto-reset-threshold", type=float, default=0.0, help="Auto-reset stream state when frame-to-frame appearance changes sharply. 0 disables it.")
-    parser.add_argument("--range-ema", type=float, default=0.85, help="EMA smoothing for display depth range. Higher is stabler, lower is more reactive.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Training checkpoint (best.pt/latest.pt) or raw VDA checkpoint.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML config. If omitted, the script uses the checkpoint's embedded config when available.",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="webcam",
+        help="'webcam', camera index like '0', or a video path.",
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto", help="auto, mps, cuda, or cpu."
+    )
+    parser.add_argument(
+        "--dtype", type=str, default="auto", help="auto, float16, or float32."
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="small",
+        help="Fallback VDA variant when loading a raw base checkpoint.",
+    )
+    parser.add_argument(
+        "--max-side",
+        type=int,
+        default=320,
+        help="Maximum model input side length. Lower is faster.",
+    )
+    parser.add_argument(
+        "--camera-width", type=int, default=640, help="Requested webcam capture width."
+    )
+    parser.add_argument(
+        "--camera-height",
+        type=int,
+        default=360,
+        help="Requested webcam capture height.",
+    )
+    parser.add_argument(
+        "--camera-fps", type=int, default=30, help="Requested webcam capture FPS."
+    )
+    parser.add_argument(
+        "--stream-max-cache-len",
+        type=int,
+        default=16,
+        help="Streaming cache length override for compatible models.",
+    )
+    parser.add_argument(
+        "--stream-reset-interval",
+        type=int,
+        default=0,
+        help="Periodic state reset interval override. 0 disables resets.",
+    )
+    parser.add_argument(
+        "--view-mode",
+        choices=("side-by-side", "overlay", "depth"),
+        default="side-by-side",
+    )
+    parser.add_argument(
+        "--overlay-alpha",
+        type=float,
+        default=0.45,
+        help="Blend factor for overlay view.",
+    )
+    parser.add_argument(
+        "--display-mode",
+        choices=("inverse", "depth"),
+        default="inverse",
+        help="Use inverse depth for more contrast in live scenes.",
+    )
+    parser.add_argument(
+        "--mirror", action="store_true", help="Mirror the camera preview horizontally."
+    )
+    parser.add_argument(
+        "--auto-reset-threshold",
+        type=float,
+        default=0.0,
+        help="Auto-reset stream state when frame-to-frame appearance changes sharply. 0 disables it.",
+    )
+    parser.add_argument(
+        "--range-ema",
+        type=float,
+        default=0.85,
+        help="EMA smoothing for display depth range. Higher is stabler, lower is more reactive.",
+    )
     args = parser.parse_args()
 
     run_demo(

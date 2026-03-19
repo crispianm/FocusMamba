@@ -91,9 +91,7 @@ def create_model_and_transforms(
     patch_encoder, patch_encoder_config = create_backbone_model(
         preset=config.patch_encoder_preset
     )
-    image_encoder, _ = create_backbone_model(
-        preset=config.image_encoder_preset
-    )
+    image_encoder, _ = create_backbone_model(preset=config.image_encoder_preset)
 
     fov_encoder = None
     if config.use_fov_head and config.fov_encoder_preset is not None:

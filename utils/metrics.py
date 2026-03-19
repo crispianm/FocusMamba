@@ -25,6 +25,7 @@ import torch.nn.functional as F
 # Individual metrics
 # ---------------------------------------------------------------------------
 
+
 def mae(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """Mean Absolute Error."""
     return (pred - gt).abs().mean()
@@ -35,15 +36,15 @@ def psnr(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> torch.Te
     mse = F.mse_loss(pred, gt)
     if mse < 1e-10:
         return torch.tensor(100.0, device=pred.device)
-    return 10.0 * torch.log10(max_val ** 2 / mse)
+    return 10.0 * torch.log10(max_val**2 / mse)
 
 
 def ssim_metric(
     pred: torch.Tensor,
     gt: torch.Tensor,
     window_size: int = 11,
-    C1: float = 0.01 ** 2,
-    C2: float = 0.03 ** 2,
+    C1: float = 0.01**2,
+    C2: float = 0.03**2,
 ) -> torch.Tensor:
     """SSIM averaged per-frame over T.
 
@@ -51,10 +52,13 @@ def ssim_metric(
     """
     try:
         from pytorch_msssim import ssim
+
         B, C, T, H, W = pred.shape
         total = torch.tensor(0.0, device=pred.device)
         for t in range(T):
-            total = total + ssim(pred[:, :, t], gt[:, :, t], data_range=1.0, size_average=True)
+            total = total + ssim(
+                pred[:, :, t], gt[:, :, t], data_range=1.0, size_average=True
+            )
         return total / T
     except ImportError:
         pass
@@ -62,7 +66,9 @@ def ssim_metric(
     # Fallback manual SSIM
     B, C, T, H, W = pred.shape
     pad = window_size // 2
-    kernel = torch.ones(1, 1, window_size, window_size, device=pred.device, dtype=pred.dtype)
+    kernel = torch.ones(
+        1, 1, window_size, window_size, device=pred.device, dtype=pred.dtype
+    )
     kernel = kernel / kernel.numel()
 
     total = torch.tensor(0.0, device=pred.device)
@@ -70,11 +76,11 @@ def ssim_metric(
         p, g = pred[:, :, t], gt[:, :, t]
         mu_p = F.conv2d(p, kernel, padding=pad)
         mu_g = F.conv2d(g, kernel, padding=pad)
-        sigma_pp = F.conv2d(p * p, kernel, padding=pad) - mu_p ** 2
-        sigma_gg = F.conv2d(g * g, kernel, padding=pad) - mu_g ** 2
+        sigma_pp = F.conv2d(p * p, kernel, padding=pad) - mu_p**2
+        sigma_gg = F.conv2d(g * g, kernel, padding=pad) - mu_g**2
         sigma_pg = F.conv2d(p * g, kernel, padding=pad) - mu_p * mu_g
         ssim_map = ((2 * mu_p * mu_g + C1) * (2 * sigma_pg + C2)) / (
-            (mu_p ** 2 + mu_g ** 2 + C1) * (sigma_pp + sigma_gg + C2)
+            (mu_p**2 + mu_g**2 + C1) * (sigma_pp + sigma_gg + C2)
         )
         total = total + ssim_map.mean()
     return total / T
@@ -105,7 +111,7 @@ def weighted_f_measure(
     weight = 1.0 + 5.0 * (gt_flat - gt_mean).abs()
 
     best_f = torch.tensor(0.0, device=pred.device)
-    beta_sq = beta ** 2
+    beta_sq = beta**2
 
     for thr_idx in range(1, num_thresholds + 1):
         thr = thr_idx / (num_thresholds + 1)
@@ -192,6 +198,7 @@ def noise_robustness_score(
 # Metric Suite (all-in-one)
 # ---------------------------------------------------------------------------
 
+
 class MetricSuite:
     """Convenience wrapper that computes all metrics at once.
 
@@ -204,9 +211,7 @@ class MetricSuite:
         self.compute_lpips = compute_lpips
 
     @torch.no_grad()
-    def __call__(
-        self, pred: torch.Tensor, gt: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
+    def __call__(self, pred: torch.Tensor, gt: torch.Tensor) -> Dict[str, torch.Tensor]:
         results: Dict[str, torch.Tensor] = {
             "mae": mae(pred, gt),
             "psnr": psnr(pred, gt),

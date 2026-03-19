@@ -57,7 +57,9 @@ class ScaleInvariantLogLoss(nn.Module):
             Scalar loss.
         """
         # Compute log difference
-        log_diff = torch.log(pred.clamp(min=self.eps)) - torch.log(gt.clamp(min=self.eps))
+        log_diff = torch.log(pred.clamp(min=self.eps)) - torch.log(
+            gt.clamp(min=self.eps)
+        )
 
         if mask is not None:
             log_diff = log_diff[mask.bool()]
@@ -65,7 +67,7 @@ class ScaleInvariantLogLoss(nn.Module):
         if log_diff.numel() == 0:
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
-        d_sq_mean = (log_diff ** 2).mean()
+        d_sq_mean = (log_diff**2).mean()
         d_mean_sq = (log_diff.mean()) ** 2
 
         loss = d_sq_mean - self.lambda_si * d_mean_sq

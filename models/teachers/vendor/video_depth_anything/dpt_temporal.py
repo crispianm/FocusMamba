@@ -1,16 +1,16 @@
-# Copyright (2025) Bytedance Ltd. and/or its affiliates 
+# Copyright (2025) Bytedance Ltd. and/or its affiliates
 
-# Licensed under the Apache License, Version 2.0 (the "License"); 
-# you may not use this file except in compliance with the License. 
-# You may obtain a copy of the License at 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 
-#     http://www.apache.org/licenses/LICENSE-2.0 
+#     http://www.apache.org/licenses/LICENSE-2.0
 
-# Unless required by applicable law or agreed to in writing, software 
-# distributed under the License is distributed on an "AS IS" BASIS, 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-# See the License for the specific language governing permissions and 
-# limitations under the License. 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -33,7 +33,9 @@ class StageResidualCacheGate(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, current_summary: torch.Tensor, cached_summary: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, current_summary: torch.Tensor, cached_summary: torch.Tensor
+    ) -> torch.Tensor:
         residual = (current_summary - cached_summary).abs()
         gate_input = torch.cat([current_summary, cached_summary, residual], dim=-1)
         return self.mlp(gate_input)
@@ -46,7 +48,9 @@ class PreTemporalStageAdapter(nn.Module):
         super().__init__()
         hidden = max(int(channels) // max(int(bottleneck_ratio), 1), 8)
         self.reduce = nn.Conv2d(int(channels), hidden, kernel_size=1, bias=True)
-        self.depthwise = nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=True)
+        self.depthwise = nn.Conv2d(
+            hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=True
+        )
         self.act = nn.GELU()
         self.expand = nn.Conv2d(hidden, int(channels), kernel_size=1, bias=True)
         self.output_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -56,25 +60,30 @@ class PreTemporalStageAdapter(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, channels, num_frames, height, width = x.shape
-        residual = x.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+        residual = x.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
         residual = self.reduce(residual)
         residual = self.depthwise(residual)
         residual = self.act(residual)
         residual = self.expand(residual)
-        residual = residual.reshape(batch_size, num_frames, channels, height, width).permute(0, 2, 1, 3, 4)
+        residual = residual.reshape(
+            batch_size, num_frames, channels, height, width
+        ).permute(0, 2, 1, 3, 4)
         scale = 0.25 * torch.tanh(self.output_scale).to(device=x.device, dtype=x.dtype)
         return x + scale * residual
 
 
 class DPTHeadTemporal(DPTHead):
-    def __init__(self, 
-        in_channels, 
-        features=256, 
-        use_bn=False, 
-        out_channels=[256, 512, 1024, 1024], 
+    def __init__(
+        self,
+        in_channels,
+        features=256,
+        use_bn=False,
+        out_channels=[256, 512, 1024, 1024],
         use_clstoken=False,
         num_frames=32,
-        pe='ape',
+        pe="ape",
         patch_size: int = 14,
         output_activation: str = "relu",
         state_gate_enabled: bool = False,
@@ -83,6 +92,11 @@ class DPTHeadTemporal(DPTHead):
         pre_temporal_stage_adapter_enabled: bool = False,
         pre_temporal_stage_adapter_stages=None,
         pre_temporal_stage_adapter_bottleneck_ratio: int = 4,
+        temporal_module_type: str = "attention",
+        temporal_mamba_d_state: int = 16,
+        temporal_mamba_d_conv: int = 4,
+        temporal_mamba_expand: int = 2,
+        quality_dim: int = 0,
     ):
         super().__init__(
             in_channels,
@@ -95,23 +109,28 @@ class DPTHeadTemporal(DPTHead):
         )
 
         assert num_frames > 0
-        motion_module_kwargs = dict(num_attention_heads                = 8,
-                                        num_transformer_block              = 1,
-                                        num_attention_blocks               = 2,
-                                        temporal_max_len                   = num_frames,
-                                        zero_initialize                    = True,
-                                        pos_embedding_type                 = pe)
+        motion_module_kwargs = dict(
+            num_attention_heads=8,
+            num_transformer_block=1,
+            num_attention_blocks=2,
+            temporal_max_len=num_frames,
+            zero_initialize=True,
+            pos_embedding_type=pe,
+            temporal_module_type=temporal_module_type,
+            mamba_d_state=temporal_mamba_d_state,
+            mamba_d_conv=temporal_mamba_d_conv,
+            mamba_expand=temporal_mamba_expand,
+            quality_dim=quality_dim,
+        )
 
-        self.motion_modules = nn.ModuleList([
-            TemporalModule(in_channels=out_channels[2], 
-                           **motion_module_kwargs),
-            TemporalModule(in_channels=out_channels[3],
-                           **motion_module_kwargs),
-            TemporalModule(in_channels=features,
-                           **motion_module_kwargs),
-            TemporalModule(in_channels=features,
-                           **motion_module_kwargs)
-        ])
+        self.motion_modules = nn.ModuleList(
+            [
+                TemporalModule(in_channels=out_channels[2], **motion_module_kwargs),
+                TemporalModule(in_channels=out_channels[3], **motion_module_kwargs),
+                TemporalModule(in_channels=features, **motion_module_kwargs),
+                TemporalModule(in_channels=features, **motion_module_kwargs),
+            ]
+        )
         self.state_gate_enabled = bool(state_gate_enabled)
         if state_gate_stage_mask is None:
             self.state_gate_stage_mask = [True, True, True, True]
@@ -122,17 +141,40 @@ class DPTHeadTemporal(DPTHead):
                     f"got {state_gate_stage_mask!r}"
                 )
             self.state_gate_stage_mask = [bool(v) for v in state_gate_stage_mask]
-        self.stage_gates = nn.ModuleList([
-            StageResidualCacheGate(out_channels[2], reduction=state_gate_reduction),
-            StageResidualCacheGate(out_channels[3], reduction=state_gate_reduction),
-            StageResidualCacheGate(features, reduction=state_gate_reduction),
-            StageResidualCacheGate(features, reduction=state_gate_reduction),
-        ]) if self.state_gate_enabled else None
-        self.pre_temporal_stage_adapter_enabled = bool(pre_temporal_stage_adapter_enabled)
+        self.stage_gates = (
+            nn.ModuleList(
+                [
+                    StageResidualCacheGate(
+                        out_channels[2], reduction=state_gate_reduction
+                    ),
+                    StageResidualCacheGate(
+                        out_channels[3], reduction=state_gate_reduction
+                    ),
+                    StageResidualCacheGate(features, reduction=state_gate_reduction),
+                    StageResidualCacheGate(features, reduction=state_gate_reduction),
+                ]
+            )
+            if self.state_gate_enabled
+            else None
+        )
+        self.pre_temporal_stage_adapter_enabled = bool(
+            pre_temporal_stage_adapter_enabled
+        )
+        self.quality_dim = int(quality_dim)
+        if self.quality_dim > 0:
+            self.stage_quality_cache_scales = nn.ModuleList(
+                [nn.Linear(self.quality_dim, 1) for _ in range(4)]
+            )
+            for layer in self.stage_quality_cache_scales:
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        else:
+            self.stage_quality_cache_scales = None
         self.pre_temporal_stage_adapter_stage_names = set()
         if self.pre_temporal_stage_adapter_enabled:
             raw_stage_names = (
-                ["layer3", "layer4"] if pre_temporal_stage_adapter_stages is None
+                ["layer3", "layer4"]
+                if pre_temporal_stage_adapter_stages is None
                 else [str(name) for name in pre_temporal_stage_adapter_stages]
             )
             normalized_stage_names = {
@@ -161,8 +203,13 @@ class DPTHeadTemporal(DPTHead):
         else:
             self.pre_temporal_stage_adapters = None
 
-    def _maybe_apply_pre_temporal_stage_adapter(self, stage_name: str, tensor: torch.Tensor) -> torch.Tensor:
-        if not self.pre_temporal_stage_adapter_enabled or self.pre_temporal_stage_adapters is None:
+    def _maybe_apply_pre_temporal_stage_adapter(
+        self, stage_name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        if (
+            not self.pre_temporal_stage_adapter_enabled
+            or self.pre_temporal_stage_adapters is None
+        ):
             return tensor
         normalized_name = str(stage_name).strip().lower().replace("_", "")
         if normalized_name not in self.pre_temporal_stage_adapters:
@@ -170,11 +217,27 @@ class DPTHeadTemporal(DPTHead):
         adapter = self.pre_temporal_stage_adapters[normalized_name]
         return adapter(tensor)
 
-    def _gate_stage_cache(self, current_stage, cached_stage_list, stage_idx):
+    def _gate_stage_cache(
+        self, current_stage, cached_stage_list, stage_idx, quality_embedding=None
+    ):
         batch_size = current_stage.shape[0]
         device = current_stage.device
         dtype = current_stage.dtype
         default_gate = torch.ones(batch_size, device=device, dtype=dtype)
+        quality_scale = default_gate
+        if (
+            self.stage_quality_cache_scales is not None
+            and quality_embedding is not None
+        ):
+            if quality_embedding.ndim != 3:
+                raise ValueError(
+                    f"quality_embedding must have shape (B, T, Q), got {tuple(quality_embedding.shape)}"
+                )
+            quality_summary = quality_embedding.mean(dim=1)
+            quality_scale = 1.0 + 0.1 * torch.tanh(
+                self.stage_quality_cache_scales[stage_idx](quality_summary).squeeze(-1)
+            ).to(device=device, dtype=dtype)
+            default_gate = default_gate * quality_scale
 
         if (
             not self.state_gate_enabled
@@ -190,7 +253,9 @@ class DPTHeadTemporal(DPTHead):
 
         for tensor in cached_stage_list:
             if tensor.ndim != 3:
-                raise ValueError(f"Expected cached temporal tensor with ndim=3, got {tensor.ndim}")
+                raise ValueError(
+                    f"Expected cached temporal tensor with ndim=3, got {tensor.ndim}"
+                )
             if tensor.shape[-1] != channels:
                 raise ValueError(
                     f"Cached temporal tensor has channel dim {tensor.shape[-1]}, expected {channels}"
@@ -205,7 +270,10 @@ class DPTHeadTemporal(DPTHead):
             cached_summary_parts.append(view.mean(dim=(1, 2)))
 
         cached_summary = torch.stack(cached_summary_parts, dim=0).mean(dim=0)
-        gate = self.stage_gates[stage_idx](current_summary, cached_summary).to(dtype=dtype)
+        gate = self.stage_gates[stage_idx](current_summary, cached_summary).to(
+            dtype=dtype
+        )
+        gate = gate * quality_scale[:, None]
 
         gated_cache = []
         for original_shape, view in reshaped_cache:
@@ -222,6 +290,7 @@ class DPTHeadTemporal(DPTHead):
         micro_batch_size=4,
         cached_hidden_state_list=None,
         return_gate_stats: bool = False,
+        quality_embedding=None,
     ):
         out = []
         for i, x in enumerate(out_features):
@@ -232,7 +301,11 @@ class DPTHeadTemporal(DPTHead):
             else:
                 x = x[0]
 
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w)).contiguous()
+            x = (
+                x.permute(0, 2, 1)
+                .reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+                .contiguous()
+            )
 
             B, T = x.shape[0] // frame_length, frame_length
             x = self.projects[i](x)
@@ -250,16 +323,42 @@ class DPTHeadTemporal(DPTHead):
         gate_means = []
 
         layer_3_seq = layer_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)
-        layer_3_seq = self._maybe_apply_pre_temporal_stage_adapter("layer3", layer_3_seq)
-        layer_3_cache, gate_mean = self._gate_stage_cache(layer_3_seq, list(cached_hidden_state_list[0:N]) if N else None, 0)
+        layer_3_seq = self._maybe_apply_pre_temporal_stage_adapter(
+            "layer3", layer_3_seq
+        )
+        layer_3_cache, gate_mean = self._gate_stage_cache(
+            layer_3_seq,
+            list(cached_hidden_state_list[0:N]) if N else None,
+            0,
+            quality_embedding=quality_embedding,
+        )
         gate_means.append(gate_mean)
-        layer_3, h0 = self.motion_modules[0](layer_3_seq, None, None, layer_3_cache)
+        layer_3, h0 = self.motion_modules[0](
+            layer_3_seq,
+            None,
+            None,
+            layer_3_cache,
+            quality_embedding=quality_embedding,
+        )
         layer_3 = layer_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
         layer_4_seq = layer_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)
-        layer_4_seq = self._maybe_apply_pre_temporal_stage_adapter("layer4", layer_4_seq)
-        layer_4_cache, gate_mean = self._gate_stage_cache(layer_4_seq, list(cached_hidden_state_list[N:2*N]) if N else None, 1)
+        layer_4_seq = self._maybe_apply_pre_temporal_stage_adapter(
+            "layer4", layer_4_seq
+        )
+        layer_4_cache, gate_mean = self._gate_stage_cache(
+            layer_4_seq,
+            list(cached_hidden_state_list[N : 2 * N]) if N else None,
+            1,
+            quality_embedding=quality_embedding,
+        )
         gate_means.append(gate_mean)
-        layer_4, h1 = self.motion_modules[1](layer_4_seq, None, None, layer_4_cache)
+        layer_4, h1 = self.motion_modules[1](
+            layer_4_seq,
+            None,
+            None,
+            layer_4_cache,
+            quality_embedding=quality_embedding,
+        )
         layer_4 = layer_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
         layer_1_rn = self.scratch.layer1_rn(layer_1)
@@ -269,26 +368,52 @@ class DPTHeadTemporal(DPTHead):
 
         path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
         path_4_seq = path_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)
-        path_4_cache, gate_mean = self._gate_stage_cache(path_4_seq, list(cached_hidden_state_list[2*N:3*N]) if N else None, 2)
+        path_4_cache, gate_mean = self._gate_stage_cache(
+            path_4_seq,
+            list(cached_hidden_state_list[2 * N : 3 * N]) if N else None,
+            2,
+            quality_embedding=quality_embedding,
+        )
         gate_means.append(gate_mean)
-        path_4, h2 = self.motion_modules[2](path_4_seq, None, None, path_4_cache)
+        path_4, h2 = self.motion_modules[2](
+            path_4_seq,
+            None,
+            None,
+            path_4_cache,
+            quality_embedding=quality_embedding,
+        )
         path_4 = path_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
         path_3_seq = path_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)
-        path_3_cache, gate_mean = self._gate_stage_cache(path_3_seq, list(cached_hidden_state_list[3*N:]) if N else None, 3)
+        path_3_cache, gate_mean = self._gate_stage_cache(
+            path_3_seq,
+            list(cached_hidden_state_list[3 * N :]) if N else None,
+            3,
+            quality_embedding=quality_embedding,
+        )
         gate_means.append(gate_mean)
-        path_3, h3 = self.motion_modules[3](path_3_seq, None, None, path_3_cache)
+        path_3, h3 = self.motion_modules[3](
+            path_3_seq,
+            None,
+            None,
+            path_3_cache,
+            quality_embedding=quality_embedding,
+        )
         path_3 = path_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
         batch_size = layer_1_rn.shape[0]
         if batch_size <= micro_batch_size or batch_size % micro_batch_size != 0:
-            path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
+            path_2 = self.scratch.refinenet2(
+                path_3, layer_2_rn, size=layer_1_rn.shape[2:]
+            )
             path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
             out = self.scratch.output_conv1(path_1)
             out = F.interpolate(
-                out, (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
-                mode="bilinear", align_corners=True
+                out,
+                (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
+                mode="bilinear",
+                align_corners=True,
             )
             ori_type = out.dtype
             with torch.autocast(device_type="cuda", enabled=False):
@@ -298,12 +423,20 @@ class DPTHeadTemporal(DPTHead):
         else:
             ret = []
             for i in range(0, batch_size, micro_batch_size):
-                path_2 = self.scratch.refinenet2(path_3[i:i + micro_batch_size], layer_2_rn[i:i + micro_batch_size], size=layer_1_rn[i:i + micro_batch_size].shape[2:])
-                path_1 = self.scratch.refinenet1(path_2, layer_1_rn[i:i + micro_batch_size])
+                path_2 = self.scratch.refinenet2(
+                    path_3[i : i + micro_batch_size],
+                    layer_2_rn[i : i + micro_batch_size],
+                    size=layer_1_rn[i : i + micro_batch_size].shape[2:],
+                )
+                path_1 = self.scratch.refinenet1(
+                    path_2, layer_1_rn[i : i + micro_batch_size]
+                )
                 out = self.scratch.output_conv1(path_1)
                 out = F.interpolate(
-                    out, (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
-                    mode="bilinear", align_corners=True
+                    out,
+                    (int(patch_h * self.patch_size), int(patch_w * self.patch_size)),
+                    mode="bilinear",
+                    align_corners=True,
                 )
                 ori_type = out.dtype
                 with torch.autocast(device_type="cuda", enabled=False):

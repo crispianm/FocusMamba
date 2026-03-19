@@ -20,6 +20,7 @@ import torch.nn.functional as F
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _sobel_edges(x: torch.Tensor) -> torch.Tensor:
     """Compute Sobel edge magnitude for a (B, 1, H, W) tensor.
 
@@ -50,8 +51,8 @@ def _ssim_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     window_size: int = 11,
-    C1: float = 0.01 ** 2,
-    C2: float = 0.03 ** 2,
+    C1: float = 0.01**2,
+    C2: float = 0.03**2,
 ) -> torch.Tensor:
     """Compute 1 - SSIM for (B, 1, H, W) tensors.
 
@@ -60,13 +61,16 @@ def _ssim_loss(
     """
     try:
         from pytorch_msssim import ssim
+
         return 1.0 - ssim(pred, target, data_range=1.0, size_average=True)
     except ImportError:
         pass
 
     # Fallback: manual SSIM with box filter
     pad = window_size // 2
-    kernel = torch.ones(1, 1, window_size, window_size, device=pred.device, dtype=pred.dtype)
+    kernel = torch.ones(
+        1, 1, window_size, window_size, device=pred.device, dtype=pred.dtype
+    )
     kernel = kernel / kernel.numel()
 
     mu_p = F.conv2d(pred, kernel, padding=pad)
@@ -87,6 +91,7 @@ def _ssim_loss(
 # ---------------------------------------------------------------------------
 # FocusLoss
 # ---------------------------------------------------------------------------
+
 
 class FocusLoss(nn.Module):
     """Composite focus-map loss.
@@ -111,9 +116,7 @@ class FocusLoss(nn.Module):
         self.lambda_grad = lambda_grad
         self.lambda_tgm = lambda_tgm
 
-    def forward(
-        self, pred: torch.Tensor, gt: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
             pred: (B, 1, T, H, W) predicted focus maps in [0, 1].
@@ -135,8 +138,8 @@ class FocusLoss(nn.Module):
         # ----- Component 3: Edge-Aware Gradient -----
         grad_sum = torch.tensor(0.0, device=pred.device)
         for t in range(T):
-            edges_gt = _sobel_edges(gt[:, :, t])          # (B, 1, H, W)
-            grad_pred = _spatial_gradient(pred[:, :, t])   # (B, 1, H, W)
+            edges_gt = _sobel_edges(gt[:, :, t])  # (B, 1, H, W)
+            grad_pred = _spatial_gradient(pred[:, :, t])  # (B, 1, H, W)
             grad_gt = _spatial_gradient(gt[:, :, t])
             grad_sum = grad_sum + (edges_gt * (grad_pred - grad_gt).abs()).mean()
         loss_grad = grad_sum / T

@@ -12,7 +12,6 @@ import logging
 import math
 from typing import Callable, List, Sequence, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
@@ -20,7 +19,6 @@ from einops import rearrange
 
 from .layers import (
     Block,
-    LayerScale,
     Mlp,
     PatchEmbed,
     PositionGetter,
@@ -39,7 +37,11 @@ def named_apply(
     for child_name, child_module in module.named_children():
         child_name = ".".join((name, child_name)) if name else child_name
         named_apply(
-            fn=fn, module=child_module, name=child_name, depth_first=depth_first, include_root=True
+            fn=fn,
+            module=child_module,
+            name=child_name,
+            depth_first=depth_first,
+            include_root=True,
         )
     if depth_first and include_root:
         fn(module=module, name=name)
@@ -101,13 +103,18 @@ class DinoVisionTransformer(nn.Module):
         self.interpolate_offset = interpolate_offset
 
         self.patch_embed = embed_layer(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
         )
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         if self.alt_start != -1:
             self.camera_token = nn.Parameter(torch.randn(1, 2, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches + self.num_tokens, embed_dim)
+        )
         assert num_register_tokens >= 0
         self.register_tokens = (
             nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim))
@@ -137,7 +144,11 @@ class DinoVisionTransformer(nn.Module):
             raise NotImplementedError
 
         if self.rope_start != -1:
-            self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
+            self.rope = (
+                RotaryPositionEmbedding2D(frequency=rope_freq)
+                if rope_freq > 0
+                else None
+            )
             self.position_getter = PositionGetter() if self.rope is not None else None
         else:
             self.rope = None
@@ -192,7 +203,9 @@ class DinoVisionTransformer(nn.Module):
         )
         assert (w0, h0) == patch_pos_embed.shape[-2:]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(
+            previous_dtype
+        )
 
     def prepare_cls_token(self, B, S):
         cls_token = self.cls_token.expand(B, S, -1)
@@ -204,7 +217,9 @@ class DinoVisionTransformer(nn.Module):
         x = rearrange(x, "b s c h w -> (b s) c h w")
         x = self.patch_embed(x)
         if masks is not None:
-            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
+            x = torch.where(
+                masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x
+            )
         cls_token = self.prepare_cls_token(B, S)
         x = torch.cat((cls_token, x), dim=1)
         x = x + self.interpolate_pos_encoding(x, w, h)
@@ -220,11 +235,15 @@ class DinoVisionTransformer(nn.Module):
         x = rearrange(x, "(b s) n c -> b s n c", b=B, s=S)
         return x
 
-    def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
+    def _get_intermediate_layers_not_chunked(
+        self, x, n=1, export_feat_layers=[], **kwargs
+    ):
         B, S, _, H, W = x.shape
         x = self.prepare_tokens_with_masks(x)
         output, total_block_len, aux_output = [], len(self.blocks), []
-        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        blocks_to_take = (
+            range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        )
 
         for i, blk in enumerate(self.blocks):
             # For da3metric-large: alt_start=-1, rope_start=-1
@@ -276,7 +295,10 @@ class DinoVisionTransformer(nn.Module):
         elif outputs[0][1].shape[-1] == (self.embed_dim * 2):
             outputs = [
                 torch.cat(
-                    [out[1][..., : self.embed_dim], self.norm(out[1][..., self.embed_dim :])],
+                    [
+                        out[1][..., : self.embed_dim],
+                        self.norm(out[1][..., self.embed_dim :]),
+                    ],
                     dim=-1,
                 )
                 for out in outputs
@@ -285,33 +307,55 @@ class DinoVisionTransformer(nn.Module):
             raise ValueError(f"Invalid output shape: {outputs[0][1].shape}")
         aux_outputs = [self.norm(out) for out in aux_outputs]
         outputs = [out[..., 1 + self.num_register_tokens :, :] for out in outputs]
-        aux_outputs = [out[..., 1 + self.num_register_tokens :, :] for out in aux_outputs]
+        aux_outputs = [
+            out[..., 1 + self.num_register_tokens :, :] for out in aux_outputs
+        ]
         return tuple(zip(outputs, camera_tokens)), aux_outputs
 
 
 def vit_small(patch_size=16, num_register_tokens=0, depth=12, **kwargs):
     return DinoVisionTransformer(
-        patch_size=patch_size, embed_dim=384, depth=depth, num_heads=6,
-        mlp_ratio=4, num_register_tokens=num_register_tokens, **kwargs,
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=depth,
+        num_heads=6,
+        mlp_ratio=4,
+        num_register_tokens=num_register_tokens,
+        **kwargs,
     )
 
 
 def vit_base(patch_size=16, num_register_tokens=0, depth=12, **kwargs):
     return DinoVisionTransformer(
-        patch_size=patch_size, embed_dim=768, depth=depth, num_heads=12,
-        mlp_ratio=4, num_register_tokens=num_register_tokens, **kwargs,
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=depth,
+        num_heads=12,
+        mlp_ratio=4,
+        num_register_tokens=num_register_tokens,
+        **kwargs,
     )
 
 
 def vit_large(patch_size=16, num_register_tokens=0, depth=24, **kwargs):
     return DinoVisionTransformer(
-        patch_size=patch_size, embed_dim=1024, depth=depth, num_heads=16,
-        mlp_ratio=4, num_register_tokens=num_register_tokens, **kwargs,
+        patch_size=patch_size,
+        embed_dim=1024,
+        depth=depth,
+        num_heads=16,
+        mlp_ratio=4,
+        num_register_tokens=num_register_tokens,
+        **kwargs,
     )
 
 
 def vit_giant2(patch_size=16, num_register_tokens=0, depth=40, **kwargs):
     return DinoVisionTransformer(
-        patch_size=patch_size, embed_dim=1536, depth=depth, num_heads=24,
-        mlp_ratio=4, num_register_tokens=num_register_tokens, **kwargs,
+        patch_size=patch_size,
+        embed_dim=1536,
+        depth=depth,
+        num_heads=24,
+        mlp_ratio=4,
+        num_register_tokens=num_register_tokens,
+        **kwargs,
     )

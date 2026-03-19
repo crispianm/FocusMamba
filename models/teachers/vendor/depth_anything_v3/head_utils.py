@@ -4,7 +4,6 @@
 from typing import Tuple, Union
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Permute(nn.Module):
@@ -34,7 +33,9 @@ def position_grid_to_embed(
     return emb.view(H, W, embed_dim)
 
 
-def make_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, omega_0: float = 100) -> torch.Tensor:
+def make_sincos_pos_embed(
+    embed_dim: int, pos: torch.Tensor, omega_0: float = 100
+) -> torch.Tensor:
     """Generate 1D positional embedding from a given grid using sine/cosine."""
     assert embed_dim % 2 == 0
     omega = torch.arange(embed_dim // 2, dtype=torch.float32, device=pos.device)
@@ -95,9 +96,13 @@ def custom_interpolate(
     if total > INT_MAX:
         chunks = torch.chunk(x, chunks=(total // INT_MAX) + 1, dim=0)
         outs = [
-            nn.functional.interpolate(c, size=size, mode=mode, align_corners=align_corners)
+            nn.functional.interpolate(
+                c, size=size, mode=mode, align_corners=align_corners
+            )
             for c in chunks
         ]
         return torch.cat(outs, dim=0).contiguous()
 
-    return nn.functional.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+    return nn.functional.interpolate(
+        x, size=size, mode=mode, align_corners=align_corners
+    )

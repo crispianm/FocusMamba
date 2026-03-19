@@ -37,6 +37,7 @@ from dataloader.degradation import LowLightDegradation
 # Utility: deterministic scene-level split
 # ---------------------------------------------------------------------------
 
+
 def _split_scenes(
     scene_dirs: List[Path],
     train_ratio: float = 0.8,
@@ -59,6 +60,7 @@ def _split_scenes(
 # ---------------------------------------------------------------------------
 # Circle-of-Confusion helpers
 # ---------------------------------------------------------------------------
+
 
 def _sample_lens_params(
     rng: np.random.RandomState,
@@ -105,7 +107,7 @@ def compute_focus_map(
     """
     d = depth.astype(np.float64).copy()
     d[d < 1e-8] = 1e-8  # avoid division by zero
-    coc = (focal_length ** 2 / (aperture * s_focus)) * np.abs(d - s_focus) / d
+    coc = (focal_length**2 / (aperture * s_focus)) * np.abs(d - s_focus) / d
     coc_norm = coc / max_coc
     focus_map = 1.0 - np.clip(coc_norm, 0.0, 1.0)
     return focus_map.astype(np.float32)
@@ -140,10 +142,10 @@ def _read_focus_npz(path: Path) -> np.ndarray:
     return focus.astype(np.float32)
 
 
-
 # ---------------------------------------------------------------------------
 # Augmentations
 # ---------------------------------------------------------------------------
+
 
 class _TrainAugmentation:
     """Random horizontal flip, random crop, temporal jitter (±1 frame)."""
@@ -186,6 +188,7 @@ class _TrainAugmentation:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
 
 class FocusDataset(Dataset):
     """Sliding-window video focus-map dataset with depth-guided CoC generation.
@@ -311,12 +314,16 @@ class FocusDataset(Dataset):
                 set_name for set_name, paths in focus_sets.items() if len(paths) >= e
             ]
             if eligible_sets:
-                selected_focus_set = str(eligible_sets[int(self.rng.randint(0, len(eligible_sets)))])
+                selected_focus_set = str(
+                    eligible_sets[int(self.rng.randint(0, len(eligible_sets)))]
+                )
                 focus_paths = focus_sets[selected_focus_set][s:e]
                 focus_maps = np.stack([_read_focus_npz(p) for p in focus_paths], axis=0)
 
                 scene_meta = scene_record.get("metadata", {})
-                if isinstance(scene_meta, dict) and isinstance(scene_meta.get("sets"), list):
+                if isinstance(scene_meta, dict) and isinstance(
+                    scene_meta.get("sets"), list
+                ):
                     try:
                         set_idx = int(selected_focus_set.split("_")[-1])
                         if 0 <= set_idx < len(scene_meta["sets"]):
@@ -342,7 +349,9 @@ class FocusDataset(Dataset):
             max_coc_used = self.max_coc
             focus_maps = np.stack(
                 [
-                    compute_focus_map(depth_maps[t], f_len, aperture, s_focus, self.max_coc)
+                    compute_focus_map(
+                        depth_maps[t], f_len, aperture, s_focus, self.max_coc
+                    )
                     for t in range(T)
                 ],
                 axis=0,
@@ -362,13 +371,9 @@ class FocusDataset(Dataset):
             depth_maps = depth_maps[:, y0 : y0 + ch, x0 : x0 + cw]
             focus_maps = focus_maps[:, y0 : y0 + ch, x0 : x0 + cw]
 
-
         # --- Convert to tensors (C, T, H, W) ---
         frames_t = (
-            torch.from_numpy(frames.copy())
-            .permute(3, 0, 1, 2)
-            .float()
-            .div(255.0)
+            torch.from_numpy(frames.copy()).permute(3, 0, 1, 2).float().div(255.0)
         )  # (3, T, H, W)
 
         # --- Low-light degradation (applied to normalised [0,1] frames) ---
@@ -378,8 +383,12 @@ class FocusDataset(Dataset):
             frames_for_deg = self.lowlight_degradation(frames_for_deg, rng=self.rng)
             frames_t = frames_for_deg.permute(1, 0, 2, 3).contiguous()  # (C, T, H, W)
 
-        focus_t = torch.from_numpy(focus_maps.copy()).unsqueeze(0).float()   # (1, T, H, W)
-        depth_t = torch.from_numpy(depth_maps.copy()).unsqueeze(0).float()   # (1, T, H, W)
+        focus_t = (
+            torch.from_numpy(focus_maps.copy()).unsqueeze(0).float()
+        )  # (1, T, H, W)
+        depth_t = (
+            torch.from_numpy(depth_maps.copy()).unsqueeze(0).float()
+        )  # (1, T, H, W)
 
         return {
             "frames": frames_t,
@@ -400,9 +409,9 @@ class FocusDataset(Dataset):
 def focus_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Custom collate that stacks tensors and collects metadata as a list."""
     return {
-        "frames": torch.stack([b["frames"] for b in batch]),        # (B,C,T,H,W)
-        "focus_maps": torch.stack([b["focus_maps"] for b in batch]),# (B,1,T,H,W)
-        "depth_maps": torch.stack([b["depth_maps"] for b in batch]),# (B,1,T,H,W)
+        "frames": torch.stack([b["frames"] for b in batch]),  # (B,C,T,H,W)
+        "focus_maps": torch.stack([b["focus_maps"] for b in batch]),  # (B,1,T,H,W)
+        "depth_maps": torch.stack([b["depth_maps"] for b in batch]),  # (B,1,T,H,W)
         "metadata": [b["metadata"] for b in batch],
     }
 
@@ -410,6 +419,7 @@ def focus_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
+
 
 def _worker_init_fn(worker_id: int) -> None:
     """Seed each DataLoader worker's numpy RNG independently.
@@ -420,13 +430,14 @@ def _worker_init_fn(worker_id: int) -> None:
     with a unique value derived from the process-level base seed to avoid this.
     """
     import numpy as np
+
     worker_info = torch.utils.data.get_worker_info()
     if worker_info is None:
         return
     dataset = worker_info.dataset
     # The dataset stores ``seed`` at construction time; offset by worker_id.
     base_seed = getattr(dataset, "seed", 42)
-    new_seed = (base_seed + worker_id * 1000) % (2 ** 31)
+    new_seed = (base_seed + worker_id * 1000) % (2**31)
     dataset.rng = np.random.RandomState(new_seed)
 
 
@@ -459,7 +470,9 @@ def build_dataloaders(
         [
             d
             for d in root.iterdir()
-            if d.is_dir() and (d / "frames_sharp").exists() and (d / "depth_maps").exists()
+            if d.is_dir()
+            and (d / "frames_sharp").exists()
+            and (d / "depth_maps").exists()
         ]
     )
 
@@ -509,13 +522,12 @@ def build_dataloaders(
             pin_memory=True,
             drop_last=(split_name == "train"),
             worker_init_fn=_worker_init_fn if num_workers > 0 else None,
-            persistent_workers=True
+            persistent_workers=True,
         )
     return loaders
 
 
-
-class DataPrefetcher():
+class DataPrefetcher:
     def __init__(self, loader):
         self.loader = iter(loader)
         self.stream = torch.cuda.Stream()
@@ -527,9 +539,9 @@ class DataPrefetcher():
         except StopIteration:
             self.next_batch = None
             return
-        
+
         with torch.cuda.stream(self.stream):
-            for k in ['frames', 'focus_maps', 'depth_maps']:
+            for k in ["frames", "focus_maps", "depth_maps"]:
                 self.next_batch[k] = self.next_batch[k].cuda(non_blocking=True)
 
     def next(self):

@@ -41,15 +41,30 @@ def compute_depth_metrics(
         mask = torch.ones_like(gt, dtype=torch.bool)
 
     # Apply depth range + validity
-    valid = mask & (gt > min_depth) & (gt < max_depth) & (pred > min_depth) & torch.isfinite(pred)
+    valid = (
+        mask
+        & (gt > min_depth)
+        & (gt < max_depth)
+        & (pred > min_depth)
+        & torch.isfinite(pred)
+    )
     pred = pred[valid]
     gt = gt[valid]
 
     if pred.numel() == 0:
-        return {k: float("nan") for k in [
-            "abs_rel", "sq_rel", "rmse", "rmse_log", "si_log",
-            "delta1", "delta2", "delta3",
-        ]}
+        return {
+            k: float("nan")
+            for k in [
+                "abs_rel",
+                "sq_rel",
+                "rmse",
+                "rmse_log",
+                "si_log",
+                "delta1",
+                "delta2",
+                "delta3",
+            ]
+        }
 
     diff = pred - gt
     abs_diff = diff.abs()
@@ -58,23 +73,23 @@ def compute_depth_metrics(
     abs_rel = (abs_diff / gt).mean().item()
 
     # SqRel
-    sq_rel = ((diff ** 2) / gt).mean().item()
+    sq_rel = ((diff**2) / gt).mean().item()
 
     # RMSE
-    rmse = (diff ** 2).mean().sqrt().item()
+    rmse = (diff**2).mean().sqrt().item()
 
     # RMSE log
-    log_diff = (torch.log(pred) - torch.log(gt))
-    rmse_log = (log_diff ** 2).mean().sqrt().item()
+    log_diff = torch.log(pred) - torch.log(gt)
+    rmse_log = (log_diff**2).mean().sqrt().item()
 
     # SI-log  (scale-invariant logarithmic error)
-    si_log = (log_diff ** 2).mean().item() - (log_diff.mean().item()) ** 2
+    si_log = (log_diff**2).mean().item() - (log_diff.mean().item()) ** 2
 
     # δ thresholds
     ratio = torch.max(pred / gt, gt / pred)
     delta1 = (ratio < 1.25).float().mean().item()
-    delta2 = (ratio < 1.25 ** 2).float().mean().item()
-    delta3 = (ratio < 1.25 ** 3).float().mean().item()
+    delta2 = (ratio < 1.25**2).float().mean().item()
+    delta3 = (ratio < 1.25**3).float().mean().item()
 
     return {
         "abs_rel": abs_rel,

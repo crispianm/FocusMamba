@@ -37,6 +37,7 @@ from .mamba_block import SpatialMambaBlock
 # 3-D Depthwise Separable Conv
 # ---------------------------------------------------------------------------
 
+
 class DepthwiseSeparableConv3d(nn.Module):
     """3-D depthwise separable convolution for local spatiotemporal smoothing."""
 
@@ -44,8 +45,12 @@ class DepthwiseSeparableConv3d(nn.Module):
         super().__init__()
         pad = kernel_size // 2
         self.depthwise = nn.Conv3d(
-            channels, channels, kernel_size,
-            padding=pad, groups=channels, bias=False,
+            channels,
+            channels,
+            kernel_size,
+            padding=pad,
+            groups=channels,
+            bias=False,
         )
         self.pointwise = nn.Conv3d(channels, channels, 1, bias=True)
         self.norm = nn.GroupNorm(1, channels)  # instance-norm-like
@@ -59,6 +64,7 @@ class DepthwiseSeparableConv3d(nn.Module):
 # ---------------------------------------------------------------------------
 # Single Decoder Stage
 # ---------------------------------------------------------------------------
+
 
 class DecoderStage(nn.Module):
     """One decoder stage: upsample → concat skip → project → Mamba → DWConv."""
@@ -102,7 +108,10 @@ class DecoderStage(nn.Module):
         # 1. Upsample spatially by 2x
         x5d = x.permute(0, 4, 1, 2, 3)  # (B, C, T, H, W)
         x5d = F.interpolate(
-            x5d, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False,
+            x5d,
+            scale_factor=(1, 2, 2),
+            mode="trilinear",
+            align_corners=False,
         )
         x5d = self.upsample_conv(x5d)  # (B, out_dim, T, H*2, W*2)
 
@@ -112,7 +121,10 @@ class DecoderStage(nn.Module):
             # Ensure spatial dims match
             if skip5d.shape[3:] != x5d.shape[3:]:
                 skip5d = F.interpolate(
-                    skip5d, size=x5d.shape[2:], mode="trilinear", align_corners=False,
+                    skip5d,
+                    size=x5d.shape[2:],
+                    mode="trilinear",
+                    align_corners=False,
                 )
             x5d = torch.cat([x5d, skip5d], dim=1)  # (B, out_dim+skip_dim, ...)
             x5d = self.proj(x5d)  # → (B, out_dim, T, H', W')
@@ -132,6 +144,7 @@ class DecoderStage(nn.Module):
 # ---------------------------------------------------------------------------
 # Full Decoder with Temporal Smoothing Head
 # ---------------------------------------------------------------------------
+
 
 class FocusMambaDecoder(nn.Module):
     """UNet decoder for FocusMamba — metric depth output.
@@ -157,23 +170,32 @@ class FocusMambaDecoder(nn.Module):
         self.predict_uncertainty = predict_uncertainty
 
         # Channel dims: stage-0=96, stage-1=192, stage-2=384, bottleneck=768
-        dims = [embed_dim * (2 ** i) for i in range(4)]  # [96, 192, 384, 768]
+        dims = [embed_dim * (2**i) for i in range(4)]  # [96, 192, 384, 768]
 
         # Decoder stages (high to low index = coarse to fine)
         # Stage 3: bottleneck(768) → upsample → concat skip2(384) → 384
         # Stage 2: 384 → upsample → concat skip1(192) → 192
         # Stage 1: 192 → upsample → concat skip0(96) → 96
         # Stage 0: 96 → no skip → 96  (final res)
-        self.stages = nn.ModuleList([
-            DecoderStage(dims[3], dims[2], dims[2], d_state, d_conv, expand),  # 768→384
-            DecoderStage(dims[2], dims[1], dims[1], d_state, d_conv, expand),  # 384→192
-            DecoderStage(dims[1], dims[0], dims[0], d_state, d_conv, expand),  # 192→96
-            DecoderStage(dims[0], 0,       dims[0], d_state, d_conv, expand),  # 96→96
-        ])
+        self.stages = nn.ModuleList(
+            [
+                DecoderStage(
+                    dims[3], dims[2], dims[2], d_state, d_conv, expand
+                ),  # 768→384
+                DecoderStage(
+                    dims[2], dims[1], dims[1], d_state, d_conv, expand
+                ),  # 384→192
+                DecoderStage(
+                    dims[1], dims[0], dims[0], d_state, d_conv, expand
+                ),  # 192→96
+                DecoderStage(dims[0], 0, dims[0], d_state, d_conv, expand),  # 96→96
+            ]
+        )
 
         # Temporal smoothing conv (1-D along T, kernel=3)
         self.temporal_smooth = nn.Conv3d(
-            dims[0], dims[0],
+            dims[0],
+            dims[0],
             kernel_size=(3, 1, 1),
             padding=(1, 0, 0),
             groups=dims[0],
@@ -220,7 +242,7 @@ class FocusMambaDecoder(nn.Module):
 
         # Metric depth head: predict log-depth, exponentiate for positivity
         log_depth = self.depth_head(x)  # (B, 1, T, H, W)
-        depth = torch.exp(log_depth)    # always positive, in metres
+        depth = torch.exp(log_depth)  # always positive, in metres
 
         outputs = {"depth": depth}
 

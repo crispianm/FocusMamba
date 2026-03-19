@@ -111,13 +111,13 @@ def check_and_tune(
 
     passed = best_diff <= tolerance
     status = "PASS" if passed else "FAIL"
-    print(f"\nParameter matching ({tolerance*100:.0f}% tolerance): {status}")
+    print(f"\nParameter matching ({tolerance * 100:.0f}% tolerance): {status}")
 
     if not passed:
         print(
-            f"  WARNING: Could not match parameters within {tolerance*100:.0f}%.\n"
+            f"  WARNING: Could not match parameters within {tolerance * 100:.0f}%.\n"
             f"  Mamba: {mamba_params:,}  Transformer: {best_transformer_params:,}\n"
-            f"  Delta: {best_diff*100:.2f}%\n"
+            f"  Delta: {best_diff * 100:.2f}%\n"
             f"  Consider adjusting depths, embed_dim, or Transformer mlp_ratio."
         )
 
@@ -139,8 +139,12 @@ def check_and_tune(
         f"Shape mismatch: Mamba {out_mamba.shape} vs Transformer {out_transformer.shape}"
     )
     assert out_mamba.shape == (1, 1, 8, 64, 64), f"Unexpected shape: {out_mamba.shape}"
-    print(f"  Mamba output:       {out_mamba.shape}  range=[{out_mamba.min():.3f}, {out_mamba.max():.3f}]")
-    print(f"  Transformer output: {out_transformer.shape}  range=[{out_transformer.min():.3f}, {out_transformer.max():.3f}]")
+    print(
+        f"  Mamba output:       {out_mamba.shape}  range=[{out_mamba.min():.3f}, {out_mamba.max():.3f}]"
+    )
+    print(
+        f"  Transformer output: {out_transformer.shape}  range=[{out_transformer.min():.3f}, {out_transformer.max():.3f}]"
+    )
     print("  Smoke test passed!")
 
     return {

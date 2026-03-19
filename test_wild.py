@@ -30,7 +30,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -46,6 +46,7 @@ from models import build_model
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def run_inference(
@@ -77,12 +78,14 @@ def run_inference(
         pred_np = pred.cpu().float().numpy()  # (B, 1, T, H, W)
 
         for b in range(pred_np.shape[0]):
-            results.append({
-                "scene": metadata[b]["scene"],
-                "start_frame": metadata[b]["start_frame"],
-                "pred_focus_map": pred_np[b, 0],  # (T, H, W)
-                "focus_distances": metadata[b].get("focus_distances"),
-            })
+            results.append(
+                {
+                    "scene": metadata[b]["scene"],
+                    "start_frame": metadata[b]["start_frame"],
+                    "pred_focus_map": pred_np[b, 0],  # (T, H, W)
+                    "focus_distances": metadata[b].get("focus_distances"),
+                }
+            )
 
     return results
 
@@ -90,6 +93,7 @@ def run_inference(
 # ---------------------------------------------------------------------------
 # Proxy metrics (when focus distances are available)
 # ---------------------------------------------------------------------------
+
 
 def compute_proxy_metrics(results: List[Dict]) -> Dict[str, float]:
     """Compute proxy metrics from focus-distance labels.
@@ -143,6 +147,7 @@ def compute_proxy_metrics(results: List[Dict]) -> Dict[str, float]:
 # Save visualisations
 # ---------------------------------------------------------------------------
 
+
 def save_predictions(
     results: List[Dict],
     output_dir: Path,
@@ -174,10 +179,15 @@ def save_predictions(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Zero-shot wild evaluation")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint")
-    parser.add_argument("--wild_data", type=str, required=True, help="Wild dataset root")
+    parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Model checkpoint"
+    )
+    parser.add_argument(
+        "--wild_data", type=str, required=True, help="Wild dataset root"
+    )
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--output_dir", type=str, default="./wild_results")
     parser.add_argument("--window_length", type=int, default=None)
@@ -222,7 +232,9 @@ def main():
 
     # Run inference
     results = run_inference(model, loader, device, use_amp)
-    print(f"  Processed {len(results)} clips across {len(set(r['scene'] for r in results))} scenes")
+    print(
+        f"  Processed {len(results)} clips across {len(set(r['scene'] for r in results))} scenes"
+    )
 
     # Proxy metrics
     metrics = compute_proxy_metrics(results)
@@ -245,6 +257,7 @@ def main():
     # Save metrics to JSON
     if metrics:
         import json
+
         metrics_path = output_dir / "wild_metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)

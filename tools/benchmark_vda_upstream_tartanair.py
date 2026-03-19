@@ -29,23 +29,32 @@ import cv2
 import numpy as np
 import torch
 import yaml
-from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataloader.degradation import LowLightParams, build_degradation
+from dataloader.tartanair_depth import (
+    decode_tartanair_depth as decode_tartanair_depth_png,
+)
 
 MODEL_CONFIGS = {
     "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
-    "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+    "vitl": {
+        "encoder": "vitl",
+        "features": 256,
+        "out_channels": [256, 512, 1024, 1024],
+    },
 }
 DEFAULT_CHECKPOINTS = {
     "vits": PROJECT_ROOT / "checkpoints/metric_video_depth_anything_vits.pth",
     "vitl": PROJECT_ROOT / "checkpoints/metric_video_depth_anything_vitl.pth",
 }
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/experiments/generated/focused_redirection_20260310/05_vdal_degraded_stream.yaml"
+DEFAULT_CONFIG = (
+    PROJECT_ROOT
+    / "configs/experiments/generated/focused_redirection_20260310/05_vdal_degraded_stream.yaml"
+)
 DEFAULT_UPSTREAM_REPO = Path("/projects/b5dh/repos/Video-Depth-Anything")
 DEFAULT_EXPORT_CHUNK_SIZE = 64
 DEFAULT_MAX_RES = 1280
@@ -100,13 +109,13 @@ class DepthMetricAccumulator:
         count = int(pred_valid.size)
         self.valid_pixels += count
         self.sum_abs_rel += float(np.sum(abs_diff / gt_valid))
-        self.sum_sq_rel += float(np.sum((diff ** 2) / gt_valid))
-        self.sum_sq_error += float(np.sum(diff ** 2))
-        self.sum_sq_log_error += float(np.sum(log_diff ** 2))
+        self.sum_sq_rel += float(np.sum((diff**2) / gt_valid))
+        self.sum_sq_error += float(np.sum(diff**2))
+        self.sum_sq_log_error += float(np.sum(log_diff**2))
         self.sum_log_diff += float(np.sum(log_diff))
         self.delta1_hits += int(np.sum(ratio < 1.25))
-        self.delta2_hits += int(np.sum(ratio < 1.25 ** 2))
-        self.delta3_hits += int(np.sum(ratio < 1.25 ** 3))
+        self.delta2_hits += int(np.sum(ratio < 1.25**2))
+        self.delta3_hits += int(np.sum(ratio < 1.25**3))
 
     def merge(self, other: "DepthMetricAccumulator") -> None:
         self.valid_pixels += other.valid_pixels
@@ -137,13 +146,13 @@ class DepthMetricAccumulator:
         mean_sq_error = self.sum_sq_error / denom
         mean_sq_log_error = self.sum_sq_log_error / denom
         mean_log_diff = self.sum_log_diff / denom
-        si_log = max(0.0, mean_sq_log_error - (mean_log_diff ** 2))
+        si_log = max(0.0, mean_sq_log_error - (mean_log_diff**2))
         return {
             "valid_pixels": self.valid_pixels,
             "abs_rel": self.sum_abs_rel / denom,
             "sq_rel": self.sum_sq_rel / denom,
-            "rmse": mean_sq_error ** 0.5,
-            "rmse_log": mean_sq_log_error ** 0.5,
+            "rmse": mean_sq_error**0.5,
+            "rmse_log": mean_sq_log_error**0.5,
             "si_log": si_log,
             "delta1": self.delta1_hits / denom,
             "delta2": self.delta2_hits / denom,
@@ -152,10 +161,8 @@ class DepthMetricAccumulator:
 
 
 def decode_tartanair_depth(path: Path) -> np.ndarray:
-    """Decode a TartanAir RGBA depth PNG to float32 metres without importing the dataset module."""
-    image = Image.open(path)
-    rgba = np.asarray(image, dtype=np.uint8)
-    return rgba.view(np.float32).reshape(rgba.shape[0], rgba.shape[1])
+    """Decode a TartanAir depth PNG to float32 metres."""
+    return decode_tartanair_depth_png(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,8 +171,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=DEFAULT_UPSTREAM_REPO)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--models", default="vits,vitl")
-    parser.add_argument("--stream-scope", choices=("trajectory_stream", "clip_reset", "both"), default="both")
-    parser.add_argument("--metric-suite", choices=("upstream", "paper", "both"), default="both")
+    parser.add_argument(
+        "--stream-scope",
+        choices=("trajectory_stream", "clip_reset", "both"),
+        default="both",
+    )
+    parser.add_argument(
+        "--metric-suite", choices=("upstream", "paper", "both"), default="both"
+    )
     parser.add_argument("--input-size", type=int, default=518)
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -254,7 +267,9 @@ def bootstrap_upstream_utils(repo_root: Path) -> None:
 
     for module_name in ("util", "dc_utils"):
         module_path = utils_root / f"{module_name}.py"
-        spec = importlib.util.spec_from_file_location(f"utils.{module_name}", module_path)
+        spec = importlib.util.spec_from_file_location(
+            f"utils.{module_name}", module_path
+        )
         if spec is None or spec.loader is None:
             raise ImportError(f"Unable to load upstream utils module: {module_path}")
         module = importlib.util.module_from_spec(spec)
@@ -263,7 +278,9 @@ def bootstrap_upstream_utils(repo_root: Path) -> None:
         setattr(package, module_name, module)
 
 
-def load_upstream_model(repo_root: Path, encoder: str, checkpoint_path: Path, device: str):
+def load_upstream_model(
+    repo_root: Path, encoder: str, checkpoint_path: Path, device: str
+):
     ensure_prepend_sys_path(repo_root)
     bootstrap_upstream_utils(repo_root)
     from video_depth_anything.video_depth_stream import VideoDepthAnything
@@ -294,7 +311,9 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
         writer.writerows(rows)
 
 
-def discover_validation_trajectories(cfg: dict, debug_max_trajectories: int | None) -> list[TrajectoryRecord]:
+def discover_validation_trajectories(
+    cfg: dict, debug_max_trajectories: int | None
+) -> list[TrajectoryRecord]:
     data_cfg = cfg.get("data", {}) or {}
     root = Path(data_cfg["root"])
     difficulty = str(data_cfg.get("difficulty", "Data_easy"))
@@ -302,9 +321,15 @@ def discover_validation_trajectories(cfg: dict, debug_max_trajectories: int | No
     envs = data_cfg.get("envs")
     seed = int(data_cfg.get("seed", 42))
     val_fraction = float(data_cfg.get("val_fraction", 0.1))
-    max_val_trajectories = data_cfg.get("max_val_trajectories", data_cfg.get("max_trajectories", None))
+    max_val_trajectories = data_cfg.get(
+        "max_val_trajectories", data_cfg.get("max_trajectories", None)
+    )
 
-    env_dirs = sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    env_dirs = sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    )
     if envs is not None:
         allowed = set(envs)
         env_dirs = [path for path in env_dirs if path.name in allowed]
@@ -381,13 +406,24 @@ def load_rgb_tensor(path: Path, device: torch.device) -> torch.Tensor:
 
 def save_rgb_tensor(path: Path, tensor: torch.Tensor) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = tensor.detach().clamp(0.0, 1.0).mul(255.0).round().byte().permute(1, 2, 0).cpu().numpy()
+    image = (
+        tensor.detach()
+        .clamp(0.0, 1.0)
+        .mul(255.0)
+        .round()
+        .byte()
+        .permute(1, 2, 0)
+        .cpu()
+        .numpy()
+    )
     image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     if not cv2.imwrite(str(path), image_bgr):
         raise RuntimeError(f"Failed to save image to {path}")
 
 
-def ensure_prediction_shape(prediction: np.ndarray, ground_truth: np.ndarray) -> np.ndarray:
+def ensure_prediction_shape(
+    prediction: np.ndarray, ground_truth: np.ndarray
+) -> np.ndarray:
     if prediction.shape == ground_truth.shape:
         return prediction
     return cv2.resize(
@@ -430,7 +466,9 @@ def build_manifest(
     clip_groups: list[dict[str, object]] = []
     for record in trajectories:
         trajectory_frames: list[dict[str, object]] = []
-        for frame_index, (image_path, depth_path) in enumerate(zip(record.image_files, record.depth_files)):
+        for frame_index, (image_path, depth_path) in enumerate(
+            zip(record.image_files, record.depth_files)
+        ):
             rel_image = Path("images") / record.video_id / image_path.name
             rel_source_image = image_path.relative_to(source_root)
             rel_depth = depth_path.relative_to(source_root)
@@ -504,9 +542,15 @@ def export_degraded_dataset(
         with open(manifest_path, "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
         if export_complete(manifest, export_root):
-            print(f"[export] Reusing existing degraded export: {manifest_path}", flush=True)
+            print(
+                f"[export] Reusing existing degraded export: {manifest_path}",
+                flush=True,
+            )
             return manifest
-        print(f"[export] Existing manifest is incomplete; rebuilding: {manifest_path}", flush=True)
+        print(
+            f"[export] Existing manifest is incomplete; rebuilding: {manifest_path}",
+            flush=True,
+        )
 
     degradation = build_degradation(cfg)
     if degradation is None:
@@ -522,7 +566,11 @@ def export_degraded_dataset(
         video_id = str(group["video_id"])
         frame_items = list(group["frames"])
         output_dir = images_root / video_id
-        if not overwrite_export and output_dir.is_dir() and len(list(output_dir.glob("*.png"))) == len(frame_items):
+        if (
+            not overwrite_export
+            and output_dir.is_dir()
+            and len(list(output_dir.glob("*.png"))) == len(frame_items)
+        ):
             print(
                 f"[export] Reusing trajectory {traj_idx}/{len(manifest['trajectory_stream'])}: {video_id}",
                 flush=True,
@@ -549,7 +597,9 @@ def export_degraded_dataset(
             chunk_end = min(chunk_start + DEFAULT_EXPORT_CHUNK_SIZE, len(frame_items))
             frame_tensors = []
             for item in frame_items[chunk_start:chunk_end]:
-                source_image = Path(manifest["metadata"]["source_root"]) / str(item["source_image"])
+                source_image = Path(manifest["metadata"]["source_root"]) / str(
+                    item["source_image"]
+                )
                 frame_tensors.append(load_rgb_tensor(source_image, process_device))
             clean_chunk = torch.stack(frame_tensors, dim=0)
             with torch.inference_mode():
@@ -587,12 +637,23 @@ def preprocess_frame_for_upstream(frame: np.ndarray, *, max_res: int) -> np.ndar
         scale = max_res / float(max(height, width))
         new_height = round(height * scale)
         new_width = round(width * scale)
-        frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        frame = cv2.resize(
+            frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR
+        )
     return frame
 
 
-def prediction_path(output_root: Path, encoder: str, mode: str, group_name: str, frame_name: str) -> Path:
-    return output_root / "predictions" / encoder / mode / sanitize_group_path(group_name) / Path(frame_name).with_suffix(".npy")
+def prediction_path(
+    output_root: Path, encoder: str, mode: str, group_name: str, frame_name: str
+) -> Path:
+    return (
+        output_root
+        / "predictions"
+        / encoder
+        / mode
+        / sanitize_group_path(group_name)
+        / Path(frame_name).with_suffix(".npy")
+    )
 
 
 def fieldnames_for_group_rows(include_upstream: bool, include_paper: bool) -> list[str]:
@@ -624,7 +685,9 @@ def fieldnames_for_group_rows(include_upstream: bool, include_paper: bool) -> li
     return fields
 
 
-def fieldnames_for_summary_rows(include_upstream: bool, include_paper: bool) -> list[str]:
+def fieldnames_for_summary_rows(
+    include_upstream: bool, include_paper: bool
+) -> list[str]:
     fields = [
         "model",
         "checkpoint",
@@ -654,7 +717,9 @@ def fieldnames_for_summary_rows(include_upstream: bool, include_paper: bool) -> 
     return fields
 
 
-def metrics_to_row(metrics: dict[str, float | int], include_upstream: bool, include_paper: bool) -> dict[str, object]:
+def metrics_to_row(
+    metrics: dict[str, float | int], include_upstream: bool, include_paper: bool
+) -> dict[str, object]:
     row: dict[str, object] = {"valid_pixels": metrics["valid_pixels"]}
     if include_upstream:
         row["upstream_absrel"] = metrics["abs_rel"]
@@ -686,7 +751,9 @@ def run_scope_benchmark(
     if args.debug_max_groups_per_mode is not None:
         groups = groups[: int(args.debug_max_groups_per_mode)]
     model = load_upstream_model(args.repo_root, model_name, checkpoint_path, device)
-    aggregate = DepthMetricAccumulator(max_depth=float(manifest["metadata"]["max_depth"]))
+    aggregate = DepthMetricAccumulator(
+        max_depth=float(manifest["metadata"]["max_depth"])
+    )
     group_rows: list[dict[str, object]] = []
 
     source_root = Path(manifest["metadata"]["source_root"])
@@ -697,7 +764,9 @@ def run_scope_benchmark(
 
     for group_idx, group in enumerate(groups, start=1):
         model.reset_stream_state()
-        group_acc = DepthMetricAccumulator(max_depth=float(manifest["metadata"]["max_depth"]))
+        group_acc = DepthMetricAccumulator(
+            max_depth=float(manifest["metadata"]["max_depth"])
+        )
         frames = list(group["frames"])
         print(
             f"[benchmark] model={model_name} mode={mode} group={group_idx}/{len(groups)} "
@@ -707,7 +776,13 @@ def run_scope_benchmark(
         for item in frames:
             image_path = export_root / str(item["image"])
             gt_path = source_root / str(item["gt_depth"])
-            pred_path = prediction_path(args.output_root, model_name, mode, str(group["group_name"]), Path(str(item["image"])).name)
+            pred_path = prediction_path(
+                args.output_root,
+                model_name,
+                mode,
+                str(group["group_name"]),
+                Path(str(item["image"])).name,
+            )
             pred_path.parent.mkdir(parents=True, exist_ok=True)
 
             if args.skip_existing and pred_path.exists():
@@ -723,7 +798,9 @@ def run_scope_benchmark(
                 ).astype(np.float32)
                 np.save(pred_path, prediction.astype(np.float32))
 
-            ground_truth = load_ground_truth_depth(str(gt_path), float(manifest["metadata"]["max_depth"]))
+            ground_truth = load_ground_truth_depth(
+                str(gt_path), float(manifest["metadata"]["max_depth"])
+            )
             prediction = ensure_prediction_shape(prediction, ground_truth)
             group_acc.update(prediction, ground_truth)
             total_frames += 1
@@ -775,8 +852,16 @@ def save_scope_reports(
     args: argparse.Namespace,
 ) -> None:
     scope_root = output_root / "summary" / mode
-    write_csv(scope_root / "summary.csv", summary_rows, fieldnames_for_summary_rows(include_upstream, include_paper))
-    write_csv(scope_root / "group_metrics.csv", group_rows, fieldnames_for_group_rows(include_upstream, include_paper))
+    write_csv(
+        scope_root / "summary.csv",
+        summary_rows,
+        fieldnames_for_summary_rows(include_upstream, include_paper),
+    )
+    write_csv(
+        scope_root / "group_metrics.csv",
+        group_rows,
+        fieldnames_for_group_rows(include_upstream, include_paper),
+    )
     payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "mode": mode,

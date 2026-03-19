@@ -26,7 +26,7 @@ from .teacher_base import TeacherBase
 
 # ImageNet normalisation used by DINOv2 backbone in Video-Depth-Anything.
 _VDA_MEAN = (0.485, 0.456, 0.406)
-_VDA_STD  = (0.229, 0.224, 0.225)
+_VDA_STD = (0.229, 0.224, 0.225)
 
 
 class VideoDepthAnythingTeacher(TeacherBase):
@@ -44,7 +44,9 @@ class VideoDepthAnythingTeacher(TeacherBase):
 
     def __init__(
         self,
-        checkpoint_path: Optional[str] = "./checkpoints/metric_video_depth_anything_vitl.pth",
+        checkpoint_path: Optional[
+            str
+        ] = "./checkpoints/metric_video_depth_anything_vitl.pth",
         device: str = "cuda",
         input_size: tuple[int, int] = (518, 518),
         temporal_window: int = 32,
@@ -73,7 +75,9 @@ class VideoDepthAnythingTeacher(TeacherBase):
             pe="ape",
             metric=True,
         )
-        state_dict = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
+        state_dict = torch.load(
+            self.checkpoint_path, map_location="cpu", weights_only=True
+        )
         self.model.load_state_dict(state_dict)
         self.model = self.model.to(self.target_device).eval()
 
@@ -91,7 +95,7 @@ class VideoDepthAnythingTeacher(TeacherBase):
         # Run as a 1-frame clip.
         frame = frame.to(self.target_device)
         mean = torch.tensor(_VDA_MEAN, device=self.target_device).view(1, 3, 1, 1)
-        std  = torch.tensor(_VDA_STD,  device=self.target_device).view(1, 3, 1, 1)
+        std = torch.tensor(_VDA_STD, device=self.target_device).view(1, 3, 1, 1)
         frame_norm = (frame - mean) / std  # (1, C, H, W)
         # forward expects (B, T, C, H, W)
         clip_input = frame_norm.unsqueeze(1)  # (1, 1, C, H, W)
@@ -140,15 +144,23 @@ class VideoDepthAnythingTeacher(TeacherBase):
 
                 # chunk: (C, T_chunk, H_t, W_t)
                 # forward expects (B, T, C, H, W)
-                chunk_input = chunk.permute(1, 0, 2, 3).unsqueeze(0)  # (1, T_chunk, C, H_t, W_t)
+                chunk_input = chunk.permute(1, 0, 2, 3).unsqueeze(
+                    0
+                )  # (1, T_chunk, C, H_t, W_t)
 
-                mean = torch.tensor(_VDA_MEAN, device=chunk_input.device).view(1, 1, 3, 1, 1)
-                std  = torch.tensor(_VDA_STD,  device=chunk_input.device).view(1, 1, 3, 1, 1)
+                mean = torch.tensor(_VDA_MEAN, device=chunk_input.device).view(
+                    1, 1, 3, 1, 1
+                )
+                std = torch.tensor(_VDA_STD, device=chunk_input.device).view(
+                    1, 1, 3, 1, 1
+                )
                 chunk_input = (chunk_input - mean) / std
 
                 with torch.no_grad():
                     chunk_depth = self.model(chunk_input)  # (1, T_chunk, H_t, W_t)
-                chunk_depths.append(chunk_depth.unsqueeze(1))  # (1, 1, T_chunk, H_t, W_t)
+                chunk_depths.append(
+                    chunk_depth.unsqueeze(1)
+                )  # (1, 1, T_chunk, H_t, W_t)
 
             clip_depth = torch.cat(chunk_depths, dim=2)  # (1, 1, T, H_t, W_t)
 

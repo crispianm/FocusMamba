@@ -49,12 +49,26 @@ DEFAULT_TEACHERS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="Experiment YAML used to define the validation dataset.")
-    parser.add_argument("--output-dir", required=True, help="Directory to store audit summaries.")
-    parser.add_argument("--num-clips", type=int, default=64, help="Number of validation clips to audit.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for auditing.")
-    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
-    parser.add_argument("--device", default=None, help="Override device, e.g. cuda or cpu.")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Experiment YAML used to define the validation dataset.",
+    )
+    parser.add_argument(
+        "--output-dir", required=True, help="Directory to store audit summaries."
+    )
+    parser.add_argument(
+        "--num-clips", type=int, default=64, help="Number of validation clips to audit."
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=1, help="Batch size for auditing."
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=2, help="DataLoader workers."
+    )
+    parser.add_argument(
+        "--device", default=None, help="Override device, e.g. cuda or cpu."
+    )
     parser.add_argument(
         "--teachers",
         nargs="*",
@@ -80,7 +94,9 @@ def _resolve_teacher_cfgs(cfg: dict, teacher_subset: set[str] | None) -> list[di
 def _build_val_dataset(cfg: dict) -> TartanAirV2Dataset:
     data_cfg = cfg.get("data", {})
     train_frames = int(data_cfg.get("train_num_frames", data_cfg.get("num_frames", 8)))
-    val_frames = int(data_cfg.get("val_num_frames", data_cfg.get("num_frames", train_frames)))
+    val_frames = int(
+        data_cfg.get("val_num_frames", data_cfg.get("num_frames", train_frames))
+    )
     image_size = tuple(int(v) for v in data_cfg.get("image_size", (256, 256)))
     return TartanAirV2Dataset(
         root=str(data_cfg["root"]),
@@ -102,7 +118,9 @@ def _build_val_dataset(cfg: dict) -> TartanAirV2Dataset:
     )
 
 
-def _teacher_valid_mask(name: str, depth: torch.Tensor, gt_mask: torch.Tensor, max_depth: float) -> torch.Tensor:
+def _teacher_valid_mask(
+    name: str, depth: torch.Tensor, gt_mask: torch.Tensor, max_depth: float
+) -> torch.Tensor:
     valid = torch.isfinite(depth) & (depth > 0.1) & (depth <= max_depth)
     if name == "depth_anything_v3":
         valid = valid & (depth > 0)
@@ -175,14 +193,22 @@ def main() -> None:
             summary[name]["rmse"].append(metrics["rmse"])
             summary[name]["si_log"].append(metrics["si_log"])
             summary[name]["delta1"].append(metrics["delta1"])
-            summary[name]["fdv"].append(frame_depth_variation(depth, mask=valid.float()))
-            summary[name]["invalid_fraction"].append(float((~valid).float().mean().item()))
+            summary[name]["fdv"].append(
+                frame_depth_variation(depth, mask=valid.float())
+            )
+            summary[name]["invalid_fraction"].append(
+                float((~valid).float().mean().item())
+            )
             summary[name]["zero_fraction"].append(float(zeros.float().mean().item()))
-            summary[name]["clipped_fraction"].append(float(clipped.float().mean().item()))
+            summary[name]["clipped_fraction"].append(
+                float(clipped.float().mean().item())
+            )
             if finite_valid.numel() > 0:
                 summary[name]["min_depth"].append(float(finite_valid.min().item()))
                 summary[name]["max_depth"].append(float(finite_valid.max().item()))
-                summary[name]["median_depth"].append(float(finite_valid.median().item()))
+                summary[name]["median_depth"].append(
+                    float(finite_valid.median().item())
+                )
 
         names = list(teacher_outputs.keys())
         for idx, name_i in enumerate(names):
@@ -209,8 +235,12 @@ def main() -> None:
             "invalid_fraction": _mean(values["invalid_fraction"]),
             "zero_fraction": _mean(values["zero_fraction"]),
             "clipped_fraction": _mean(values["clipped_fraction"]),
-            "min_depth": min(values["min_depth"]) if values["min_depth"] else float("nan"),
-            "max_depth": max(values["max_depth"]) if values["max_depth"] else float("nan"),
+            "min_depth": min(values["min_depth"])
+            if values["min_depth"]
+            else float("nan"),
+            "max_depth": max(values["max_depth"])
+            if values["max_depth"]
+            else float("nan"),
             "median_depth": _mean(values["median_depth"]),
         }
         teacher_rows.append(row)
@@ -241,14 +271,20 @@ def main() -> None:
         writer.writerows(teacher_rows)
 
     with (output_dir / "pairwise_disagreement.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["teacher_a", "teacher_b", "mean_abs_log_diff", "clips"])
+        writer = csv.DictWriter(
+            f, fieldnames=["teacher_a", "teacher_b", "mean_abs_log_diff", "clips"]
+        )
         writer.writeheader()
         writer.writerows(pairwise_rows)
 
     with (output_dir / "teacher_priors.json").open("w") as f:
         json.dump(teacher_priors, f, indent=2)
 
-    print(json.dumps({"output_dir": str(output_dir), "teacher_priors": teacher_priors}, indent=2))
+    print(
+        json.dumps(
+            {"output_dir": str(output_dir), "teacher_priors": teacher_priors}, indent=2
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -54,7 +54,12 @@ def _distill_cfg(strategy: str) -> dict:
         "teachers": [{"name": t["name"], "weight": 1.0} for t in TEACHERS],
         "confidence_weighted": True,
         "lambda_si": 0.5,
-        "calibration": {"enabled": True, "min_depth": 0.1, "min_valid_pixels": 64, "use_gt": True},
+        "calibration": {
+            "enabled": True,
+            "min_depth": 0.1,
+            "min_valid_pixels": 64,
+            "use_gt": True,
+        },
         "aggregate": {"weight": 0.5, "beta": 6.0},
         "auxiliary": {
             "vda_weight": 0.3,
@@ -166,7 +171,9 @@ def _recipe(strategy: str) -> dict:
     return {"distillation": _distill_cfg(strategy)}
 
 
-def _stats_align(target_mean: list[float] | None = None, target_std: list[float] | None = None) -> dict:
+def _stats_align(
+    target_mean: list[float] | None = None, target_std: list[float] | None = None
+) -> dict:
     model = {
         "prefilter_enabled": True,
         "prefilter_type": "stats_align",
@@ -181,27 +188,221 @@ def _stats_align(target_mean: list[float] | None = None, target_std: list[float]
 
 VARIANTS = [
     {"name": "00_anchor_baseline", "job": "fABs", "overrides": _recipe("anchor_vda")},
-    {"name": "01_anchor_stats_align", "job": "fASt", "overrides": deep_update(_recipe("anchor_vda"), _stats_align())},
-    {"name": "02_anchor_gate_only", "job": "fAGt", "overrides": deep_update(_recipe("anchor_vda"), {"model": {"state_gate_enabled": True}})},
-    {"name": "03_anchor_stats_align_gate", "job": "fASG", "overrides": deep_update(deepcopy(_recipe("anchor_vda")), deep_update(_stats_align(), {"model": {"state_gate_enabled": True}}))},
-    {"name": "04_anchor_reset8", "job": "fAR8", "overrides": deep_update(_recipe("anchor_vda"), {"model": {"stream_reset_interval": 8}})},
-    {"name": "05_anchor_reset16", "job": "fAR6", "overrides": deep_update(_recipe("anchor_vda"), {"model": {"stream_reset_interval": 16}})},
-    {"name": "06_anchor_shortmem8", "job": "fAK8", "overrides": deep_update(_recipe("anchor_vda"), {"model": {"stream_max_cache_len": 8}})},
-    {"name": "07_hetero_baseline", "job": "fHBs", "overrides": _recipe("heterogeneous_mtkd")},
-    {"name": "08_hetero_stats_align", "job": "fHSt", "overrides": deep_update(_recipe("heterogeneous_mtkd"), _stats_align())},
-    {"name": "09_hetero_gate_only", "job": "fHGt", "overrides": deep_update(_recipe("heterogeneous_mtkd"), {"model": {"state_gate_enabled": True}})},
-    {"name": "10_hetero_stats_align_gate", "job": "fHSG", "overrides": deep_update(deepcopy(_recipe("heterogeneous_mtkd")), deep_update(_stats_align(), {"model": {"state_gate_enabled": True}}))},
-    {"name": "11_hetero_reset8", "job": "fHR8", "overrides": deep_update(_recipe("heterogeneous_mtkd"), {"model": {"stream_reset_interval": 8}})},
-    {"name": "12_hetero_reset16", "job": "fHR6", "overrides": deep_update(_recipe("heterogeneous_mtkd"), {"model": {"stream_reset_interval": 16}})},
-    {"name": "13_hetero_shortmem8", "job": "fHK8", "overrides": deep_update(_recipe("heterogeneous_mtkd"), {"model": {"stream_max_cache_len": 8}})},
-    {"name": "14_hetero_stats_align_gate_laststage", "job": "fHGL", "overrides": deep_update(deepcopy(_recipe("heterogeneous_mtkd")), deep_update(_stats_align(), {"model": {"state_gate_enabled": True, "state_gate_stage_mask": [False, False, False, True]}}))},
-    {"name": "15_hetero_stats_align_gate_temporalhead", "job": "fHGH", "overrides": deep_update(deepcopy(_recipe("heterogeneous_mtkd")), deep_update(_stats_align(), {"model": {"state_gate_enabled": True}, "training": {"freeze_backbone": True, "unfreeze_prefixes": ["model.head.motion_modules", "model.head.stage_gates"]}}))},
-    {"name": "16_hetero_stats_align_curriculum_moderate", "job": "fHCM", "overrides": deep_update(_recipe("heterogeneous_mtkd"), deep_update(_stats_align(), {"degradation": {"curriculum": {"warmup_epochs": 1, "max_severity_epoch": 2, "schedule": "linear", "warmup_start_scale": 0.5, "min_scale": 0.5, "max_scale": 1.0}}}))},
-    {"name": "17_hetero_stats_align_gate_curriculum_mixed", "job": "fHGM", "overrides": deep_update(deepcopy(_recipe("heterogeneous_mtkd")), deep_update(_stats_align(), {"model": {"state_gate_enabled": True}, "degradation": {"curriculum": {"warmup_epochs": 0, "max_severity_epoch": 2, "schedule": "linear", "warmup_start_scale": 1.0, "min_scale": 1.0, "max_scale": 1.0, "mix_clean_probability_start": 0.50, "mix_clean_probability_end": 0.20}}}))},
-    {"name": "18_hetero_stats_align_temporal_smooth", "job": "fHTS", "overrides": deep_update(_recipe("heterogeneous_mtkd"), deep_update(_stats_align(), {"loss": {"temporal_weight": 2.5, "temporal_threshold": 0.03}}))},
-    {"name": "19_hetero_stats_align_clean_consistency", "job": "fHCC", "overrides": deep_update(_recipe("heterogeneous_mtkd"), deep_update(_stats_align(), {"loss": {"auxiliary": {"clean_depth_consistency_weight": 0.05, "clean_depth_consistency_mode": "log_l1"}}}))},
-    {"name": "20_hetero_stats_align_neutral_stats", "job": "fHSN", "overrides": deep_update(_recipe("heterogeneous_mtkd"), _stats_align([0.5, 0.5, 0.5], [0.25, 0.25, 0.25]))},
-    {"name": "21_hetero_stats_align_bright_stats", "job": "fHSB", "overrides": deep_update(_recipe("heterogeneous_mtkd"), _stats_align([0.58, 0.56, 0.54], [0.24, 0.23, 0.22]))},
+    {
+        "name": "01_anchor_stats_align",
+        "job": "fASt",
+        "overrides": deep_update(_recipe("anchor_vda"), _stats_align()),
+    },
+    {
+        "name": "02_anchor_gate_only",
+        "job": "fAGt",
+        "overrides": deep_update(
+            _recipe("anchor_vda"), {"model": {"state_gate_enabled": True}}
+        ),
+    },
+    {
+        "name": "03_anchor_stats_align_gate",
+        "job": "fASG",
+        "overrides": deep_update(
+            deepcopy(_recipe("anchor_vda")),
+            deep_update(_stats_align(), {"model": {"state_gate_enabled": True}}),
+        ),
+    },
+    {
+        "name": "04_anchor_reset8",
+        "job": "fAR8",
+        "overrides": deep_update(
+            _recipe("anchor_vda"), {"model": {"stream_reset_interval": 8}}
+        ),
+    },
+    {
+        "name": "05_anchor_reset16",
+        "job": "fAR6",
+        "overrides": deep_update(
+            _recipe("anchor_vda"), {"model": {"stream_reset_interval": 16}}
+        ),
+    },
+    {
+        "name": "06_anchor_shortmem8",
+        "job": "fAK8",
+        "overrides": deep_update(
+            _recipe("anchor_vda"), {"model": {"stream_max_cache_len": 8}}
+        ),
+    },
+    {
+        "name": "07_hetero_baseline",
+        "job": "fHBs",
+        "overrides": _recipe("heterogeneous_mtkd"),
+    },
+    {
+        "name": "08_hetero_stats_align",
+        "job": "fHSt",
+        "overrides": deep_update(_recipe("heterogeneous_mtkd"), _stats_align()),
+    },
+    {
+        "name": "09_hetero_gate_only",
+        "job": "fHGt",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"), {"model": {"state_gate_enabled": True}}
+        ),
+    },
+    {
+        "name": "10_hetero_stats_align_gate",
+        "job": "fHSG",
+        "overrides": deep_update(
+            deepcopy(_recipe("heterogeneous_mtkd")),
+            deep_update(_stats_align(), {"model": {"state_gate_enabled": True}}),
+        ),
+    },
+    {
+        "name": "11_hetero_reset8",
+        "job": "fHR8",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"), {"model": {"stream_reset_interval": 8}}
+        ),
+    },
+    {
+        "name": "12_hetero_reset16",
+        "job": "fHR6",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"), {"model": {"stream_reset_interval": 16}}
+        ),
+    },
+    {
+        "name": "13_hetero_shortmem8",
+        "job": "fHK8",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"), {"model": {"stream_max_cache_len": 8}}
+        ),
+    },
+    {
+        "name": "14_hetero_stats_align_gate_laststage",
+        "job": "fHGL",
+        "overrides": deep_update(
+            deepcopy(_recipe("heterogeneous_mtkd")),
+            deep_update(
+                _stats_align(),
+                {
+                    "model": {
+                        "state_gate_enabled": True,
+                        "state_gate_stage_mask": [False, False, False, True],
+                    }
+                },
+            ),
+        ),
+    },
+    {
+        "name": "15_hetero_stats_align_gate_temporalhead",
+        "job": "fHGH",
+        "overrides": deep_update(
+            deepcopy(_recipe("heterogeneous_mtkd")),
+            deep_update(
+                _stats_align(),
+                {
+                    "model": {"state_gate_enabled": True},
+                    "training": {
+                        "freeze_backbone": True,
+                        "unfreeze_prefixes": [
+                            "model.head.motion_modules",
+                            "model.head.stage_gates",
+                        ],
+                    },
+                },
+            ),
+        ),
+    },
+    {
+        "name": "16_hetero_stats_align_curriculum_moderate",
+        "job": "fHCM",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"),
+            deep_update(
+                _stats_align(),
+                {
+                    "degradation": {
+                        "curriculum": {
+                            "warmup_epochs": 1,
+                            "max_severity_epoch": 2,
+                            "schedule": "linear",
+                            "warmup_start_scale": 0.5,
+                            "min_scale": 0.5,
+                            "max_scale": 1.0,
+                        }
+                    }
+                },
+            ),
+        ),
+    },
+    {
+        "name": "17_hetero_stats_align_gate_curriculum_mixed",
+        "job": "fHGM",
+        "overrides": deep_update(
+            deepcopy(_recipe("heterogeneous_mtkd")),
+            deep_update(
+                _stats_align(),
+                {
+                    "model": {"state_gate_enabled": True},
+                    "degradation": {
+                        "curriculum": {
+                            "warmup_epochs": 0,
+                            "max_severity_epoch": 2,
+                            "schedule": "linear",
+                            "warmup_start_scale": 1.0,
+                            "min_scale": 1.0,
+                            "max_scale": 1.0,
+                            "mix_clean_probability_start": 0.50,
+                            "mix_clean_probability_end": 0.20,
+                        }
+                    },
+                },
+            ),
+        ),
+    },
+    {
+        "name": "18_hetero_stats_align_temporal_smooth",
+        "job": "fHTS",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"),
+            deep_update(
+                _stats_align(),
+                {"loss": {"temporal_weight": 2.5, "temporal_threshold": 0.03}},
+            ),
+        ),
+    },
+    {
+        "name": "19_hetero_stats_align_clean_consistency",
+        "job": "fHCC",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"),
+            deep_update(
+                _stats_align(),
+                {
+                    "loss": {
+                        "auxiliary": {
+                            "clean_depth_consistency_weight": 0.05,
+                            "clean_depth_consistency_mode": "log_l1",
+                        }
+                    }
+                },
+            ),
+        ),
+    },
+    {
+        "name": "20_hetero_stats_align_neutral_stats",
+        "job": "fHSN",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"),
+            _stats_align([0.5, 0.5, 0.5], [0.25, 0.25, 0.25]),
+        ),
+    },
+    {
+        "name": "21_hetero_stats_align_bright_stats",
+        "job": "fHSB",
+        "overrides": deep_update(
+            _recipe("heterogeneous_mtkd"),
+            _stats_align([0.58, 0.56, 0.54], [0.24, 0.23, 0.22]),
+        ),
+    },
 ]
 
 
@@ -259,12 +460,23 @@ def _mixed_curriculum() -> dict:
 
 FRONT_ADAPTER_STAGEB_VARIANTS = [
     {"name": "00_anchor_baseline", "job": "fa00", "overrides": _recipe("anchor_vda")},
-    {"name": "01_anchor_stats_align", "job": "fa01", "overrides": deep_update(_recipe("anchor_vda"), _stats_align())},
-    {"name": "02_anchor_front_adapter", "job": "fa02", "overrides": deep_update(_recipe("anchor_vda"), _front_adapter())},
+    {
+        "name": "01_anchor_stats_align",
+        "job": "fa01",
+        "overrides": deep_update(_recipe("anchor_vda"), _stats_align()),
+    },
+    {
+        "name": "02_anchor_front_adapter",
+        "job": "fa02",
+        "overrides": deep_update(_recipe("anchor_vda"), _front_adapter()),
+    },
     {
         "name": "03_anchor_front_adapter_gate",
         "job": "fa03",
-        "overrides": deep_update(deepcopy(_recipe("anchor_vda")), deep_update(_front_adapter(), {"model": {"state_gate_enabled": True}})),
+        "overrides": deep_update(
+            deepcopy(_recipe("anchor_vda")),
+            deep_update(_front_adapter(), {"model": {"state_gate_enabled": True}}),
+        ),
     },
     {
         "name": "04_anchor_pre_temporal_adapter",
@@ -274,17 +486,26 @@ FRONT_ADAPTER_STAGEB_VARIANTS = [
     {
         "name": "05_anchor_pre_temporal_adapter_stats_align",
         "job": "fa05",
-        "overrides": deep_update(deepcopy(_recipe("anchor_vda")), deep_update(_pre_temporal_adapter(), _stats_align())),
+        "overrides": deep_update(
+            deepcopy(_recipe("anchor_vda")),
+            deep_update(_pre_temporal_adapter(), _stats_align()),
+        ),
     },
     {
         "name": "06_anchor_front_adapter_clean_consistency",
         "job": "fa06",
-        "overrides": deep_update(deepcopy(_recipe("anchor_vda")), deep_update(_front_adapter(), _clean_consistency())),
+        "overrides": deep_update(
+            deepcopy(_recipe("anchor_vda")),
+            deep_update(_front_adapter(), _clean_consistency()),
+        ),
     },
     {
         "name": "07_anchor_front_adapter_curriculum_mixed",
         "job": "fa07",
-        "overrides": deep_update(deepcopy(_recipe("anchor_vda")), deep_update(_front_adapter(), _mixed_curriculum())),
+        "overrides": deep_update(
+            deepcopy(_recipe("anchor_vda")),
+            deep_update(_front_adapter(), _mixed_curriculum()),
+        ),
     },
 ]
 
@@ -344,7 +565,9 @@ def main() -> None:
         deep_update(cfg, deepcopy(variant["overrides"]))
         if args.suite_kind == "front_adapter_stageb":
             if args.profile != "screen":
-                raise ValueError("front_adapter_stageb currently only supports --profile screen")
+                raise ValueError(
+                    "front_adapter_stageb currently only supports --profile screen"
+                )
             cfg["training"]["max_epochs"] = 6
             cfg["data"]["max_train_trajectories"] = 128
             cfg["data"]["max_val_trajectories"] = 16

@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 
 
-def compare_teachers(config_path: str, input_path: str, output_dir: str = "teacher_comparison") -> None:
+def compare_teachers(
+    config_path: str, input_path: str, output_dir: str = "teacher_comparison"
+) -> None:
     """Load all teachers and compare their depth outputs on sample frames.
 
     Generates:

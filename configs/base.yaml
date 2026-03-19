@@ -73,15 +73,101 @@ distillation:
 # ── Loss ───────────────────────────────────────────────────────────────────
 loss:
   si_log_weight: 1.0
-  gradient_weight: 0.5       # edge-aware smoothness (to be implemented)
-  temporal_weight: 0.2       # temporal consistency (to be implemented)
+  gradient_weight: 0.0
+  gradient_scales: 4
+  gradient_mode: matching
+  gradient_log_space: true
+  boundary_weight: 0.0
+  boundary_threshold: 0.05
+  boundary_dilation: 1
+  temporal_weight: 0.2
+  metric_l1_weight: 0.0
+  metric_log_l1_weight: 0.0
+  range_prior_weight: 0.0
+  min_depth: 1.0e-3
+  max_depth: 80.0
+  weight_ramp: {}
   uncertainty_nll_weight: 0.1
 
 # ── Degradation ────────────────────────────────────────────────────────────
 degradation:
   enabled: true
+  policy: legacy_lowlight
+  return_params: false
+  summary: false
+  time_mode: clip_constant
+  clean_probability: 0.0
+  drift:
+    enabled: false
+    exposure_strength: 0.35
+    noise_strength: 0.35
+    blur_strength: 0.30
+  events:
+    enabled: false
+    exposure_jump_probability: 0.3
+    exposure_jump_magnitude: 1.0
+    blur_spike_probability: 0.3
+    blur_spike_factor: 2.5
+  processing:
+    probability: 0.0
+  sensor:
+    probability: 0.0
+    line_jitter_max_shift: 2
+    hot_dead_pixel_probability: 0.0
+  v2:
+    exposure_ev_range: [-3.5, 0.0]
+    shot_scale_range: [0.08, 12.0]
+    read_noise_range: [0.0, 0.03]
+    quant_step_range: [0.0, 0.0039215686]
+    band_noise_range: [0.0, 0.02]
+    blur_sigma1_range: [0.35, 2.25]
+    blur_sigma2_range: [0.35, 2.25]
+    blur_angle_range: [0.0, 1.5707963268]
+    max_blur_kernel_size: 25
+    quantization_mode: round
+    shot_noise_mode: gaussian
+    fixed_pattern_per_clip: true
   curriculum: true           # increase severity over training
   # Per-type settings are in configs/data/synthetic_degradation.yaml
+
+validation:
+  use_teacher_signals: false
+  robodepth:
+    enabled: false
+    selection_metric: robodepth_dee2
+    eval_every_n_epochs: 1
+    dataset: kitti_c
+    root: ""
+    split: eigen
+    batch_size: 1
+    num_workers: 0
+    repeat_frames: 8
+    use_eigen_crop: true
+    corruptions:
+      - brightness
+      - dark
+      - fog
+      - frost
+      - snow
+      - contrast
+      - defocus_blur
+      - glass_blur
+      - motion_blur
+      - zoom_blur
+      - elastic_transform
+      - color_quant
+      - gaussian_noise
+      - impulse_noise
+      - shot_noise
+      - iso_noise
+      - pixelate
+      - jpeg_compression
+    severities: [1, 2, 3, 4, 5]
+    baseline_name: monodepth2_mono
+    latency_warmup: 5
+    latency_iterations: 20
+    clean_subdir: kitti_data
+    corrupted_subdir: kitti_c
 
 # ── Inference ──────────────────────────────────────────────────────────────
 inference:

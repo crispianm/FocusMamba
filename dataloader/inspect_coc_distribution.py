@@ -33,7 +33,9 @@ def collect_coc_values(
     if len(scene_dirs) == 0:
         raise FileNotFoundError(f"No scene directories found in {data_root}")
 
-    chosen = rng.choice(len(scene_dirs), size=min(n_scenes, len(scene_dirs)), replace=False)
+    chosen = rng.choice(
+        len(scene_dirs), size=min(n_scenes, len(scene_dirs)), replace=False
+    )
     all_coc: list[np.ndarray] = []
 
     for idx in chosen:
@@ -43,16 +45,20 @@ def collect_coc_values(
             continue
         depth_all = np.load(str(depth_path), mmap_mode="r")
         n_frames = depth_all.shape[0]
-        frame_indices = rng.choice(n_frames, size=min(frames_per_scene, n_frames), replace=False)
+        frame_indices = rng.choice(
+            n_frames, size=min(frames_per_scene, n_frames), replace=False
+        )
 
         for fi in frame_indices:
             depth = np.array(depth_all[fi], dtype=np.float64)
             depth[depth < 1e-8] = 1e-8
 
-            f_len, aperture = _sample_lens_params(rng, focal_length_range, aperture_range)
+            f_len, aperture = _sample_lens_params(
+                rng, focal_length_range, aperture_range
+            )
             s_focus = _sample_focus_distance(depth, rng)
 
-            coc = (f_len ** 2 / (aperture * s_focus)) * np.abs(depth - s_focus) / depth
+            coc = (f_len**2 / (aperture * s_focus)) * np.abs(depth - s_focus) / depth
             all_coc.append(coc.ravel())
 
     return np.concatenate(all_coc)

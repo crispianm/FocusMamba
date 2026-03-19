@@ -24,9 +24,7 @@ from .vit import (
 LOGGER = logging.getLogger(__name__)
 
 
-ViTPreset = Literal[
-    "dinov2l16_384",
-]
+ViTPreset = Literal["dinov2l16_384",]
 
 
 @dataclass

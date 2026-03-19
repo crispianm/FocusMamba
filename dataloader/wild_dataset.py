@@ -47,6 +47,7 @@ from torch.utils.data import DataLoader, Dataset
 
 try:
     import cv2
+
     _HAS_CV2 = True
 except ImportError:
     _HAS_CV2 = False
@@ -117,6 +118,7 @@ def _resize_frame(frame: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
 
 class WildDataset(Dataset):
     """Dataset for uncalibrated smartphone focal sweeps.
@@ -242,10 +244,7 @@ class WildDataset(Dataset):
 
         # Convert to tensor (C, T, H, W)
         frames_t = (
-            torch.from_numpy(frames_np.copy())
-            .permute(3, 0, 1, 2)
-            .float()
-            .div(255.0)
+            torch.from_numpy(frames_np.copy()).permute(3, 0, 1, 2).float().div(255.0)
         )
 
         # Focus distances for this clip (if available)

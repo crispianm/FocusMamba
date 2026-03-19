@@ -92,13 +92,13 @@ class DepthMetricAccumulator:
         count = int(pred_valid.numel())
         self.valid_pixels += count
         self.sum_abs_rel += float((abs_diff / gt_valid).sum().item())
-        self.sum_sq_rel += float((((diff ** 2) / gt_valid).sum()).item())
-        self.sum_sq_error += float(((diff ** 2).sum()).item())
-        self.sum_sq_log_error += float(((log_diff ** 2).sum()).item())
+        self.sum_sq_rel += float((((diff**2) / gt_valid).sum()).item())
+        self.sum_sq_error += float(((diff**2).sum()).item())
+        self.sum_sq_log_error += float(((log_diff**2).sum()).item())
         self.sum_log_diff += float(log_diff.sum().item())
         self.delta1_hits += int((ratio < 1.25).sum().item())
-        self.delta2_hits += int((ratio < 1.25 ** 2).sum().item())
-        self.delta3_hits += int((ratio < 1.25 ** 3).sum().item())
+        self.delta2_hits += int((ratio < 1.25**2).sum().item())
+        self.delta3_hits += int((ratio < 1.25**3).sum().item())
 
     def summary(self) -> dict[str, float | int]:
         if self.valid_pixels == 0:
@@ -118,13 +118,13 @@ class DepthMetricAccumulator:
         mean_sq_error = self.sum_sq_error / denom
         mean_sq_log_error = self.sum_sq_log_error / denom
         mean_log_diff = self.sum_log_diff / denom
-        si_log = max(0.0, mean_sq_log_error - (mean_log_diff ** 2))
+        si_log = max(0.0, mean_sq_log_error - (mean_log_diff**2))
         return {
             "valid_pixels": self.valid_pixels,
             "abs_rel": self.sum_abs_rel / denom,
             "sq_rel": self.sum_sq_rel / denom,
-            "rmse": mean_sq_error ** 0.5,
-            "rmse_log": mean_sq_log_error ** 0.5,
+            "rmse": mean_sq_error**0.5,
+            "rmse_log": mean_sq_log_error**0.5,
             "si_log": si_log,
             "delta1": self.delta1_hits / denom,
             "delta2": self.delta2_hits / denom,
@@ -136,8 +136,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/experiments/tartanair_v2.yaml")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--small-checkpoint", default="checkpoints/metric_video_depth_anything_vits.pth")
-    parser.add_argument("--large-checkpoint", default="checkpoints/metric_video_depth_anything_vitl.pth")
+    parser.add_argument(
+        "--small-checkpoint", default="checkpoints/metric_video_depth_anything_vits.pth"
+    )
+    parser.add_argument(
+        "--large-checkpoint", default="checkpoints/metric_video_depth_anything_vitl.pth"
+    )
     parser.add_argument(
         "--models",
         default="small,large",
@@ -154,8 +158,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional H,W override for VDA inference resolution, e.g. 518,518.",
     )
     parser.add_argument("--device", default=None)
-    parser.add_argument("--amp", choices=("auto", "none", "fp16", "bf16"), default="auto")
-    parser.add_argument("--mode", choices=("offline", "streaming_emulated"), default="offline")
+    parser.add_argument(
+        "--amp", choices=("auto", "none", "fp16", "bf16"), default="auto"
+    )
+    parser.add_argument(
+        "--mode", choices=("offline", "streaming_emulated"), default="offline"
+    )
     parser.add_argument(
         "--strict-checkpoint",
         action="store_true",
@@ -215,7 +223,9 @@ def _parse_degradation_specs(raw_specs: Iterable[str] | None) -> list[ConditionS
         name = parts[0]
         lux_level = float(parts[1])
         severity_scale = float(parts[2]) if len(parts) == 3 else 1.0
-        parsed.append(ConditionSpec(name=name, lux_level=lux_level, severity_scale=severity_scale))
+        parsed.append(
+            ConditionSpec(name=name, lux_level=lux_level, severity_scale=severity_scale)
+        )
     return parsed
 
 
@@ -233,7 +243,9 @@ def _parse_models(raw_models: str) -> list[str]:
     valid = {"small", "large"}
     unknown = [name for name in requested if name not in valid]
     if unknown:
-        raise ValueError(f"Unknown model(s) requested via --models: {', '.join(sorted(set(unknown)))}")
+        raise ValueError(
+            f"Unknown model(s) requested via --models: {', '.join(sorted(set(unknown)))}"
+        )
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -262,11 +274,15 @@ def _parse_hw(raw_hw: str | None) -> tuple[int, int] | None:
         raise ValueError(f"--inference-size must be formatted as H,W. Got: {raw_hw!r}")
     height, width = (int(parts[0]), int(parts[1]))
     if height <= 0 or width <= 0:
-        raise ValueError(f"--inference-size must use positive integers. Got: {raw_hw!r}")
+        raise ValueError(
+            f"--inference-size must use positive integers. Got: {raw_hw!r}"
+        )
     return (height, width)
 
 
-def _build_degradation(cfg: dict, condition: ConditionSpec) -> LowLightDegradation | None:
+def _build_degradation(
+    cfg: dict, condition: ConditionSpec
+) -> LowLightDegradation | None:
     if condition.is_clean:
         return None
 
@@ -298,7 +314,9 @@ def _build_dataset(
         root=str(data_cfg["root"]),
         num_frames=num_frames,
         image_size=tuple(int(v) for v in data_cfg.get("image_size", (256, 256))),
-        max_trajectories=data_cfg.get("max_val_trajectories", data_cfg.get("max_trajectories")),
+        max_trajectories=data_cfg.get(
+            "max_val_trajectories", data_cfg.get("max_trajectories")
+        ),
         clip_stride=int(data_cfg.get("clip_stride", 8)),
         frame_stride=int(data_cfg.get("frame_stride", 1)),
         split="val",
@@ -318,7 +336,9 @@ def _build_dataset(
     return dataset
 
 
-def _build_loader(dataset: TartanAirV2Dataset | Subset, batch_size: int, num_workers: int) -> DataLoader:
+def _build_loader(
+    dataset: TartanAirV2Dataset | Subset, batch_size: int, num_workers: int
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -359,12 +379,18 @@ def _resize_video_tensor(
     align_corners: bool | None,
 ) -> torch.Tensor:
     batch_size, channels, num_frames, height, width = tensor.shape
-    flat = tensor.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames, channels, height, width)
+    flat = tensor.permute(0, 2, 1, 3, 4).reshape(
+        batch_size * num_frames, channels, height, width
+    )
     kwargs: dict[str, object] = {"size": size, "mode": mode}
     if align_corners is not None:
         kwargs["align_corners"] = align_corners
     resized = torch.nn.functional.interpolate(flat, **kwargs)
-    return resized.reshape(batch_size, num_frames, channels, size[0], size[1]).permute(0, 2, 1, 3, 4).contiguous()
+    return (
+        resized.reshape(batch_size, num_frames, channels, size[0], size[1])
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
 
 
 @torch.inference_mode()
@@ -395,7 +421,10 @@ def _evaluate_condition(
         mask = batch["mask"].to(device, non_blocking=True)
         original_depth_size = tuple(int(v) for v in depth.shape[-2:])
         model_frames = frames
-        if inference_size is not None and tuple(int(v) for v in frames.shape[-2:]) != inference_size:
+        if (
+            inference_size is not None
+            and tuple(int(v) for v in frames.shape[-2:]) != inference_size
+        ):
             model_frames = _resize_video_tensor(
                 frames,
                 size=inference_size,
@@ -406,7 +435,10 @@ def _evaluate_condition(
         with _autocast_context(device, amp_mode):
             outputs = model(model_frames, mode=mode)
             pred = outputs["depth"]
-            if inference_size is not None and tuple(int(v) for v in pred.shape[-2:]) != original_depth_size:
+            if (
+                inference_size is not None
+                and tuple(int(v) for v in pred.shape[-2:]) != original_depth_size
+            ):
                 pred = _resize_video_tensor(
                     pred,
                     size=original_depth_size,
@@ -415,7 +447,9 @@ def _evaluate_condition(
                 )
 
         metrics.update(pred, depth, mask)
-        temporal_sum += float(frame_depth_variation(pred, mask=mask.float())) * int(frames.shape[0])
+        temporal_sum += float(frame_depth_variation(pred, mask=mask.float())) * int(
+            frames.shape[0]
+        )
         total_clips += int(frames.shape[0])
         total_frames += int(frames.shape[0] * frames.shape[2])
 
@@ -477,7 +511,9 @@ def _write_summary_csv(output_path: Path, rows: list[dict[str, object]]) -> None
         writer.writerows(rows)
 
 
-def _write_outputs(output_dir: Path, report: dict[str, object], csv_rows: list[dict[str, object]]) -> None:
+def _write_outputs(
+    output_dir: Path, report: dict[str, object], csv_rows: list[dict[str, object]]
+) -> None:
     json_path = output_dir / "summary.json"
     csv_path = output_dir / "summary.csv"
     with json_path.open("w") as handle:
@@ -532,23 +568,41 @@ def main() -> None:
     csv_path = output_dir / "summary.csv"
 
     data_cfg = cfg.get("data", {}) or {}
-    eval_num_frames = int(args.num_frames or data_cfg.get("val_num_frames", data_cfg.get("num_frames", 8)))
+    eval_num_frames = int(
+        args.num_frames or data_cfg.get("val_num_frames", data_cfg.get("num_frames", 8))
+    )
     inference_size = _parse_hw(args.inference_size)
     max_depth = float(data_cfg.get("max_depth", 80.0))
     conditions: list[ConditionSpec] = []
     if args.clean_only:
-        conditions.append(ConditionSpec(name="clean", lux_level=None, severity_scale=0.0))
+        conditions.append(
+            ConditionSpec(name="clean", lux_level=None, severity_scale=0.0)
+        )
     else:
         if not args.skip_clean:
-            conditions.append(ConditionSpec(name="clean", lux_level=None, severity_scale=0.0))
+            conditions.append(
+                ConditionSpec(name="clean", lux_level=None, severity_scale=0.0)
+            )
         conditions.extend(_parse_degradation_specs(args.degradation_levels))
     requested_models = _parse_models(args.models)
 
     models: list[ModelSpec] = []
     if "small" in requested_models:
-        models.append(ModelSpec(name="vda_small", variant="small", checkpoint_path=Path(args.small_checkpoint)))
+        models.append(
+            ModelSpec(
+                name="vda_small",
+                variant="small",
+                checkpoint_path=Path(args.small_checkpoint),
+            )
+        )
     if "large" in requested_models:
-        models.append(ModelSpec(name="vda_large", variant="large", checkpoint_path=Path(args.large_checkpoint)))
+        models.append(
+            ModelSpec(
+                name="vda_large",
+                variant="large",
+                checkpoint_path=Path(args.large_checkpoint),
+            )
+        )
 
     if args.resume and json_path.is_file():
         report = json.loads(json_path.read_text())
@@ -571,7 +625,9 @@ def main() -> None:
             "clean_only": bool(args.clean_only),
             "resume": bool(args.resume),
             "requested_models": requested_models,
-            "results": report.get("results", {}) if isinstance(report.get("results", {}), dict) else {},
+            "results": report.get("results", {})
+            if isinstance(report.get("results", {}), dict)
+            else {},
         }
     )
     csv_rows = _csv_rows_from_report(report)
@@ -620,7 +676,9 @@ def main() -> None:
                 f"lux={condition.lux_level} severity={condition.severity_scale}",
                 flush=True,
             )
-            loader = _build_loader(dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+            loader = _build_loader(
+                dataset, batch_size=args.batch_size, num_workers=args.num_workers
+            )
             summary = _evaluate_condition(
                 model,
                 loader,
@@ -639,7 +697,9 @@ def main() -> None:
                     "model": model_spec.name,
                     "variant": model_spec.variant,
                     "checkpoint": str(model_spec.checkpoint_path),
-                    "inference_size": None if inference_size is None else f"{inference_size[0]}x{inference_size[1]}",
+                    "inference_size": None
+                    if inference_size is None
+                    else f"{inference_size[0]}x{inference_size[1]}",
                     **summary,
                 }
             )
@@ -660,7 +720,16 @@ def main() -> None:
     csv_rows = _csv_rows_from_report(report)
     _write_outputs(output_dir, report, csv_rows)
 
-    print(json.dumps({"output_dir": str(output_dir), "summary_json": str(json_path), "summary_csv": str(csv_path)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "output_dir": str(output_dir),
+                "summary_json": str(json_path),
+                "summary_csv": str(csv_path),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

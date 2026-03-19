@@ -49,6 +49,7 @@ def generate_error_map(
 
     if output_path is not None:
         from PIL import Image
+
         Image.fromarray(colored).save(output_path)
 
     return colored

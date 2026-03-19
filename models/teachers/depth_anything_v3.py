@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from .teacher_base import TeacherBase
 
@@ -50,10 +49,14 @@ class DepthAnythingV3Teacher(TeacherBase):
 
         # Pre-compute normalisation tensors (registered as buffers later).
         self.register_buffer(
-            "_mean", torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False,
+            "_mean",
+            torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1),
+            persistent=False,
         )
         self.register_buffer(
-            "_std", torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1), persistent=False,
+            "_std",
+            torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1),
+            persistent=False,
         )
 
     def _load_model(self) -> None:
@@ -63,7 +66,8 @@ class DepthAnythingV3Teacher(TeacherBase):
 
         if self.checkpoint_path is not None:
             self.model = load_da3_metric_large(
-                self.checkpoint_path, device=self.target_device,
+                self.checkpoint_path,
+                device=self.target_device,
             )
         else:
             self.model = create_da3_metric_large()

@@ -62,8 +62,8 @@ class GradientSmoothnessLoss(nn.Module):
             gx: (B, 1, H, W) horizontal gradient (zero-padded right column)
             gy: (B, 1, H, W) vertical gradient   (zero-padded bottom row)
         """
-        gx = x[:, :, :, 1:] - x[:, :, :, :-1]   # (B,1,H,W-1)
-        gy = x[:, :, 1:, :] - x[:, :, :-1, :]   # (B,1,H-1,W)
+        gx = x[:, :, :, 1:] - x[:, :, :, :-1]  # (B,1,H,W-1)
+        gy = x[:, :, 1:, :] - x[:, :, :-1, :]  # (B,1,H-1,W)
         # Pad to restore spatial dims
         gx = F.pad(gx, (0, 1, 0, 0))
         gy = F.pad(gy, (0, 0, 0, 1))
@@ -125,7 +125,7 @@ class GradientSmoothnessLoss(nn.Module):
                 loss_x = edge_x * gx_p.abs()
                 loss_y = edge_y * gy_p.abs()
 
-            loss = loss_x + loss_y                    # (B*T,1,H',W')
+            loss = loss_x + loss_y  # (B*T,1,H',W')
 
             if m is not None:
                 loss = loss[m]

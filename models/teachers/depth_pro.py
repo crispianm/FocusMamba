@@ -100,9 +100,7 @@ class DepthProTeacher(TeacherBase):
         # depth = 1.0 / inverse_depth
         W = frame.shape[-1]  # 1536
         if fov_deg is not None:
-            f_px = 0.5 * W / torch.tan(
-                0.5 * torch.deg2rad(fov_deg.to(torch.float))
-            )
+            f_px = 0.5 * W / torch.tan(0.5 * torch.deg2rad(fov_deg.to(torch.float)))
         else:
             # Fallback: assume 60° FOV if head is disabled
             f_px = 0.5 * W / torch.tan(torch.tensor(0.5236))  # ~30° half-angle

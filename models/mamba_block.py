@@ -24,6 +24,7 @@ except ImportError:
 # RMSNorm (from the original Mamba paper convention)
 # ---------------------------------------------------------------------------
 
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -35,9 +36,38 @@ class RMSNorm(nn.Module):
         return (x.float() * norm).type_as(x) * self.weight
 
 
+class _SequenceSSM(nn.Module):
+    """Use Mamba on CUDA and a tiny MLP fallback elsewhere."""
+
+    def __init__(
+        self,
+        dim: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+    ):
+        super().__init__()
+        self.mamba = None
+        if Mamba is not None:
+            self.mamba = Mamba(
+                d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand
+            )
+        self.fallback = nn.Sequential(
+            nn.Linear(dim, dim * expand),
+            nn.SiLU(),
+            nn.Linear(dim * expand, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mamba is not None and x.is_cuda:
+            return self.mamba(x)
+        return self.fallback(x)
+
+
 # ---------------------------------------------------------------------------
 # Single Mamba block (pre-norm, residual)
 # ---------------------------------------------------------------------------
+
 
 class MambaBlock(nn.Module):
     """Single-direction Mamba with pre-RMSNorm and residual connection.
@@ -58,20 +88,7 @@ class MambaBlock(nn.Module):
     ):
         super().__init__()
         self.norm = RMSNorm(dim)
-        if Mamba is not None:
-            self.mamba = Mamba(
-                d_model=dim,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
-        else:
-            # Fallback: simple linear layer for testing without mamba_ssm
-            self.mamba = nn.Sequential(
-                nn.Linear(dim, dim * expand),
-                nn.SiLU(),
-                nn.Linear(dim * expand, dim),
-            )
+        self.mamba = _SequenceSSM(dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, L, C) → (B, L, C)"""
@@ -81,6 +98,7 @@ class MambaBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Cross-scan Mamba (4-way spatial scan)
 # ---------------------------------------------------------------------------
+
 
 class CrossScanMambaBlock(nn.Module):
     """Four independent Mamba SSMs scanning in 4 spatial directions.
@@ -108,17 +126,15 @@ class CrossScanMambaBlock(nn.Module):
     ):
         super().__init__()
         self.norm = RMSNorm(dim)
-        self.ssms = nn.ModuleList([
-            self._make_ssm(dim, d_state, d_conv, expand) for _ in range(4)
-        ])
+        self.ssms = nn.ModuleList(
+            [self._make_ssm(dim, d_state, d_conv, expand) for _ in range(4)]
+        )
         # Learnable weights for combining the 4 scan directions
         self.scan_weights = nn.Parameter(torch.ones(4) / 4.0)
 
     @staticmethod
     def _make_ssm(dim, d_state, d_conv, expand):
-        if Mamba is not None:
-            return Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        return nn.Sequential(nn.Linear(dim, dim * expand), nn.SiLU(), nn.Linear(dim * expand, dim))
+        return _SequenceSSM(dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
     @staticmethod
     def _row_major(x: torch.Tensor, H: int, W: int) -> torch.Tensor:
@@ -144,7 +160,13 @@ class CrossScanMambaBlock(nn.Module):
         B, _, C = x.shape
         return x.view(B, W, H, C).permute(0, 2, 1, 3).reshape(B, H * W, C)
 
-    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        H: int,
+        W: int,
+        scan_weight_delta: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, H*W, C) tokens in row-major spatial order.
@@ -167,13 +189,24 @@ class CrossScanMambaBlock(nn.Module):
         outs = [ssm(s) for ssm, s in zip(self.ssms, scans)]
 
         # Reverse the reordering to get back to row-major
-        outs[1] = outs[1].flip(1)                        # undo reverse
-        outs[2] = self._undo_col_major(outs[2], H, W)    # undo col-major
+        outs[1] = outs[1].flip(1)  # undo reverse
+        outs[2] = self._undo_col_major(outs[2], H, W)  # undo col-major
         outs[3] = self._undo_col_major(outs[3].flip(1), H, W)  # undo col-major+reverse
 
         # Weighted sum
-        w = self.scan_weights.softmax(dim=0)
-        combined = sum(w[i] * outs[i] for i in range(4))
+        if scan_weight_delta is None:
+            w = self.scan_weights.softmax(dim=0)
+            combined = sum(w[i] * outs[i] for i in range(4))
+        else:
+            if scan_weight_delta.ndim != 2 or scan_weight_delta.shape != (
+                x.shape[0],
+                4,
+            ):
+                raise ValueError(
+                    f"scan_weight_delta must have shape ({x.shape[0]}, 4), got {tuple(scan_weight_delta.shape)}"
+                )
+            w = (self.scan_weights.unsqueeze(0) + scan_weight_delta).softmax(dim=-1)
+            combined = sum(w[:, i].view(-1, 1, 1) * outs[i] for i in range(4))
 
         return residual + combined
 
@@ -181,6 +214,7 @@ class CrossScanMambaBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Spatial Mamba Block: (B, T, H, W, C) → cross-scan over spatial dims
 # ---------------------------------------------------------------------------
+
 
 class SpatialMambaBlock(nn.Module):
     """Applies 4-way CrossScanMamba over the spatial dimensions.
@@ -193,17 +227,27 @@ class SpatialMambaBlock(nn.Module):
         super().__init__()
         self.cross_scan = CrossScanMambaBlock(dim, d_state, d_conv, expand)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, scan_weight_delta: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """x: (B, T, H, W, C)"""
         B, T, H, W, C = x.shape
         x_flat = x.reshape(B * T, H * W, C)
-        x_flat = self.cross_scan(x_flat, H, W)
+        delta = None
+        if scan_weight_delta is not None:
+            if scan_weight_delta.ndim != 2 or scan_weight_delta.shape != (B, 4):
+                raise ValueError(
+                    f"Expected per-clip scan_weight_delta with shape ({B}, 4), got {tuple(scan_weight_delta.shape)}"
+                )
+            delta = scan_weight_delta[:, None, :].expand(B, T, 4).reshape(B * T, 4)
+        x_flat = self.cross_scan(x_flat, H, W, scan_weight_delta=delta)
         return x_flat.reshape(B, T, H, W, C)
 
 
 # ---------------------------------------------------------------------------
 # Temporal Mamba Block: (B, T, H, W, C) → Mamba over temporal dim
 # ---------------------------------------------------------------------------
+
 
 class TemporalMambaBlock(nn.Module):
     """Applies single-direction Mamba along the temporal dimension.

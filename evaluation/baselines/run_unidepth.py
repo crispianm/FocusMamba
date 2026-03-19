@@ -16,4 +16,6 @@ def run_unidepth_baseline(config: Dict[str, Any]) -> Dict[str, float]:
     Returns:
         Dict of depth metrics.
     """
-    raise NotImplementedError("Implement: load UniDepth, run on eval set, compute metrics.")
+    raise NotImplementedError(
+        "Implement: load UniDepth, run on eval set, compute metrics."
+    )

@@ -60,7 +60,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -72,6 +72,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _setup_logging(log_path: Path) -> None:
     handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -95,6 +96,7 @@ def _all_cached(clip_cache_dir: Path, teacher_names: List[str]) -> bool:
 # Dataset wrapper that returns (clip_tensor, video_id, start_frame) only
 # ---------------------------------------------------------------------------
 
+
 class _ClipOnlyDataset(torch.utils.data.Dataset):
     """Thin wrapper that exposes only the fields needed for caching."""
 
@@ -107,9 +109,9 @@ class _ClipOnlyDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         item = self._ds[idx]
         return {
-            "frames": item["frames"],          # (3, T, H, W) float32
-            "video_id": item["video_id"],       # str
-            "start_frame": item["start_frame"], # int
+            "frames": item["frames"],  # (3, T, H, W) float32
+            "video_id": item["video_id"],  # str
+            "start_frame": item["start_frame"],  # int
         }
 
 
@@ -117,34 +119,69 @@ class _ClipOnlyDataset(torch.utils.data.Dataset):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Pre-cache teacher pseudo-labels for FocusMamba training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", default="configs/experiments/tartanair_v2.yaml",
-                        help="Experiment config YAML (teachers section must be populated)")
-    parser.add_argument("--cache-dir", default=None,
-                        help="Root directory for the cache. Overrides config value if set.")
-    parser.add_argument("--device", default="cuda",
-                        help="Device for teacher inference (cuda / cpu)")
-    parser.add_argument("--batch-size", type=int, default=1,
-                        help="Batch size for teacher inference. 1 is usually safest for "
-                             "teachers that internally manage temporal windows.")
-    parser.add_argument("--num-workers", type=int, default=4,
-                        help="DataLoader workers for reading frames")
-    parser.add_argument("--max-clips", type=int, default=None,
-                        help="Stop after processing this many clips (useful for testing)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Skip clips that already have all teacher files")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="List teachers and dataset size then exit immediately")
-    parser.add_argument("--split", default="train", choices=["train", "val"],
-                        help="Which split to cache")
-    parser.add_argument("--envs", nargs="+", default=None, metavar="ENV",
-                        help="Override config envs: restrict caching to these environment "
-                             "names (e.g. --envs AbandonedFactory Ocean).  Useful for "
-                             "parallelising across SLURM array tasks.")
+    parser.add_argument(
+        "--config",
+        default="configs/experiments/tartanair_v2.yaml",
+        help="Experiment config YAML (teachers section must be populated)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Root directory for the cache. Overrides config value if set.",
+    )
+    parser.add_argument(
+        "--device", default="cuda", help="Device for teacher inference (cuda / cpu)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for teacher inference. 1 is usually safest for "
+        "teachers that internally manage temporal windows.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="DataLoader workers for reading frames",
+    )
+    parser.add_argument(
+        "--max-clips",
+        type=int,
+        default=None,
+        help="Stop after processing this many clips (useful for testing)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip clips that already have all teacher files",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List teachers and dataset size then exit immediately",
+    )
+    parser.add_argument(
+        "--split",
+        default="train",
+        choices=["train", "val"],
+        help="Which split to cache",
+    )
+    parser.add_argument(
+        "--envs",
+        nargs="+",
+        default=None,
+        metavar="ENV",
+        help="Override config envs: restrict caching to these environment "
+        "names (e.g. --envs AbandonedFactory Ocean).  Useful for "
+        "parallelising across SLURM array tasks.",
+    )
     args = parser.parse_args()
 
     # -----------------------------------------------------------------------
@@ -153,8 +190,9 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu"
-                          else "cpu")
+    device = torch.device(
+        args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
+    )
 
     # Resolve cache dir
     cache_dir_str = (
@@ -194,7 +232,9 @@ def main() -> None:
             log.warning("Could not load teacher '%s': %s", name, exc)
 
     if not teachers:
-        log.error("No teachers loaded — nothing to cache.  Check config teachers section.")
+        log.error(
+            "No teachers loaded — nothing to cache.  Check config teachers section."
+        )
         sys.exit(1)
 
     teacher_names = list(teachers.keys())
@@ -208,6 +248,7 @@ def main() -> None:
 
     if dataset_type == "tartanair_v2":
         from dataloader.tartanair_v2 import TartanAirV2Dataset
+
         # --envs CLI flag overrides the config value (used by SLURM array tasks)
         envs_filter = args.envs if args.envs is not None else data_cfg.get("envs", None)
         if envs_filter:
@@ -233,9 +274,13 @@ def main() -> None:
         sys.exit(1)
 
     dataset = _ClipOnlyDataset(raw_dataset)
-    n_total = len(dataset) if args.max_clips is None else min(len(dataset), args.max_clips)
+    n_total = (
+        len(dataset) if args.max_clips is None else min(len(dataset), args.max_clips)
+    )
 
-    log.info("Dataset split=%s  clips=%d  (using %d)", args.split, len(dataset), n_total)
+    log.info(
+        "Dataset split=%s  clips=%d  (using %d)", args.split, len(dataset), n_total
+    )
 
     if args.dry_run:
         log.info("--- DRY RUN complete ---")
@@ -267,8 +312,8 @@ def main() -> None:
     pbar = tqdm(total=n_total, unit="clip", desc="Caching", dynamic_ncols=True)
 
     for batch in loader:
-        videos = batch["video_id"]        # list[str], length B
-        starts = batch["start_frame"]     # list[int], length B
+        videos = batch["video_id"]  # list[str], length B
+        starts = batch["start_frame"]  # list[int], length B
         frames = batch["frames"].to(device)  # (B, 3, T, H, W)
 
         for b_idx in range(frames.shape[0]):
@@ -304,7 +349,9 @@ def main() -> None:
                     arr = depth.squeeze(0).half().cpu().numpy()  # (1, T, H, W) float16
                     np.save(str(out_path), arr)
                 except Exception as exc:
-                    log.warning("Teacher '%s' failed on %s/%d: %s", t_name, vid, sf, exc)
+                    log.warning(
+                        "Teacher '%s' failed on %s/%d: %s", t_name, vid, sf, exc
+                    )
 
             n_cached += 1
             pbar.update(1)
@@ -317,13 +364,16 @@ def main() -> None:
     pbar.close()
     log.info(
         "Done.  Cached=%d  Skipped(already existed)=%d  Cache dir: %s",
-        n_cached, n_skipped, cache_dir,
+        n_cached,
+        n_skipped,
+        cache_dir,
     )
 
 
 # ---------------------------------------------------------------------------
 # Custom collate to handle str video IDs in batches
 # ---------------------------------------------------------------------------
+
 
 def _collate_fn(batch):
     """Collate that keeps video_id as a plain list of strings."""

@@ -106,4 +106,3 @@ class ScaleShiftInvariantLoss(nn.Module):
             aligned[b] = s * pred[b] + t
 
         return aligned
-

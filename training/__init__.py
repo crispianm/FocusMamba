@@ -12,7 +12,12 @@ Provides:
 from .losses import ScaleInvariantLogLoss, DistillationLoss, CombinedLoss
 from .curriculum import CurriculumScheduler
 from .ema import EMAModel
-from .trainer import WarmupCosineScheduler, train_one_epoch, validate, compute_depth_metrics
+from .trainer import (
+    WarmupCosineScheduler,
+    train_one_epoch,
+    validate,
+    compute_depth_metrics,
+)
 
 __all__ = [
     "ScaleInvariantLogLoss",

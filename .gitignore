@@ -32,3 +32,5 @@ Video-Depth-Anything/
 configs/experiments/
 zz_info/
 tmp/
+six_runs/
+bug_hunt_vda/

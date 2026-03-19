@@ -9,10 +9,9 @@ Compares framewise baseline vs. temporal model.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import torch
-import numpy as np
 
 
 def generate_temporal_comparison_video(

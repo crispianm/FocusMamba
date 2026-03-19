@@ -51,7 +51,7 @@ def load_pretrained_encoder(
     # Strip prefix if needed
     if key_prefix:
         state_dict = {
-            k[len(key_prefix):] if k.startswith(key_prefix) else k: v
+            k[len(key_prefix) :] if k.startswith(key_prefix) else k: v
             for k, v in state_dict.items()
         }
 
@@ -59,8 +59,10 @@ def load_pretrained_encoder(
     result = encoder.load_state_dict(state_dict, strict=strict)
 
     loaded_keys = [
-        k for k in state_dict.keys()
-        if k not in (result.unexpected_keys if hasattr(result, 'unexpected_keys') else [])
+        k
+        for k in state_dict.keys()
+        if k
+        not in (result.unexpected_keys if hasattr(result, "unexpected_keys") else [])
     ]
 
     return loaded_keys

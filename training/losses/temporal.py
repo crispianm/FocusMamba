@@ -81,7 +81,7 @@ class TemporalConsistencyLoss(nn.Module):
         # ── Stability mask ──────────────────────────────────────────────────
         # Only regions where GT is temporally smooth (static background).
         # Excludes object edges, dynamic objects, occlusion boundaries.
-        stable: torch.Tensor = dg.abs() < self.threshold   # (B,1,T-1,H,W)
+        stable: torch.Tensor = dg.abs() < self.threshold  # (B,1,T-1,H,W)
 
         # Both adjacent frames must be valid
         if mask is not None:
@@ -93,5 +93,5 @@ class TemporalConsistencyLoss(nn.Module):
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
         # L1 between |pred temporal change| and |GT temporal change|
-        loss_map = (dp.abs() - dg.abs()).abs()              # (B,1,T-1,H,W)
+        loss_map = (dp.abs() - dg.abs()).abs()  # (B,1,T-1,H,W)
         return loss_map[stable].mean()

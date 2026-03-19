@@ -124,16 +124,24 @@ class TartanAirV2Dataset(Dataset):
         self.camera = camera
         self.teacher_cache_dir = Path(teacher_cache_dir) if teacher_cache_dir else None
         self.degradation = degradation
-        self.return_clean_and_degraded = bool(return_clean_and_degraded and degradation is not None)
-        self.return_clean_reference = bool(return_clean_reference and self.return_clean_and_degraded)
-        self.return_degradation_metadata = bool(return_degradation_metadata and self.return_clean_and_degraded)
+        self.return_clean_and_degraded = bool(
+            return_clean_and_degraded and degradation is not None
+        )
+        self.return_clean_reference = bool(
+            return_clean_reference and self.return_clean_and_degraded
+        )
+        self.return_degradation_metadata = bool(
+            return_degradation_metadata and self.return_clean_and_degraded
+        )
         self.split = split
         self.seed = int(seed)
 
         # --- Discover all trajectories with both image and depth -----------
         all_trajectories: List[Tuple[Path, Path]] = []  # (image_dir, depth_dir)
 
-        env_dirs = sorted(p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.'))
+        env_dirs = sorted(
+            p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith(".")
+        )
         if envs is not None:
             env_dirs = [d for d in env_dirs if d.name in envs]
 
@@ -220,7 +228,7 @@ class TartanAirV2Dataset(Dataset):
             depth_t = torch.from_numpy(depth).unsqueeze(0).float()  # (1, H, W)
             depths.append(depth_t)
 
-        frames = torch.stack(imgs, dim=1)   # (3, T, H, W)
+        frames = torch.stack(imgs, dim=1)  # (3, T, H, W)
         depth = torch.stack(depths, dim=1)  # (1, T, H, W)
         mask = (depth > 0).float()
 
@@ -266,7 +274,9 @@ class TartanAirV2Dataset(Dataset):
             degradation_params = None
             degradation_summary = None
             if self.return_degradation_metadata:
-                degraded_clip, degradation_params, degradation_summary = degradation_output
+                degraded_clip, degradation_params, degradation_summary = (
+                    degradation_output
+                )
             else:
                 degraded_clip = degradation_output
             degraded_frames = degraded_clip.permute(1, 0, 2, 3).contiguous()
@@ -293,13 +303,17 @@ class TartanAirV2Dataset(Dataset):
                         # mmap_mode='r' memory-maps the file — the OS shares pages
                         # across all DataLoader worker processes and skips pickle
                         # deserialization, giving faster multi-worker throughput.
-                        arr = np.load(str(npy_file), mmap_mode="r")  # (1, T, H_c, W_c) f16
-                        td = torch.from_numpy(arr.astype(np.float32))  # copy out of mmap
+                        arr = np.load(
+                            str(npy_file), mmap_mode="r"
+                        )  # (1, T, H_c, W_c) f16
+                        td = torch.from_numpy(
+                            arr.astype(np.float32)
+                        )  # copy out of mmap
                         H, W = self.image_size
                         if td.shape[-2:] != (H, W):
                             # Resize to training resolution if cache was built at a different res
                             td = F.interpolate(
-                                td,              # (1, T, H_c, W_c)
+                                td,  # (1, T, H_c, W_c)
                                 size=(H, W),
                                 mode="bilinear",
                                 align_corners=False,

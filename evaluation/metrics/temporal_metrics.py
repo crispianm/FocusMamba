@@ -51,7 +51,11 @@ def frame_depth_variation(
         pair_mask = mask[:, :, 1:].bool() & mask[:, :, :-1].bool()
         if pair_mask.any():
             diff_mean = diffs[pair_mask].mean()
-            mean_depth = depth[mask.bool()].abs().mean() if mask.bool().any() else depth.abs().mean()
+            mean_depth = (
+                depth[mask.bool()].abs().mean()
+                if mask.bool().any()
+                else depth.abs().mean()
+            )
         else:
             return 0.0
     else:

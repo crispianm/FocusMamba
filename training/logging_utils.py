@@ -101,7 +101,9 @@ def setup_logger(
     else:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+            )
         )
     console_handler.setLevel(level)
     logger.addHandler(console_handler)
@@ -112,7 +114,9 @@ def setup_logger(
         file_handler = logging.FileHandler(log_path.resolve(), mode="a")
         file_handler.setLevel(level)
         file_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+            )
         )
         logger.addHandler(file_handler)
 
@@ -129,12 +133,20 @@ class RunArtifacts:
     config_snapshot_file: Path
 
 
-def resolve_run_artifacts(train_cfg: Mapping[str, Any], *, default_log_dir: str) -> RunArtifacts:
+def resolve_run_artifacts(
+    train_cfg: Mapping[str, Any], *, default_log_dir: str
+) -> RunArtifacts:
     log_dir = Path(train_cfg.get("log_dir", default_log_dir))
-    verbose_log_file = Path(train_cfg.get("verbose_log_file", log_dir / "train_verbose.log"))
+    verbose_log_file = Path(
+        train_cfg.get("verbose_log_file", log_dir / "train_verbose.log")
+    )
     metrics_file = Path(train_cfg.get("metrics_jsonl_file", log_dir / "metrics.jsonl"))
-    metadata_file = Path(train_cfg.get("run_metadata_file", log_dir / "run_metadata.json"))
-    config_snapshot_file = Path(train_cfg.get("config_snapshot_file", log_dir / "config_snapshot.yaml"))
+    metadata_file = Path(
+        train_cfg.get("run_metadata_file", log_dir / "run_metadata.json")
+    )
+    config_snapshot_file = Path(
+        train_cfg.get("config_snapshot_file", log_dir / "config_snapshot.yaml")
+    )
     return RunArtifacts(
         log_dir=log_dir,
         verbose_log_file=verbose_log_file,
@@ -189,7 +201,9 @@ def write_run_metadata(
     if extra:
         metadata.update(dict(extra))
 
-    artifacts.metadata_file.write_text(json.dumps(_json_ready(metadata), indent=2, sort_keys=True) + "\n")
+    artifacts.metadata_file.write_text(
+        json.dumps(_json_ready(metadata), indent=2, sort_keys=True) + "\n"
+    )
     return metadata
 
 

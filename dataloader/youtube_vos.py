@@ -111,7 +111,9 @@ class YouTubeVOSDataset(Dataset):
                 self.clips.append((vdir, start, frames))
 
         # --- transforms -----------------------------------------------------
-        self._to_tensor = transforms.ToTensor()   # (H, W, C) uint8 → (C, H, W) float [0,1]
+        self._to_tensor = (
+            transforms.ToTensor()
+        )  # (H, W, C) uint8 → (C, H, W) float [0,1]
 
     def __len__(self) -> int:
         return len(self.clips)
@@ -133,7 +135,7 @@ class YouTubeVOSDataset(Dataset):
         H, W = self.image_size
         if frames_chw.shape[-2:] != (H, W):
             frames_chw = F.interpolate(
-                frames_chw.permute(1, 0, 2, 3),    # (T, 3, H, W)
+                frames_chw.permute(1, 0, 2, 3),  # (T, 3, H, W)
                 size=(H, W),
                 mode="bilinear",
                 align_corners=False,

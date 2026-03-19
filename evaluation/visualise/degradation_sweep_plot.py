@@ -8,7 +8,7 @@ Generate performance-vs-severity curves for the paper (Figure 3 or 4).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 
 def plot_degradation_sweep(

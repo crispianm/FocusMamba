@@ -12,8 +12,14 @@ import yaml
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--audit-csv", required=True, help="Path to teacher_summary.csv from audit_teacher_outputs.py.")
-    parser.add_argument("--config", required=True, help="Config YAML to rewrite in-place.")
+    parser.add_argument(
+        "--audit-csv",
+        required=True,
+        help="Path to teacher_summary.csv from audit_teacher_outputs.py.",
+    )
+    parser.add_argument(
+        "--config", required=True, help="Config YAML to rewrite in-place."
+    )
     parser.add_argument(
         "--metric",
         default="abs_rel",
@@ -41,7 +47,9 @@ def rewrite_config(config_path: Path, teacher_name: str) -> None:
     with config_path.open("r") as f:
         cfg = yaml.safe_load(f) or {}
 
-    enabled_teachers = [t for t in cfg.get("teachers", []) if t.get("name") == teacher_name]
+    enabled_teachers = [
+        t for t in cfg.get("teachers", []) if t.get("name") == teacher_name
+    ]
     if not enabled_teachers:
         raise ValueError(f"Teacher {teacher_name!r} is not present in {config_path}")
 

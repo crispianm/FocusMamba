@@ -54,7 +54,10 @@ class CurriculumScheduler:
         """
         if epoch < self.warmup_epochs:
             progress = epoch / max(1, self.warmup_epochs)
-            return self.warmup_start_scale + (self.min_scale - self.warmup_start_scale) * progress
+            return (
+                self.warmup_start_scale
+                + (self.min_scale - self.warmup_start_scale) * progress
+            )
 
         # After warmup, ramp to 1.0
         progress = (epoch - self.warmup_epochs) / max(

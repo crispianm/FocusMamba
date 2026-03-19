@@ -73,7 +73,11 @@ def _load_run_tags(root: Path, config_path: str | None) -> dict[str, object]:
     distill_cfg = cfg.get("distillation", {})
     recipe = str(distill_cfg.get("strategy", "none")).strip().lower()
     prefilter_enabled = bool(model_cfg.get("prefilter_enabled", False))
-    prefilter = str(model_cfg.get("prefilter_type", "none")).strip().lower() if prefilter_enabled else "none"
+    prefilter = (
+        str(model_cfg.get("prefilter_type", "none")).strip().lower()
+        if prefilter_enabled
+        else "none"
+    )
     gate_enabled = bool(model_cfg.get("state_gate_enabled", False))
     gate_mask = model_cfg.get("state_gate_stage_mask")
     gate = "off"
@@ -94,13 +98,19 @@ def _load_run_tags(root: Path, config_path: str | None) -> dict[str, object]:
 
     temporal_adapter = "off"
     if bool(model_cfg.get("pre_temporal_stage_adapter_enabled", False)):
-        raw_stages = model_cfg.get("pre_temporal_stage_adapter_stages", ["layer3", "layer4"])
+        raw_stages = model_cfg.get(
+            "pre_temporal_stage_adapter_stages", ["layer3", "layer4"]
+        )
         if raw_stages is None:
             raw_stages = ["layer3", "layer4"]
-        normalized_stages = sorted({str(stage).strip().lower().replace("_", "") for stage in raw_stages})
+        normalized_stages = sorted(
+            {str(stage).strip().lower().replace("_", "") for stage in raw_stages}
+        )
         temporal_adapter = "+".join(normalized_stages) if normalized_stages else "on"
 
-    train_budget = data_cfg.get("max_train_trajectories", data_cfg.get("max_trajectories"))
+    train_budget = data_cfg.get(
+        "max_train_trajectories", data_cfg.get("max_trajectories")
+    )
     val_budget = data_cfg.get("max_val_trajectories", data_cfg.get("max_trajectories"))
     budget_scope = "full" if train_budget is None and val_budget is None else "subset"
 
@@ -187,7 +197,9 @@ class RunRecord:
         return "incomplete"
 
 
-def _ensure_record(records: Dict[str, RunRecord], run_dir: str, source: str) -> RunRecord:
+def _ensure_record(
+    records: Dict[str, RunRecord], run_dir: str, source: str
+) -> RunRecord:
     rec = records.get(run_dir)
     if rec is None:
         rec = RunRecord(run_dir=run_dir)
@@ -207,7 +219,9 @@ def parse_verbose_logs(root: Path, records: Dict[str, RunRecord]) -> None:
                 m_cfg = ARGS_CFG_RE.search(line)
                 if m_cfg:
                     rec.config_path = m_cfg.group(1)
-                    rec.target_mode = rec.target_mode or _load_target_mode(root, rec.config_path)
+                    rec.target_mode = rec.target_mode or _load_target_mode(
+                        root, rec.config_path
+                    )
                     for key, value in _load_run_tags(root, rec.config_path).items():
                         setattr(rec, key, value)
             if rec.target_mode is None and "training_target" in line:
@@ -298,7 +312,9 @@ def parse_metrics_jsonl(root: Path, records: Dict[str, RunRecord]) -> None:
                     rec.params = int(trainable_params)
                 target_mode = payload.get("target_mode")
                 if target_mode:
-                    rec.target_mode = rec.target_mode or str(target_mode).strip().lower()
+                    rec.target_mode = (
+                        rec.target_mode or str(target_mode).strip().lower()
+                    )
             elif event == "validation":
                 metrics = payload.get("metrics") or {}
                 abs_rel = metrics.get("abs_rel")
@@ -348,7 +364,9 @@ def parse_slurm_logs(root: Path, records: Dict[str, RunRecord]) -> None:
                 m_cfg = ARGS_CFG_RE.search(line)
                 if m_cfg:
                     rec.config_path = m_cfg.group(1)
-                    rec.target_mode = rec.target_mode or _load_target_mode(root, rec.config_path)
+                    rec.target_mode = rec.target_mode or _load_target_mode(
+                        root, rec.config_path
+                    )
             if rec.target_mode is None and "training_target" in line:
                 m_target = TARGET_RE.search(line)
                 if m_target:
@@ -419,7 +437,9 @@ def parse_slurm_logs(root: Path, records: Dict[str, RunRecord]) -> None:
 
 def _rank_group(records: List[RunRecord]) -> List[RunRecord]:
     ranked = [
-        r for r in records if r.best_abs_rel is not None and r.run_dir not in {"runs", "."}
+        r
+        for r in records
+        if r.best_abs_rel is not None and r.run_dir not in {"runs", "."}
     ]
     ranked.sort(key=lambda r: (r.best_abs_rel, -(r.best_delta1 or 0.0), r.run_dir))
     return ranked
@@ -450,8 +470,12 @@ def print_ranked(
         first_section = False
         title = f"{target_mode.title()} runs"
         print(title)
-        print("| rank | mode | run | recipe | prefilter | temporal | gate | budget | heuristic | status | abs_rel | delta1 | rmse | si_log | fdv | fps | params | runtime_min | jobs |")
-        print("|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        print(
+            "| rank | mode | run | recipe | prefilter | temporal | gate | budget | heuristic | status | abs_rel | delta1 | rmse | si_log | fdv | fps | params | runtime_min | jobs |"
+        )
+        print(
+            "|---:|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        )
         for i, r in enumerate(ranked[:top_k], start=1):
             params = str(r.params) if r.params is not None else "-"
             fps = f"{r.fps:.1f}" if r.fps is not None else "-"
@@ -491,7 +515,9 @@ def print_fail_patterns(records: Dict[str, RunRecord]) -> None:
     if buckets.get("noop_resume"):
         print("  noop_resume runs:")
         for r in sorted(buckets["noop_resume"], key=lambda x: x.run_dir):
-            print(f"  - {r.run_dir} jobs={','.join(sorted(r.job_ids)) if r.job_ids else '-'}")
+            print(
+                f"  - {r.run_dir} jobs={','.join(sorted(r.job_ids)) if r.job_ids else '-'}"
+            )
 
     if buckets.get("failed"):
         print("  failed runs:")
@@ -557,7 +583,9 @@ def write_csv(path: Path, rows: List[tuple[str, int, RunRecord]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Aggregate FocusMamba run logs into a ranked table.")
+    ap = argparse.ArgumentParser(
+        description="Aggregate FocusMamba run logs into a ranked table."
+    )
     ap.add_argument("--root", type=Path, default=Path("."))
     ap.add_argument("--csv", type=Path, default=None, help="Optional CSV output path.")
     ap.add_argument("--top-k", type=int, default=200)

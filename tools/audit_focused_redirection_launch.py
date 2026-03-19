@@ -170,13 +170,23 @@ def build_method_signature(cfg: dict[str, Any]) -> MethodSignature:
     if bool(model_cfg.get("prefilter_enabled", False)):
         prefilter = str(model_cfg.get("prefilter_type", "none")).strip().lower()
         if prefilter == "stats_align":
-            target_mean = _round_tuple(model_cfg.get("prefilter_target_mean")) or DEFAULT_STATS_ALIGN_MEAN
-            target_std = _round_tuple(model_cfg.get("prefilter_target_std")) or DEFAULT_STATS_ALIGN_STD
+            target_mean = (
+                _round_tuple(model_cfg.get("prefilter_target_mean"))
+                or DEFAULT_STATS_ALIGN_MEAN
+            )
+            target_std = (
+                _round_tuple(model_cfg.get("prefilter_target_std"))
+                or DEFAULT_STATS_ALIGN_STD
+            )
 
     temporal_adapter = "off"
     if bool(model_cfg.get("pre_temporal_stage_adapter_enabled", False)):
-        raw_stages = model_cfg.get("pre_temporal_stage_adapter_stages", ["layer3", "layer4"]) or ["layer3", "layer4"]
-        normalized_stages = sorted({str(stage).strip().lower().replace("_", "") for stage in raw_stages})
+        raw_stages = model_cfg.get(
+            "pre_temporal_stage_adapter_stages", ["layer3", "layer4"]
+        ) or ["layer3", "layer4"]
+        normalized_stages = sorted(
+            {str(stage).strip().lower().replace("_", "") for stage in raw_stages}
+        )
         temporal_adapter = "+".join(normalized_stages) if normalized_stages else "on"
 
     gate, gate_mask = _gate_label(model_cfg)
@@ -192,16 +202,28 @@ def build_method_signature(cfg: dict[str, Any]) -> MethodSignature:
         reset_interval=int(model_cfg.get("stream_reset_interval", 0) or 0),
         cache_len=int(model_cfg.get("stream_max_cache_len", 0) or 0),
         freeze_backbone=bool(training_cfg.get("freeze_backbone", False)),
-        unfreeze_prefixes=tuple(str(v) for v in (training_cfg.get("unfreeze_prefixes", []) or [])),
+        unfreeze_prefixes=tuple(
+            str(v) for v in (training_cfg.get("unfreeze_prefixes", []) or [])
+        ),
         curriculum=_normalize_curriculum(degradation_cfg.get("curriculum")),
         temporal_weight=round(float(loss_cfg.get("temporal_weight", 0.0) or 0.0), 6),
-        temporal_threshold=round(float(loss_cfg.get("temporal_threshold", 0.0) or 0.0), 6),
+        temporal_threshold=round(
+            float(loss_cfg.get("temporal_threshold", 0.0) or 0.0), 6
+        ),
         clean_consistency_weight=round(
             float(aux_cfg.get("clean_depth_consistency_weight", 0.0) or 0.0), 6
         ),
-        clean_consistency_mode=str(aux_cfg.get("clean_depth_consistency_mode", "") or "").strip().lower(),
-        train_budget=data_cfg.get("max_train_trajectories", data_cfg.get("max_trajectories")),
-        val_budget=data_cfg.get("max_val_trajectories", data_cfg.get("max_trajectories")),
+        clean_consistency_mode=str(
+            aux_cfg.get("clean_depth_consistency_mode", "") or ""
+        )
+        .strip()
+        .lower(),
+        train_budget=data_cfg.get(
+            "max_train_trajectories", data_cfg.get("max_trajectories")
+        ),
+        val_budget=data_cfg.get(
+            "max_val_trajectories", data_cfg.get("max_trajectories")
+        ),
         max_epochs=int(training_cfg.get("max_epochs", 0) or 0),
     )
 
@@ -259,7 +281,9 @@ def _run(cmd: list[str], cwd: Path) -> str:
 
 def get_running_job_ids(project_root: Path) -> set[str]:
     try:
-        out = _run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i"], project_root)
+        out = _run(
+            ["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i"], project_root
+        )
     except Exception:
         return set()
     return {line.strip() for line in out.splitlines() if line.strip()}
@@ -272,14 +296,27 @@ def infer_config_path(project_root: Path, run_dir: Path) -> Path | None:
             match = CONFIG_RE.search(line)
             if match:
                 config_path = Path(match.group(1).strip())
-                return config_path if config_path.is_absolute() else project_root / config_path
-    generated_guess = project_root / "configs" / "experiments" / "generated" / run_dir.parent.name / f"{run_dir.name}.yaml"
+                return (
+                    config_path
+                    if config_path.is_absolute()
+                    else project_root / config_path
+                )
+    generated_guess = (
+        project_root
+        / "configs"
+        / "experiments"
+        / "generated"
+        / run_dir.parent.name
+        / f"{run_dir.name}.yaml"
+    )
     if generated_guess.is_file():
         return generated_guess
     return None
 
 
-def read_metrics(metrics_path: Path) -> tuple[float | None, int | None, str | None, int | None]:
+def read_metrics(
+    metrics_path: Path,
+) -> tuple[float | None, int | None, str | None, int | None]:
     best_abs_rel = None
     best_epoch = None
     latest_event = None
@@ -310,7 +347,9 @@ def read_job_ids(run_dir: Path) -> tuple[str, ...]:
     return tuple(sorted(job_ids))
 
 
-def infer_status(run_dir: Path, latest_event: str | None, running_job_ids: set[str]) -> str:
+def infer_status(
+    run_dir: Path, latest_event: str | None, running_job_ids: set[str]
+) -> str:
     if latest_event == "run_complete":
         return "completed"
     job_ids = read_job_ids(run_dir)
@@ -323,7 +362,9 @@ def infer_status(run_dir: Path, latest_event: str | None, running_job_ids: set[s
     return "unknown"
 
 
-def load_existing_runs(project_root: Path, roots: list[Path], running_job_ids: set[str]) -> list[ExistingRun]:
+def load_existing_runs(
+    project_root: Path, roots: list[Path], running_job_ids: set[str]
+) -> list[ExistingRun]:
     records: list[ExistingRun] = []
     for root in roots:
         if not root.exists():
@@ -335,7 +376,9 @@ def load_existing_runs(project_root: Path, roots: list[Path], running_job_ids: s
                 continue
             cfg = load_config(config_path)
             method = build_method_signature(cfg)
-            best_abs_rel, best_epoch, latest_event, latest_epoch = read_metrics(metrics_path)
+            best_abs_rel, best_epoch, latest_event, latest_epoch = read_metrics(
+                metrics_path
+            )
             status = infer_status(run_dir, latest_event, running_job_ids)
             records.append(
                 ExistingRun(
@@ -376,10 +419,20 @@ def select_best_match(matches: list[ExistingRun]) -> ExistingRun | None:
 
 
 def decide(candidate: Candidate, existing_runs: list[ExistingRun]) -> dict[str, str]:
-    exact_matches = [rec for rec in existing_runs if rec.method_signature == candidate.method_signature]
-    related_matches = [rec for rec in existing_runs if rec.family_signature == candidate.family_signature]
+    exact_matches = [
+        rec
+        for rec in existing_runs
+        if rec.method_signature == candidate.method_signature
+    ]
+    related_matches = [
+        rec
+        for rec in existing_runs
+        if rec.family_signature == candidate.family_signature
+    ]
     exact_running = [rec for rec in exact_matches if rec.status == "running"]
-    exact_completed = [rec for rec in exact_matches if rec.status in {"completed", "stopped_with_val"}]
+    exact_completed = [
+        rec for rec in exact_matches if rec.status in {"completed", "stopped_with_val"}
+    ]
 
     decision = "launch_now"
     reason = "no exact method match in running or recent runs"
@@ -404,11 +457,15 @@ def decide(candidate: Candidate, existing_runs: list[ExistingRun]) -> dict[str, 
         "match_suite": match.suite if match else "",
         "match_run": match.run if match else "",
         "match_status": match.status if match else "",
-        "match_abs_rel": "" if match is None or match.best_abs_rel is None else f"{match.best_abs_rel:.6f}",
+        "match_abs_rel": ""
+        if match is None or match.best_abs_rel is None
+        else f"{match.best_abs_rel:.6f}",
         "related_suite": related.suite if related else "",
         "related_run": related.run if related else "",
         "related_status": related.status if related else "",
-        "related_abs_rel": "" if related is None or related.best_abs_rel is None else f"{related.best_abs_rel:.6f}",
+        "related_abs_rel": ""
+        if related is None or related.best_abs_rel is None
+        else f"{related.best_abs_rel:.6f}",
     }
 
 
@@ -488,12 +545,19 @@ def main() -> None:
     suite_dir = Path(args.candidate_suite)
     if not suite_dir.is_absolute():
         suite_dir = project_root / suite_dir
-    existing_roots = [Path(p) if Path(p).is_absolute() else project_root / p for p in (args.existing_root or [])]
+    existing_roots = [
+        Path(p) if Path(p).is_absolute() else project_root / p
+        for p in (args.existing_root or [])
+    ]
     if not existing_roots:
         existing_roots = [project_root / p for p in DEFAULT_EXISTING_ROOTS]
 
-    audit_path = Path(args.audit_tsv) if args.audit_tsv else suite_dir / "launch_audit.tsv"
-    launch_path = Path(args.launch_tsv) if args.launch_tsv else suite_dir / "launch_jobs.tsv"
+    audit_path = (
+        Path(args.audit_tsv) if args.audit_tsv else suite_dir / "launch_audit.tsv"
+    )
+    launch_path = (
+        Path(args.launch_tsv) if args.launch_tsv else suite_dir / "launch_jobs.tsv"
+    )
     if not audit_path.is_absolute():
         audit_path = project_root / audit_path
     if not launch_path.is_absolute():
@@ -502,7 +566,9 @@ def main() -> None:
     candidates = load_candidates(project_root, suite_dir)
     running_job_ids = get_running_job_ids(project_root)
     existing_runs = load_existing_runs(project_root, existing_roots, running_job_ids)
-    launch_count, total = write_audit(audit_path, launch_path, candidates, existing_runs)
+    launch_count, total = write_audit(
+        audit_path, launch_path, candidates, existing_runs
+    )
 
     print(f"Audited {total} candidate jobs against {len(existing_runs)} recent runs.")
     print(f"Launch-now jobs: {launch_count}")
