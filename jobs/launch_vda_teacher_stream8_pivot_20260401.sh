@@ -4,8 +4,8 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/projects/b5dh/FocusMamba}"
 RUNNER="${RUNNER:-jobs/run_train_vda_small_scratch_distill.sh}"
 BENCH_RUNNER="${BENCH_RUNNER:-jobs/run_vda_degraded_benchmark.sh}"
-CFG_DIR="${CFG_DIR:-configs/experiments/generated/vda_speed_pivot_20260401}"
-BENCH_ROOT="${BENCH_ROOT:-runs/vda_degraded_benchmark/stream8_speed_pivot_$(date -u +%Y%m%d_%H%M%S)}"
+CFG_DIR="${CFG_DIR:-configs/experiments/generated/vda_teacher_stream8_pivot_20260401}"
+BENCH_ROOT="${BENCH_ROOT:-runs/vda_degraded_benchmark/teacher_stream8_pivot_$(date -u +%Y%m%d_%H%M%S)}"
 
 cd "$PROJECT_DIR"
 
@@ -20,15 +20,15 @@ project_dir = Path(sys.argv[1])
 cfg_dir = Path(sys.argv[2])
 
 bases = {
-    "01_quality_gate_stream8.yaml": project_dir / "configs/experiments/generated/vda_bug_hunt_promotions_20260319/04_quality_gate_whole_dataset.yaml",
-    "02_degradation_conditioned_stream8.yaml": project_dir / "configs/experiments/generated/vda_bug_hunt_promotions_20260319/07_degradation_conditioned_gate_whole_dataset.yaml",
+    "01_quality_gate_anchor_stream8.yaml": project_dir / "configs/experiments/generated/vda_teacher_whole_dataset_20260401/02_quality_gate_anchor_vda.yaml",
+    "02_degradation_conditioned_anchor_stream8.yaml": project_dir / "configs/experiments/generated/vda_teacher_whole_dataset_20260401/04_degradation_conditioned_gate_anchor_vda.yaml",
 }
 
 for name, base_path in bases.items():
     cfg = yaml.safe_load(base_path.read_text()) or {}
     run_stem = Path(name).stem
-    run_dir = f"runs/vda_speed_pivot_20260401/{run_stem}"
-    ckpt_dir = f"checkpoints/vda_speed_pivot_20260401/{run_stem}"
+    run_dir = f"runs/vda_teacher_stream8_pivot_20260401/{run_stem}"
+    ckpt_dir = f"checkpoints/vda_teacher_stream8_pivot_20260401/{run_stem}"
 
     model = cfg.setdefault("model", {})
     model["mode"] = "streaming_emulated"
@@ -105,42 +105,42 @@ submit_bench() {
     "$BENCH_RUNNER"
 }
 
-cfg_q="${CFG_DIR}/01_quality_gate_stream8.yaml"
-cfg_d="${CFG_DIR}/02_degradation_conditioned_stream8.yaml"
+cfg_q="${CFG_DIR}/01_quality_gate_anchor_stream8.yaml"
+cfg_d="${CFG_DIR}/02_degradation_conditioned_anchor_stream8.yaml"
 
-echo "Submitting stream8 speed-pivot VDA whole-dataset jobs from $CFG_DIR"
+echo "Submitting teacher-enabled stream8 speed-pivot VDA jobs from $CFG_DIR"
 
-jid_q="$(submit_train "vdaS8Q" "$cfg_q")"
-jid_d="$(submit_train "vdaS8D" "$cfg_d")"
+jid_q="$(submit_train "vdaT8Q" "$cfg_q")"
+jid_d="$(submit_train "vdaT8D" "$cfg_d")"
 
-bench_q_dir="${BENCH_ROOT}/quality_gate_stream8"
-bench_d_dir="${BENCH_ROOT}/degradation_conditioned_stream8"
+bench_q_dir="${BENCH_ROOT}/quality_gate_anchor_stream8"
+bench_d_dir="${BENCH_ROOT}/degradation_conditioned_anchor_stream8"
 mkdir -p "$bench_q_dir" "$bench_d_dir"
 
 jid_bq="$(
   submit_bench \
-    "vdaBS8Q" \
+    "vdaBT8Q" \
     "$jid_q" \
-    "runs/vda_speed_pivot_20260401/01_quality_gate_stream8/config_snapshot.yaml" \
-    "checkpoints/vda_speed_pivot_20260401/01_quality_gate_stream8/best.pt" \
-    "quality_gate_stream8" \
+    "runs/vda_teacher_stream8_pivot_20260401/01_quality_gate_anchor_stream8/config_snapshot.yaml" \
+    "checkpoints/vda_teacher_stream8_pivot_20260401/01_quality_gate_anchor_stream8/best.pt" \
+    "teacher_quality_gate_anchor_stream8" \
     "$bench_q_dir"
 )"
 jid_bd="$(
   submit_bench \
-    "vdaBS8D" \
+    "vdaBT8D" \
     "$jid_d" \
-    "runs/vda_speed_pivot_20260401/02_degradation_conditioned_stream8/config_snapshot.yaml" \
-    "checkpoints/vda_speed_pivot_20260401/02_degradation_conditioned_stream8/best.pt" \
-    "degradation_conditioned_stream8" \
+    "runs/vda_teacher_stream8_pivot_20260401/02_degradation_conditioned_anchor_stream8/config_snapshot.yaml" \
+    "checkpoints/vda_teacher_stream8_pivot_20260401/02_degradation_conditioned_anchor_stream8/best.pt" \
+    "teacher_degradation_conditioned_anchor_stream8" \
     "$bench_d_dir"
 )"
 
 echo "Submitted jobs:"
-echo "  ${jid_q}   vdaS8Q   ${cfg_q}"
-echo "  ${jid_d}   vdaS8D   ${cfg_d}"
-echo "  ${jid_bq}  vdaBS8Q  afterok:${jid_q} quality-gate stream8 benchmark"
-echo "  ${jid_bd}  vdaBS8D  afterok:${jid_d} degradation-conditioned stream8 benchmark"
+echo "  ${jid_q}   vdaT8Q   ${cfg_q}"
+echo "  ${jid_d}   vdaT8D   ${cfg_d}"
+echo "  ${jid_bq}  vdaBT8Q  afterok:${jid_q} quality-gate anchor stream8 benchmark"
+echo "  ${jid_bd}  vdaBT8D  afterok:${jid_d} degradation-conditioned anchor stream8 benchmark"
 
 echo
 echo "Queue snapshot:"
