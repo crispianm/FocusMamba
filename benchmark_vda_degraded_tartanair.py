@@ -73,6 +73,22 @@ def parse_args() -> argparse.Namespace:
         help="Dataset resize H,W. Defaults to 518,518 to match VDA training resolution.",
     )
     parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Optional fine-tuned checkpoint to benchmark instead of the stock VDA weights.",
+    )
+    parser.add_argument(
+        "--checkpoint-label",
+        default=None,
+        help="Label for --checkpoint-path in summaries. Defaults to the checkpoint stem.",
+    )
+    parser.add_argument(
+        "--checkpoint-variant",
+        default=None,
+        help="Override model variant for --checkpoint-path. Defaults to config.model.variant.",
+    )
+    parser.add_argument(
         "--inference-size",
         default=None,
         help="Optional H,W model inference size. Example: 392,392",
@@ -96,15 +112,50 @@ def parse_models(raw_models: str) -> list[str]:
     return deduped
 
 
-def parse_hw(raw_hw: str | None) -> tuple[int, int] | None:
+def resolve_model_specs(
+    args: argparse.Namespace, cfg: dict[str, Any]
+) -> list[dict[str, Any]]:
+    if args.checkpoint_path is not None:
+        variant = str(
+            args.checkpoint_variant or cfg.get("model", {}).get("variant", "small")
+        ).strip()
+        label = str(args.checkpoint_label or args.checkpoint_path.stem).strip()
+        if not label:
+            label = args.checkpoint_path.stem
+        return [
+            {
+                "name": label,
+                "variant": variant,
+                "checkpoint_path": args.checkpoint_path,
+            }
+        ]
+
+    return [
+        {
+            "name": model_name,
+            "variant": model_name,
+            "checkpoint_path": DEFAULT_CHECKPOINTS[model_name],
+        }
+        for model_name in parse_models(args.models)
+    ]
+
+
+def parse_hw(
+    raw_hw: str | None, *, arg_name: str = "--inference-size"
+) -> tuple[int, int] | None:
     if raw_hw is None:
         return None
-    parts = [part.strip() for part in raw_hw.split(",") if part.strip()]
+    normalized = raw_hw.lower().replace("x", ",")
+    parts = [part.strip() for part in normalized.split(",") if part.strip()]
+    if len(parts) == 1:
+        parts = [parts[0], parts[0]]
     if len(parts) != 2:
-        raise ValueError(f"--inference-size must look like H,W. Got {raw_hw!r}")
+        raise ValueError(
+            f"{arg_name} must look like H,W, HxW, or a single square size. Got {raw_hw!r}"
+        )
     height, width = int(parts[0]), int(parts[1])
     if height <= 0 or width <= 0:
-        raise ValueError(f"--inference-size must use positive integers. Got {raw_hw!r}")
+        raise ValueError(f"{arg_name} must use positive integers. Got {raw_hw!r}")
     return (height, width)
 
 
@@ -596,11 +647,12 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
-    image_hw = parse_hw(args.image_size)
-    inference_hw = parse_hw(args.inference_size)
-    model_names = parse_models(args.models)
+    image_hw = parse_hw(args.image_size, arg_name="--image-size")
+    inference_hw = parse_hw(args.inference_size, arg_name="--inference-size")
 
     cfg, dataset = load_dataset(args.config, image_hw=image_hw)
+    model_specs = resolve_model_specs(args, cfg)
+    model_names = [str(spec["name"]) for spec in model_specs]
     max_depth = float(cfg["data"].get("max_depth", 80.0))
     num_eval_clips = min(max(int(args.num_eval_clips), 0), len(dataset))
     if num_eval_clips <= 0:
@@ -622,14 +674,15 @@ def main() -> None:
     print(f"image_size={dataset.image_size}")
     if inference_hw is not None:
         print(f"inference_hw={inference_hw}")
-    for model_name in model_names:
-        print(f"{model_name}_checkpoint={DEFAULT_CHECKPOINTS[model_name]}")
+    for spec in model_specs:
+        print(f"{spec['name']}_checkpoint={spec['checkpoint_path']}")
 
     wall_start = time.perf_counter()
-    for model_name in model_names:
-        checkpoint_path = DEFAULT_CHECKPOINTS[model_name]
+    for spec in model_specs:
+        model_name = str(spec["name"])
+        checkpoint_path = Path(spec["checkpoint_path"])
         model = load_model(
-            variant=model_name,
+            variant=str(spec["variant"]),
             checkpoint_path=checkpoint_path,
             num_frames=dataset.num_frames,
             mode=args.mode,
