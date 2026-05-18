@@ -22,10 +22,9 @@ Features:
     - Best-checkpoint saving based on val loss or AbsRel
 
 Usage:
-    python train.py --config configs/experiments/tartanair_v2.yaml
-    python train.py --config configs/experiments/trial_youtube_vos.yaml
-    python train.py --config configs/experiments/tartanair_v2.yaml \\
-        --resume checkpoints/tartanair_v2/latest.pt
+    python train.py --config configs/experiments/sanity_check_clean.yaml
+    python train.py --config configs/experiments/sanity_check_clean.yaml \\
+        --resume checkpoints/sanity/clean/latest.pt
 """
 
 from __future__ import annotations
@@ -931,41 +930,9 @@ def main():
                 ),
                 "use_teacher_signals": val_use_teacher_signals,
             }
-    elif dataset_type == "youtube_vos":
-        from dataloader.youtube_vos import YouTubeVOSDataset
-
-        train_dataset = YouTubeVOSDataset(
-            root=data_cfg.get("root", "data/youtube-vos/train_all_frames/JPEGImages"),
-            num_frames=train_num_frames,
-            image_size=tuple(data_cfg.get("image_size", [256, 256])),
-            max_videos=data_cfg.get("max_videos", None),
-            clip_stride=data_cfg.get("clip_stride", 8),
-            frame_stride=data_cfg.get("frame_stride", 1),
-            split="train",
-            val_fraction=data_cfg.get("val_fraction", 0.1),
-            seed=data_cfg.get("seed", 42),
-        )
-        val_dataset = YouTubeVOSDataset(
-            root=data_cfg.get("root", "data/youtube-vos/train_all_frames/JPEGImages"),
-            num_frames=val_num_frames,
-            image_size=tuple(data_cfg.get("image_size", [256, 256])),
-            max_videos=data_cfg.get("max_videos", None),
-            clip_stride=data_cfg.get("clip_stride", 8),
-            frame_stride=data_cfg.get("frame_stride", 1),
-            split="val",
-            val_fraction=data_cfg.get("val_fraction", 0.1),
-            seed=data_cfg.get("seed", 42),
-        )
-        validation_sets = {
-            "val": {
-                "dataset": val_dataset,
-                "use_teacher_signals": val_use_teacher_signals,
-            }
-        }
-        primary_validation_set = "val"
     else:
         raise ValueError(
-            f"Unknown dataset type: {dataset_type!r}. Use 'tartanair_v2' or 'youtube_vos'."
+            f"Unknown dataset type: {dataset_type!r}. Only 'tartanair_v2' is supported."
         )
 
     if primary_validation_set not in validation_sets:
