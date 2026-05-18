@@ -130,6 +130,7 @@ class DistillationLoss(nn.Module):
         teacher_depths: Dict[str, torch.Tensor],
         mask: Optional[torch.Tensor] = None,
         gt_depth: Optional[torch.Tensor] = None,
+        student_weight_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute distillation loss for the configured teacher subset only."""
         filtered_teachers = self._filter_teacher_depths(teacher_depths)
@@ -137,12 +138,18 @@ class DistillationLoss(nn.Module):
             return {"total": self._zero_loss(student_depth.device)}
 
         if self.strategy == "legacy":
-            return self._forward_legacy(student_depth, filtered_teachers, mask=mask)
+            return self._forward_legacy(
+                student_depth,
+                filtered_teachers,
+                mask=mask,
+                student_weight_map=student_weight_map,
+            )
         return self._forward_heterogeneous(
             student_depth,
             filtered_teachers,
             gt_depth=gt_depth,
             mask=mask,
+            student_weight_map=student_weight_map,
         )
 
     def _forward_legacy(
@@ -150,6 +157,7 @@ class DistillationLoss(nn.Module):
         student_depth: torch.Tensor,
         teacher_depths: Dict[str, torch.Tensor],
         mask: Optional[torch.Tensor] = None,
+        student_weight_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         losses: Dict[str, torch.Tensor] = {}
         weighted_sum = torch.tensor(0.0, device=student_depth.device)
@@ -173,6 +181,9 @@ class DistillationLoss(nn.Module):
                 log_space=(mode == "metric"),
             )
             losses["confidence_mean"] = confidence.mean().detach()
+        confidence = self._combine_weight_maps(confidence, student_weight_map)
+        if student_weight_map is not None:
+            losses["student_weight_mean"] = student_weight_map.mean().detach()
 
         for cfg in self.teacher_configs:
             name = cfg["name"]
@@ -287,6 +298,7 @@ class DistillationLoss(nn.Module):
         *,
         gt_depth: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        student_weight_map: Optional[torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         if self.target_mode != "metric":
             raise ValueError(
@@ -304,10 +316,17 @@ class DistillationLoss(nn.Module):
 
         agg_depth, agg_valid, teacher_mix = self._compute_calibrated_aggregate(prepared)
         if agg_valid.any():
-            agg_loss = self._si_log_weighted(student_depth, agg_depth, mask=agg_valid)
+            agg_loss = self._si_log_weighted(
+                student_depth,
+                agg_depth,
+                mask=agg_valid,
+                weight_map=student_weight_map,
+            )
             losses["distill/agg_si_log"] = agg_loss.detach()
             losses["distill/agg_valid_fraction"] = agg_valid.float().mean().detach()
             components.append(("agg", self.aggregate_weight, agg_loss))
+        if student_weight_map is not None:
+            losses["distill/student_weight_mean"] = student_weight_map.mean().detach()
         for name in self.teacher_names:
             mix = teacher_mix.get(
                 name,
@@ -324,6 +343,7 @@ class DistillationLoss(nn.Module):
                     student_depth,
                     info["calibrated_depth"],
                     info["valid_mask"],
+                    weight_map=student_weight_map,
                 )
                 if aux_loss is None:
                     continue
@@ -506,6 +526,8 @@ class DistillationLoss(nn.Module):
         student_depth: torch.Tensor,
         teacher_depth: torch.Tensor,
         valid_mask: torch.Tensor,
+        *,
+        weight_map: torch.Tensor | None = None,
     ) -> tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
         if not valid_mask.any():
             return None, {}
@@ -514,7 +536,12 @@ class DistillationLoss(nn.Module):
         metrics: Dict[str, torch.Tensor] = {}
 
         if mode == "metric_temporal":
-            si = self._si_log_weighted(student_depth, teacher_depth, mask=valid_mask)
+            si = self._si_log_weighted(
+                student_depth,
+                teacher_depth,
+                mask=valid_mask,
+                weight_map=weight_map,
+            )
             temporal = self._temporal_consistency(
                 student_depth,
                 teacher_depth,
@@ -523,34 +550,50 @@ class DistillationLoss(nn.Module):
             )
             metrics["si_log"] = si.detach()
             metrics["temporal"] = temporal.detach()
-            return si + self.vda_temporal_weight * temporal, metrics
+            combined = si + self.vda_temporal_weight * temporal
+            return combined * self._mean_weight(weight_map, valid_mask), metrics
 
         if mode == "metric_structure":
-            si = self._si_log_weighted(student_depth, teacher_depth, mask=valid_mask)
+            si = self._si_log_weighted(
+                student_depth,
+                teacher_depth,
+                mask=valid_mask,
+                weight_map=weight_map,
+            )
             grad = self.gradient_metric(
                 student_depth, teacher_depth, mask=valid_mask.float()
             )
             metrics["si_log"] = si.detach()
             metrics["gradient"] = grad.detach()
-            return si + self.structure_weight * grad, metrics
+            combined = si + self.structure_weight * grad
+            return combined * self._mean_weight(weight_map, valid_mask), metrics
 
         if mode == "metric":
-            si = self._si_log_weighted(student_depth, teacher_depth, mask=valid_mask)
+            si = self._si_log_weighted(
+                student_depth,
+                teacher_depth,
+                mask=valid_mask,
+                weight_map=weight_map,
+            )
             metrics["si_log"] = si.detach()
-            return si, metrics
+            return si * self._mean_weight(weight_map, valid_mask), metrics
 
         if mode in {"relative_structure", "structure_only"}:
             student_rel = self._normalize_relative_depth(student_depth, valid_mask)
             teacher_rel = self._normalize_relative_depth(teacher_depth, valid_mask)
             rel_l1 = self._relative_l1_weighted(
-                student_rel, teacher_rel, mask=valid_mask
+                student_rel,
+                teacher_rel,
+                mask=valid_mask,
+                weight_map=weight_map,
             )
             grad = self.gradient_relative(
                 student_rel, teacher_rel, mask=valid_mask.float()
             )
             metrics["rel_l1"] = rel_l1.detach()
             metrics["gradient"] = grad.detach()
-            return rel_l1 + self.structure_weight * grad, metrics
+            combined = rel_l1 + self.structure_weight * grad
+            return combined * self._mean_weight(weight_map, valid_mask), metrics
 
         raise ValueError(f"Unsupported distill_mode={mode!r} for teacher {name!r}")
 
@@ -594,6 +637,32 @@ class DistillationLoss(nn.Module):
         for _, weight, loss in active_components:
             total = total + (weight / weight_sum) * loss
         return total
+
+    @staticmethod
+    def _combine_weight_maps(
+        base: torch.Tensor | None,
+        extra: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if base is None:
+            return extra
+        if extra is None:
+            return base
+        return base * extra
+
+    @staticmethod
+    def _mean_weight(
+        weight_map: torch.Tensor | None,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if weight_map is None:
+            device = mask.device if mask is not None else "cpu"
+            return torch.tensor(1.0, device=device, dtype=torch.float32)
+        valid = torch.isfinite(weight_map)
+        if mask is not None:
+            valid = valid & mask.bool()
+        if valid.any():
+            return weight_map[valid].mean()
+        return torch.tensor(1.0, device=weight_map.device, dtype=weight_map.dtype)
 
     def _normalize_relative_depth(
         self,

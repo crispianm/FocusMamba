@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-FocusMamba Training Script — Metric Video Depth Estimation
-============================================================
+VDA-Small Training Script — Metric Video Depth Estimation
+==========================================================
 
 Multi-teacher distillation + GT-supervised training for degradation-robust
-metric depth. Supports TartanAir v2 (with GT depth) and YouTube-VOS
-(teacher pseudo-GT only).
+metric depth. Supports TartanAir v2 with GT depth supervision.
 
 Loss modes:
     - VDA-style GT supervision: SSI + TGM (TartanAir)
@@ -250,7 +249,7 @@ def _should_run_robodepth(
 def _apply_vda_phase1_runtime_guards(cfg: dict, logger: logging.Logger) -> None:
     model_cfg = cfg.get("model", {}) or {}
     model_type = (
-        str(model_cfg.get("type", cfg.get("model_type", "mamba"))).strip().lower()
+        str(model_cfg.get("type", cfg.get("model_type", "video_depth_anything"))).strip().lower()
     )
     if model_type not in {"video_depth_anything", "vda"}:
         return
@@ -258,12 +257,11 @@ def _apply_vda_phase1_runtime_guards(cfg: dict, logger: logging.Logger) -> None:
     loss_cfg = cfg.setdefault("loss", {})
     uncertainty_weight = float(loss_cfg.get("uncertainty_nll_weight", 0.0) or 0.0)
     if uncertainty_weight > 0.0:
-        logger.warning(
-            "Phase-1 VDA runs defer uncertainty-weighted regression. "
-            "Forcing loss.uncertainty_nll_weight from %.4f to 0.0.",
+        logger.info(
+            "VDA uncertainty-enabled training requested "
+            "(loss.uncertainty_nll_weight=%.4f).",
             uncertainty_weight,
         )
-        loss_cfg["uncertainty_nll_weight"] = 0.0
 
 
 def _deep_update_dict(dst: dict, src: dict) -> dict:
@@ -319,7 +317,7 @@ def _audit_vda_checkpoint(model: nn.Module, cfg: dict, logger: logging.Logger) -
 
     model_cfg = cfg.get("model", {}) or {}
     model_type = (
-        str(model_cfg.get("type", cfg.get("model_type", "mamba"))).strip().lower()
+        str(model_cfg.get("type", cfg.get("model_type", "video_depth_anything"))).strip().lower()
     )
     if model_type not in {"video_depth_anything", "vda"}:
         return
@@ -580,7 +578,7 @@ def _build_optimizer(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train FocusMamba — Metric Depth")
+    parser = argparse.ArgumentParser(description="Train VDA-Small — Metric Depth")
     parser.add_argument(
         "--config", type=str, default="configs/experiments/tartanair_v2.yaml"
     )
@@ -603,7 +601,7 @@ def main():
         default_log_dir=f"runs/{Path(args.config).stem}",
     )
     logger = setup_logger(
-        "focusmamba.train",
+        "vda.train",
         debug=args.debug,
         log_file=artifacts.verbose_log_file,
         use_rich=True,
@@ -679,7 +677,7 @@ def main():
     _apply_freeze_cfg(model, train_cfg, logger)
     _audit_vda_checkpoint(model, cfg, logger)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    model_type = cfg.get("model", {}).get("type", "mamba")
+    model_type = cfg.get("model", {}).get("type", "video_depth_anything")
     logger.info("Student: %s | Parameters: %s", model_type, f"{n_params:,}")
     metric_bridge_mode = getattr(model, "metric_bridge_mode", "none")
     if metric_bridge_mode and metric_bridge_mode != "none":
@@ -701,7 +699,7 @@ def main():
     # unused parameters for these model families.
     ddp_find_unused_cfg = train_cfg.get("ddp_find_unused_parameters", None)
     if ddp_find_unused_cfg is None:
-        ddp_find_unused = model_type in ("video_depth_anything", "mamba")
+        ddp_find_unused = model_type in ("video_depth_anything", "vda")
     else:
         ddp_find_unused = bool(ddp_find_unused_cfg)
 

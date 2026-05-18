@@ -1,9 +1,0 @@
-# Mamba Depth — Base variant (default)
-# Inherits from base.yaml, overrides model config
-model:
-  type: mamba
-  embed_dim: 96
-  encoder_depths: [2, 2, 4, 2]
-  d_state: 16
-  d_conv: 4
-  expand: 2

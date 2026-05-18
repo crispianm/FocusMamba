@@ -29,7 +29,7 @@ config.yaml
 
 # Vendored / external worktrees
 Video-Depth-Anything/
-configs/experiments/
+configs/experiments/generated/
 zz_info/
 tmp/
 six_runs/

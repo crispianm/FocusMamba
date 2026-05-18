@@ -438,12 +438,16 @@ class VideoDepthAnythingModel(nn.Module):
         self,
         variant: str = "small",
         num_frames: int = 32,
+        predict_uncertainty: bool = False,
         positional_encoding: str = "ape",
         checkpoint_path: str | None = None,
         strict_checkpoint: bool = False,
         mode: str = "offline",
         stream_max_cache_len: int | None = None,
         stream_reset_interval: int = 0,
+        stream_training_mask_probability: float = 0.0,
+        stream_training_mask_fill: str = "previous",
+        stream_training_random_reset_probability: float = 0.0,
         state_gate_enabled: bool = False,
         state_gate_reduction: int = 8,
         state_gate_stage_mask: Sequence[bool] | None = None,
@@ -496,8 +500,20 @@ class VideoDepthAnythingModel(nn.Module):
         self.metric_bridge_mode = "none"
         self.patch_size = 14
         self.max_temporal_length = int(num_frames)
+        self.predict_uncertainty = bool(predict_uncertainty)
         self.default_mode = mode
         self.stream_reset_interval = max(0, int(stream_reset_interval))
+        self.stream_training_mask_probability = max(
+            0.0, float(stream_training_mask_probability)
+        )
+        self.stream_training_mask_fill = str(stream_training_mask_fill).strip().lower()
+        if self.stream_training_mask_fill not in {"previous", "zero", "mean"}:
+            raise ValueError(
+                "stream_training_mask_fill must be one of: previous, zero, mean"
+            )
+        self.stream_training_random_reset_probability = max(
+            0.0, float(stream_training_random_reset_probability)
+        )
         cache_limit = (
             self.max_temporal_length
             if stream_max_cache_len is None
@@ -568,6 +584,11 @@ class VideoDepthAnythingModel(nn.Module):
             if self.refiner_enabled
             else None
         )
+        self.uncertainty_head = None
+        if self.predict_uncertainty:
+            self.uncertainty_head = nn.Conv2d(1, 1, kernel_size=1, bias=True)
+            nn.init.zeros_(self.uncertainty_head.weight)
+            nn.init.zeros_(self.uncertainty_head.bias)
         self.quality_net = (
             QualityNet(
                 in_channels=3,
@@ -674,6 +695,7 @@ class VideoDepthAnythingModel(nn.Module):
             (
                 "prefilter.",
                 "refiner.",
+                "uncertainty_head.",
                 "quality_net.",
                 "aux_restoration_decoder.",
                 "degradation_conditioner.",
@@ -893,6 +915,8 @@ class VideoDepthAnythingModel(nn.Module):
             outputs["gate_stats"] = head_outputs["gate_stats"]
         if "edge_logits" in head_outputs:
             outputs["edge_logits"] = head_outputs["edge_logits"]
+        if "uncertainty" in head_outputs:
+            outputs["uncertainty"] = head_outputs["uncertainty"]
         if "reconstruction" in head_outputs:
             outputs["reconstruction"] = head_outputs["reconstruction"]
         return outputs
@@ -934,6 +958,7 @@ class VideoDepthAnythingModel(nn.Module):
                 "feature_summary",
                 "gate_stats",
                 "edge_logits",
+                "uncertainty",
                 "reconstruction",
             ):
                 if key in outputs:
@@ -945,6 +970,8 @@ class VideoDepthAnythingModel(nn.Module):
             return result
 
         batch_size, _, num_frames, _, _ = self._validate_frames(frames)
+        if self.training:
+            frames = self._apply_stream_training_augmentation(frames)
         state = self.reset_stream_state(batch_size=batch_size, device=frames.device)
         quality_embedding = self._build_quality_embedding(
             frames,
@@ -955,10 +982,19 @@ class VideoDepthAnythingModel(nn.Module):
         gate_steps: list[torch.Tensor] = []
         feature_steps: list[torch.Tensor] = []
         edge_steps: list[torch.Tensor] = []
+        uncertainty_steps: list[torch.Tensor] = []
         reconstruction_steps: list[torch.Tensor] = []
         collect_gate_stats = bool(return_gate_stats and self.state_gate_enabled)
 
         for frame_idx in range(num_frames):
+            if (
+                self.training
+                and self.stream_training_random_reset_probability > 0.0
+                and frame_idx > 0
+                and float(torch.rand((), device=frames.device).item())
+                < self.stream_training_random_reset_probability
+            ):
+                state = self.reset_stream_state(batch_size=batch_size, device=frames.device)
             frame_quality = None
             if quality_embedding is not None:
                 frame_quality = quality_embedding[:, frame_idx : frame_idx + 1, :]
@@ -976,6 +1012,8 @@ class VideoDepthAnythingModel(nn.Module):
                 gate_steps.append(step_outputs["gate_stats"])
             if "edge_logits" in step_outputs:
                 edge_steps.append(step_outputs["edge_logits"])
+            if "uncertainty" in step_outputs:
+                uncertainty_steps.append(step_outputs["uncertainty"])
             if "reconstruction" in step_outputs:
                 reconstruction_steps.append(step_outputs["reconstruction"])
             state = step_outputs["stream_state"]
@@ -987,6 +1025,8 @@ class VideoDepthAnythingModel(nn.Module):
             outputs["gate_stats"] = torch.stack(gate_steps, dim=1)
         if edge_steps:
             outputs["edge_logits"] = torch.cat(edge_steps, dim=2)
+        if uncertainty_steps:
+            outputs["uncertainty"] = torch.cat(uncertainty_steps, dim=2)
         if reconstruction_steps:
             outputs["reconstruction"] = torch.cat(reconstruction_steps, dim=2)
         if return_state:
@@ -1023,6 +1063,39 @@ class VideoDepthAnythingModel(nn.Module):
         std = _materialize_const_tensor(self._std, device=x.device, dtype=x.dtype)
         x = (x - mean) / std
         return x, batch_size, num_frames, height, width, padded_h, padded_w
+
+    def _apply_stream_training_augmentation(
+        self,
+        frames: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.stream_training_mask_probability <= 0.0:
+            return frames
+        batch_size, _, num_frames, _, _ = self._validate_frames(frames)
+        if num_frames <= 1:
+            return frames
+
+        augmented = frames.clone()
+        mask = (
+            torch.rand((batch_size, num_frames), device=frames.device)
+            < self.stream_training_mask_probability
+        )
+        mask[:, 0] = False
+        if not bool(mask.any()):
+            return augmented
+
+        for frame_idx in range(1, num_frames):
+            batch_mask = mask[:, frame_idx]
+            if not bool(batch_mask.any()):
+                continue
+            if self.stream_training_mask_fill == "zero":
+                augmented[batch_mask, :, frame_idx] = 0.0
+            elif self.stream_training_mask_fill == "mean":
+                augmented[batch_mask, :, frame_idx] = frames[batch_mask].mean(dim=2)
+            else:
+                augmented[batch_mask, :, frame_idx] = augmented[
+                    batch_mask, :, frame_idx - 1
+                ]
+        return augmented
 
     def _run_vda_head(
         self,
@@ -1071,10 +1144,13 @@ class VideoDepthAnythingModel(nn.Module):
         hidden_state_list = head_outputs[1]
         gate_stats = head_outputs[2] if len(head_outputs) > 2 else None
 
-        depth_bt = F.interpolate(
+        depth_logits_bt = F.interpolate(
             depth_bt, size=(padded_h, padded_w), mode="bilinear", align_corners=True
         )
-        depth_bt = F.relu(depth_bt)
+        uncertainty_bt = None
+        if self.uncertainty_head is not None:
+            uncertainty_bt = self.uncertainty_head(depth_logits_bt)
+        depth_bt = F.relu(depth_logits_bt)
         depth_bt = depth_bt[:, :, :height, :width]
         depth = (
             depth_bt.unflatten(0, (batch_size, num_frames))
@@ -1097,6 +1173,13 @@ class VideoDepthAnythingModel(nn.Module):
             outputs["gate_stats"] = gate_stats
         if edge_logits is not None:
             outputs["edge_logits"] = edge_logits
+        if uncertainty_bt is not None:
+            uncertainty_bt = uncertainty_bt[:, :, :height, :width]
+            outputs["uncertainty"] = (
+                uncertainty_bt.unflatten(0, (batch_size, num_frames))
+                .permute(0, 2, 1, 3, 4)
+                .contiguous()
+            )
         if self.aux_restoration_decoder is not None and self.training:
             outputs["reconstruction"] = self.aux_restoration_decoder(raw_frames, depth)
         return outputs

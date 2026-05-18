@@ -1,0 +1,89 @@
+# Sanity-check run: VDA-Small fine-tuned on clean TartanAir v2, small subset.
+# Goal: confirm the training pipeline can learn (val abs_rel should decrease over 10 epochs).
+# GT supervision only, no teachers, no degradation.
+
+model:
+  type: video_depth_anything
+  variant: small
+  num_frames: 16
+  positional_encoding: ape
+  checkpoint_path: checkpoints/metric_video_depth_anything_vits.pth
+  strict_checkpoint: false
+  mode: offline
+  stream_max_cache_len: 16
+  stream_reset_interval: 0
+  state_gate_enabled: false
+  prefilter_enabled: false
+  refiner_enabled: false
+  quality_conditioning:
+    enabled: false
+  aux_reconstruction:
+    enabled: false
+  degradation_conditioning:
+    enabled: false
+  pre_temporal_stage_adapter_enabled: false
+
+data:
+  dataset: tartanair_v2
+  root: /projects/b5dh/data/tartanair-v2
+  train_num_frames: 8
+  val_num_frames: 16
+  image_size: [392, 392]
+  max_train_trajectories: 32
+  max_val_trajectories: 8
+  clip_stride: 8
+  frame_stride: 1
+  val_fraction: 0.1
+  seed: 42
+  difficulty: Data_easy
+  camera: lcam_front
+  max_depth: 80.0
+  envs: null
+  teacher_cache_dir: null
+
+teachers: []
+
+distillation:
+  enabled: false
+  teachers: []
+  confidence_weighted: false
+
+degradation:
+  enabled: false
+  curriculum: false
+
+training:
+  max_epochs: 10
+  batch_size: 1
+  learning_rate: 5.0e-5
+  backbone_lr_multiplier: 0.3
+  weight_decay: 0.01
+  warmup_steps: 40
+  grad_clip: 1.0
+  precision: bf16
+  val_every_n_epochs: 1
+  selection_metric: abs_rel
+  ema_decay: 0.999
+  num_workers: 8
+  gradient_accumulation_steps: 4
+  compile: false
+  ddp_find_unused_parameters: true
+  skip_live_teachers: true
+  cpu_prefetch: true
+  cpu_prefetch_batches: 1
+  log_dir: runs/sanity/clean
+  checkpoint_dir: checkpoints/sanity/clean
+  log_images_every_n_steps: 500
+  log_images_max_batch: 2
+  step_log_every_n_steps: 50
+
+loss:
+  training_target: metric
+  ssi_weight: 0.25
+  temporal_weight: 1.0
+  temporal_threshold: 0.05
+  temporal_log_space: false
+  ssi_mode: l2
+  distillation_weight: 0.0
+  metric_l1_weight: 0.5
+  metric_log_l1_weight: 1.0

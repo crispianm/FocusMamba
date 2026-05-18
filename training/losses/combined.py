@@ -42,6 +42,12 @@ class CombinedLoss(nn.Module):
         self.boundary_threshold = float(cfg.get("boundary_threshold", 0.05))
         self.boundary_dilation = int(cfg.get("boundary_dilation", 1))
         self.range_prior_weight = float(cfg.get("range_prior_weight", 0.0))
+        self.uncertainty_nll_weight = float(cfg.get("uncertainty_nll_weight", 0.0))
+        self.uncertainty_target = str(
+            cfg.get("uncertainty_target", "metric_log_l1")
+        ).lower()
+        self.uncertainty_min_logvar = float(cfg.get("uncertainty_min_logvar", -4.0))
+        self.uncertainty_max_logvar = float(cfg.get("uncertainty_max_logvar", 4.0))
         self.min_depth = float(cfg.get("min_depth", 1e-3))
         self.max_depth = float(cfg.get("max_depth", 80.0))
         self.weight_ramp_cfg = cfg.get("weight_ramp", {}) or {}
@@ -199,6 +205,41 @@ class CombinedLoss(nn.Module):
         alpha = (position - start) / max(end - start, self.eps)
         return start_value + (end_value - start_value) * alpha
 
+    def _student_uncertainty(
+        self,
+        student_outputs: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        uncertainty = student_outputs.get("uncertainty")
+        if uncertainty is None:
+            return None, None
+        log_var = uncertainty.clamp(
+            min=self.uncertainty_min_logvar,
+            max=self.uncertainty_max_logvar,
+        )
+        reliability = torch.exp(-log_var.clamp(min=0.0, max=self.uncertainty_max_logvar))
+        return log_var, reliability
+
+    def _laplace_uncertainty_nll(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        log_var: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        log_space: bool,
+    ) -> torch.Tensor:
+        pred_space = torch.log(pred.clamp(min=self.eps)) if log_space else pred
+        target_space = torch.log(target.clamp(min=self.eps)) if log_space else target
+        diff = (pred_space - target_space).abs()
+        weight = torch.exp(-log_var)
+        term = weight * diff + log_var
+        valid = torch.isfinite(term)
+        if mask is not None:
+            valid = valid & mask.bool()
+        if valid.any():
+            return term[valid].mean()
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+
     @staticmethod
     def _flatten_clip(x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, int]:
         b, c, t, h, w = x.shape
@@ -281,6 +322,10 @@ class CombinedLoss(nn.Module):
         range_prior_weight = self._current_weight(
             "range_prior_weight", self.range_prior_weight
         )
+        uncertainty_nll_weight = self._current_weight(
+            "uncertainty_nll_weight", self.uncertainty_nll_weight
+        )
+        student_log_var, student_reliability = self._student_uncertainty(student_outputs)
 
         if mask is None and gt_depth is not None:
             mask = (gt_depth > 0).float()
@@ -295,6 +340,7 @@ class CombinedLoss(nn.Module):
                 teacher_depths,
                 mask=mask,
                 gt_depth=gt_depth,
+                student_weight_map=student_reliability,
             )
             distill_total = distill_losses.get(
                 "total", torch.tensor(0.0, device=student_depth.device)
@@ -343,6 +389,16 @@ class CombinedLoss(nn.Module):
                         losses["tgm"] = tgm_loss.detach()
                     except NotImplementedError:
                         pass
+                if uncertainty_nll_weight > 0 and student_log_var is not None:
+                    uncertainty_nll = self._laplace_uncertainty_nll(
+                        pred_rel,
+                        gt_rel,
+                        log_var=student_log_var,
+                        mask=mask,
+                        log_space=False,
+                    )
+                    total = total + (uncertainty_nll_weight * uncertainty_nll)
+                    losses["uncertainty_nll"] = uncertainty_nll.detach()
             else:
                 aligned_pred = self.ssi.align_scale_shift(
                     student_depth, gt_depth, mask=mask
@@ -388,6 +444,18 @@ class CombinedLoss(nn.Module):
                     range_prior = self._range_prior(student_depth, mask=mask)
                     total = total + (range_prior_weight * range_prior)
                     losses["range_prior"] = range_prior.detach()
+
+                if uncertainty_nll_weight > 0 and student_log_var is not None:
+                    use_log_space = self.uncertainty_target != "metric_l1"
+                    uncertainty_nll = self._laplace_uncertainty_nll(
+                        student_depth,
+                        gt_depth,
+                        log_var=student_log_var,
+                        mask=mask,
+                        log_space=use_log_space,
+                    )
+                    total = total + (uncertainty_nll_weight * uncertainty_nll)
+                    losses["uncertainty_nll"] = uncertainty_nll.detach()
 
                 if self._temporal_loss is not None and temporal_weight > 0:
                     try:
