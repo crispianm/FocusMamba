@@ -9,6 +9,8 @@ Provides:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .video_depth_anything_model import VideoDepthAnythingModel
 
 
@@ -137,6 +139,12 @@ def build_model(cfg: dict) -> "torch.nn.Module":
         raise ValueError(
             f"Unknown model_type '{model_type}'. Must be 'video_depth_anything' or 'vda'."
         )
+
+    # Set is_metric flag: explicit config takes precedence; else auto-detect from
+    # checkpoint name (metric_ prefix → True, anything else → False).
+    ckpt = str(model_cfg.get("checkpoint_path", "") or "")
+    auto_is_metric = Path(ckpt).name.startswith("metric_") if ckpt else True
+    model.is_metric = bool(model_cfg.get("is_metric", auto_is_metric))
 
     return model
 

@@ -382,6 +382,29 @@ def compute_aligned_depth_metrics(
 
 
 @torch.no_grad()
+def compute_disparity_aligned_depth_metrics(
+    disp_pred: torch.Tensor,
+    depth_gt: torch.Tensor,
+    *,
+    aligner,
+    mask: Optional[torch.Tensor] = None,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+) -> Dict[str, float]:
+    """Aligned metrics for affine-invariant (non-metric) models.
+    Aligns in inverse-depth space per the VDA paper evaluation protocol.
+    """
+    aligned = aligner.align_disparity_to_depth(
+        disp_pred.float(), depth_gt.float(), mask=mask, min_depth=min_depth
+    )
+    aligned = torch.nan_to_num(aligned, nan=0.0, posinf=max_depth, neginf=0.0).clamp(
+        min=min_depth
+    )
+    metrics = compute_depth_metrics(aligned, depth_gt.float(), mask=mask)
+    return {f"aligned_{key}": value for key, value in metrics.items()}
+
+
+@torch.no_grad()
 def compute_depth_distribution_metrics(
     pred: torch.Tensor,
     *,
@@ -994,16 +1017,30 @@ def validate(
                     m = compute_depth_metrics(
                         pred_depth.float(), gt_depth.float(), mask=mask
                     )
-                    m.update(
-                        compute_aligned_depth_metrics(
-                            pred_depth.float(),
-                            gt_depth.float(),
-                            aligner=criterion.ssi,
-                            mask=mask,
-                            min_depth=float(getattr(criterion, "min_depth", 1e-3)),
-                            max_depth=float(getattr(criterion, "max_depth", 80.0)),
+                    _min_d = float(getattr(criterion, "min_depth", 1e-3))
+                    _max_d = float(getattr(criterion, "max_depth", 80.0))
+                    if getattr(model, "is_metric", True):
+                        m.update(
+                            compute_aligned_depth_metrics(
+                                pred_depth.float(),
+                                gt_depth.float(),
+                                aligner=criterion.ssi,
+                                mask=mask,
+                                min_depth=_min_d,
+                                max_depth=_max_d,
+                            )
                         )
-                    )
+                    else:
+                        m.update(
+                            compute_disparity_aligned_depth_metrics(
+                                pred_depth.float(),
+                                gt_depth.float(),
+                                aligner=criterion.ssi,
+                                mask=mask,
+                                min_depth=_min_d,
+                                max_depth=_max_d,
+                            )
+                        )
                     m.update(
                         compute_depth_distribution_metrics(
                             pred_depth.float(),

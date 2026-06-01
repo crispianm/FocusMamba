@@ -6,7 +6,7 @@
 model:
   type: video_depth_anything
   variant: small
-  num_frames: 16
+  num_frames: 32
   positional_encoding: ape
   checkpoint_path: checkpoints/metric_video_depth_anything_vits.pth
   strict_checkpoint: false

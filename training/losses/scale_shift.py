@@ -106,3 +106,26 @@ class ScaleShiftInvariantLoss(nn.Module):
             aligned[b] = s * pred[b] + t
 
         return aligned
+
+    @staticmethod
+    def align_disparity_to_depth(
+        pred: torch.Tensor,
+        depth_gt: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        eps: float = 1e-6,
+        min_depth: float = 1e-3,
+    ) -> torch.Tensor:
+        """Align affine-invariant (non-metric) model output to metric depth GT.
+
+        The model output is treated as an arbitrary-scale "depth-like" map whose
+        values linearly correlate with 1/GT_depth.  Solves s*pred + t ≈ 1/GT
+        in disparity space, then converts back: depth = 1/(s*pred + t).
+
+        This is the VDA paper evaluation protocol: "align video inverse depth
+        with GT inverse depth" where the model output IS the "inverse depth".
+        """
+        disp_gt = 1.0 / depth_gt.clamp(min=min_depth)
+        aligned_disp = ScaleShiftInvariantLoss.align_scale_shift(
+            pred, disp_gt, mask=mask, eps=eps
+        )
+        return 1.0 / aligned_disp.clamp(min=min_depth)

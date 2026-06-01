@@ -164,6 +164,16 @@ def _resolve_selection_metric(
         "delta1",
         "delta2",
         "delta3",
+        # Scale-shift-aligned variants — the correct selection signal for
+        # affine-invariant / SSI-only training, where absolute scale is free
+        # and raw abs_rel is uninformative.
+        "aligned_abs_rel",
+        "aligned_sq_rel",
+        "aligned_rmse",
+        "aligned_si_log",
+        "aligned_delta1",
+        "aligned_delta2",
+        "aligned_delta3",
         "fdv",
         "rel_l1",
         "rel_rmse",
@@ -203,6 +213,9 @@ def _selection_metric_higher_is_better(metric: str) -> bool:
         "delta1",
         "delta2",
         "delta3",
+        "aligned_delta1",
+        "aligned_delta2",
+        "aligned_delta3",
         "rel_delta1",
         "boundary_f1",
         "robodepth_fps",
@@ -850,6 +863,76 @@ def main():
             return_clean_reference=need_clean_reference,
             return_degradation_metadata=return_degradation_metadata,
         )
+
+        # Optional extra training datasets concatenated with TartanAir (e.g.
+        # VKITTI to inject KITTI-domain far-range driving depth). They share the
+        # clip length / image size / degradation settings of the main dataset.
+        def _build_vkitti(spec: dict, *, split: str, n_frames: int, deg, clean_and_deg,
+                          clean_ref, deg_meta):
+            from dataloader.vkitti import VKITTIDataset
+
+            return VKITTIDataset(
+                root=spec["root"],
+                num_frames=n_frames,
+                image_size=tuple(data_cfg.get("image_size", [256, 256])),
+                clip_stride=int(spec.get("clip_stride", data_cfg.get("clip_stride", 8))),
+                frame_stride=int(spec.get("frame_stride", data_cfg.get("frame_stride", 1))),
+                split=split,
+                val_fraction=float(spec.get("val_fraction", data_cfg.get("val_fraction", 0.1))),
+                seed=int(data_cfg.get("seed", 42)),
+                max_depth=float(data_cfg.get("max_depth", 80.0)),
+                scenes=spec.get("scenes", None),
+                variants=spec.get("variants", None),
+                cameras=spec.get("cameras", None),
+                degradation=deg,
+                return_clean_and_degraded=clean_and_deg,
+                return_clean_reference=clean_ref,
+                return_degradation_metadata=deg_meta,
+            )
+
+        extra_train_specs = data_cfg.get("extra_train_datasets", []) or []
+        if extra_train_specs:
+            from torch.utils.data import ConcatDataset
+
+            base_len = len(train_dataset)
+            parts = [train_dataset]
+            source_labels = ["tartanair_v2 x1"]
+            for spec in extra_train_specs:
+                if str(spec.get("type", "")).lower() != "vkitti":
+                    raise ValueError(
+                        f"Unknown extra_train_datasets type: {spec.get('type')!r}"
+                    )
+                ds = _build_vkitti(
+                    spec, split="train", n_frames=train_num_frames,
+                    deg=train_degradation,
+                    clean_and_deg=train_degradation is not None,
+                    clean_ref=need_clean_reference,
+                    deg_meta=return_degradation_metadata,
+                )
+                # DDP-safe oversampling: replicate the dataset object so a minority
+                # source keeps a meaningful share of the (proportionally sampled)
+                # combined set. `repeat_to_fraction` targets a per-source fraction
+                # relative to the base (TartanAir) dataset; `repeat` sets it directly.
+                ds_len = max(len(ds), 1)
+                if spec.get("repeat_to_fraction") is not None:
+                    f = float(spec["repeat_to_fraction"])
+                    f = min(max(f, 0.0), 0.95)
+                    k = max(1, round(f / (1.0 - f) * base_len / ds_len))
+                else:
+                    k = max(1, int(spec.get("repeat", 1)))
+                parts.extend([ds] * k)
+                source_labels.append(f"vkitti({ds_len}) x{k}")
+            train_dataset = ConcatDataset(parts)
+            total = len(train_dataset)
+            logger.info(
+                "Combined train dataset: %d clips across %d source-instances [%s]",
+                total, len(parts), ", ".join(source_labels),
+            )
+            logger.info(
+                "  per-source fractions: base=%.2f, extras=%.2f",
+                base_len / total, (total - base_len) / total,
+            )
+
         validation_sets: Dict[str, dict] = {}
         if validation_set_cfgs:
             for raw_set_cfg in validation_set_cfgs:
@@ -880,8 +963,16 @@ def main():
                     and bool(active_teachers)
                     and set_use_teacher_signals
                 )
-                validation_sets[set_name] = {
-                    "dataset": TartanAirV2Dataset(
+                if str(set_cfg.get("type", "tartanair_v2")).lower() == "vkitti":
+                    set_dataset = _build_vkitti(
+                        set_cfg, split="val", n_frames=val_num_frames,
+                        deg=set_degradation,
+                        clean_and_deg=set_degradation is not None,
+                        clean_ref=set_need_clean_reference,
+                        deg_meta=set_return_degradation_metadata,
+                    )
+                else:
+                    set_dataset = TartanAirV2Dataset(
                         root=data_cfg.get("root", "/projects/b5dh/data/tartanair-v2"),
                         num_frames=val_num_frames,
                         image_size=tuple(data_cfg.get("image_size", [256, 256])),
@@ -902,7 +993,9 @@ def main():
                         return_clean_and_degraded=set_degradation is not None,
                         return_clean_reference=set_need_clean_reference,
                         return_degradation_metadata=set_return_degradation_metadata,
-                    ),
+                    )
+                validation_sets[set_name] = {
+                    "dataset": set_dataset,
                     "use_teacher_signals": set_use_teacher_signals,
                 }
         else:
@@ -960,17 +1053,55 @@ def main():
         int(train_cfg.get("val_prefetch_factor", 1)) if val_num_workers > 0 else None
     )
 
-    train_sampler = (
-        DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=local_rank,
-            shuffle=True,
-            drop_last=True,
+    # Balanced (uniform per-dataset) sampling — matches the VDA "uniform
+    # sampler" so each source dataset contributes equally per epoch regardless
+    # of size. Prevents the majority dataset from dominating the optimum.
+    balanced_sampling = bool(data_cfg.get("balanced_sampling", False))
+    from torch.utils.data import ConcatDataset as _ConcatDataset
+
+    if (
+        balanced_sampling
+        and isinstance(train_dataset, _ConcatDataset)
+        and not is_distributed
+    ):
+        from torch.utils.data import WeightedRandomSampler
+
+        sizes = [len(d) for d in train_dataset.datasets]
+        n_sources = len(sizes)
+        sample_weights: List[float] = []
+        for sz in sizes:
+            per = 1.0 / (n_sources * max(sz, 1))  # equal total mass per source
+            sample_weights.extend([per] * sz)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True,
         )
-        if is_distributed
-        else None
-    )
+        logger.info(
+            "Balanced sampler enabled: %d sources, sizes=%s (equal per-source probability)",
+            n_sources, sizes,
+        )
+    elif balanced_sampling and is_distributed:
+        logger.warning(
+            "balanced_sampling not implemented for distributed runs; "
+            "falling back to proportional DistributedSampler."
+        )
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=local_rank,
+            shuffle=True, drop_last=True,
+        )
+    else:
+        train_sampler = (
+            DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=local_rank,
+                shuffle=True,
+                drop_last=True,
+            )
+            if is_distributed
+            else None
+        )
 
     val_samplers = {
         set_name: (
@@ -1452,7 +1583,7 @@ def main():
 
         # Shuffle sampler for this epoch — required so each rank sees a
         # different shard on every epoch; no-op when running single-GPU.
-        if train_sampler is not None:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
         # Update train-time degradation schedule. Validation stays at full severity.

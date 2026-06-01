@@ -216,21 +216,26 @@ class TartanAirV2Dataset(Dataset):
 
         imgs = []
         depths = []
+        masks_raw = []
         for i in indices:
             # Load RGB
             img = Image.open(img_files[i]).convert("RGB")
             t = self._to_tensor(img)  # (3, H, W) float [0, 1]
             imgs.append(t)
 
-            # Load depth
-            depth = _decode_tartanair_depth(str(depth_files[i]))  # (H, W) float32
-            depth = np.clip(depth, 0.0, self.max_depth)
-            depth_t = torch.from_numpy(depth).unsqueeze(0).float()  # (1, H, W)
+            # Load depth — compute validity BEFORE clipping so sky pixels (inf → 80 m)
+            # are excluded from the mask. Without this, every pixel is flagged valid.
+            depth_raw = _decode_tartanair_depth(str(depth_files[i]))  # (H, W) float32; inf for sky
+            valid = np.isfinite(depth_raw) & (depth_raw > 0) & (depth_raw < self.max_depth)
+            depth = np.clip(depth_raw, 0.0, self.max_depth)
+            depth_t = torch.from_numpy(depth).unsqueeze(0).float()          # (1, H, W)
+            mask_t = torch.from_numpy(valid.astype(np.float32)).unsqueeze(0)  # (1, H, W)
             depths.append(depth_t)
+            masks_raw.append(mask_t)
 
-        frames = torch.stack(imgs, dim=1)  # (3, T, H, W)
-        depth = torch.stack(depths, dim=1)  # (1, T, H, W)
-        mask = (depth > 0).float()
+        frames = torch.stack(imgs, dim=1)       # (3, T, H, W)
+        depth = torch.stack(depths, dim=1)      # (1, T, H, W)
+        mask = torch.stack(masks_raw, dim=1)    # (1, T, H, W) — sky excluded
 
         # Resize if needed
         H, W = self.image_size
