@@ -1887,6 +1887,30 @@ def main():
             )
         logger.info("Saved latest checkpoint for epoch %d", epoch + 1)
 
+        # Optionally snapshot a per-epoch checkpoint ladder (diagnostics). Saves
+        # the EMA weights when EMA is active so the ladder matches the validation
+        # trajectory logged above; falls back to raw weights otherwise.
+        save_every = int(train_cfg.get("save_every_n_epochs", 0) or 0)
+        if is_main and save_every > 0 and (epoch + 1) % save_every == 0:
+            epoch_path = ckpt_dir / f"epoch_{epoch + 1}.pt"
+            if ema is not None:
+                ema.apply_shadow()
+                try:
+                    _save_ckpt(
+                        epoch_path, epoch, model, optimizer, scaler, scheduler,
+                        global_step, best_val_loss, selection_metric,
+                        best_selection_value, cfg, ema, model_is_ema=True,
+                    )
+                finally:
+                    ema.restore()
+            else:
+                _save_ckpt(
+                    epoch_path, epoch, model, optimizer, scaler, scheduler,
+                    global_step, best_val_loss, selection_metric,
+                    best_selection_value, cfg, ema, model_is_ema=False,
+                )
+            logger.info("Saved per-epoch checkpoint ladder: %s", epoch_path.name)
+
     # -----------------------------------------------------------------------
     # Final profiling (rank 0 only)
     # -----------------------------------------------------------------------
