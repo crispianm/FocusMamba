@@ -1570,6 +1570,19 @@ def main():
     unfreeze_backbone_epoch = train_cfg.get("unfreeze_backbone_epoch")
     backbone_unfrozen = not bool(train_cfg.get("freeze_backbone", False))
 
+    # Optional per-epoch abort guard: stop the whole job if a watched degraded
+    # validation metric fails to match prior runs (absolute ceiling) or erodes
+    # too far from its own best, after a few epochs. Lets us "stop and investigate"
+    # rather than burn the full schedule. See configs/.../degraded_ft_wdda_lr1e5_hpc.yaml.
+    abort_cfg = train_cfg.get("validation_abort", {}) or {}
+    abort_enabled = bool(abort_cfg.get("enabled", False))
+    abort_set = str(abort_cfg.get("validation_set", "val_vkitti_degraded"))
+    abort_metric = str(abort_cfg.get("metric", "aligned_abs_rel"))
+    abort_start_epoch = int(abort_cfg.get("start_epoch", 3))
+    abort_ceiling = abort_cfg.get("ceiling")
+    abort_max_erosion = abort_cfg.get("max_erosion_from_best")
+    best_abort_metric = float("inf")
+
     for epoch in epoch_bar:
         epoch_t0 = time.time()
 
@@ -1677,6 +1690,7 @@ def main():
         # -------------------------------------------------------------------
         # Validation
         # -------------------------------------------------------------------
+        abort_reason = None
         if (epoch + 1) % val_every == 0 or epoch == max_epochs - 1:
             # Use EMA weights for validation if available
             if ema is not None:
@@ -1758,6 +1772,29 @@ def main():
             delta1 = primary_val_metrics.get("delta1", 0.0)
             selection_value = _extract_selection_value(val_metrics, selection_metric)
             saved_best = False
+
+            # Per-epoch abort guard (rank 0 decides; sys.exit below is after ckpt saves)
+            if abort_enabled:
+                watched = validation_metrics_by_name.get(abort_set, {}).get(abort_metric)
+                if watched is not None and math.isfinite(watched):
+                    if watched < best_abort_metric:
+                        best_abort_metric = watched
+                    if (epoch + 1) >= abort_start_epoch:
+                        if abort_ceiling is not None and watched > float(abort_ceiling):
+                            abort_reason = (
+                                "%s[%s]=%.4f exceeds ceiling %.4f at epoch %d"
+                                % (abort_set, abort_metric, watched,
+                                   float(abort_ceiling), epoch + 1)
+                            )
+                        elif (
+                            abort_max_erosion is not None
+                            and watched > best_abort_metric + float(abort_max_erosion)
+                        ):
+                            abort_reason = (
+                                "%s[%s]=%.4f eroded >%.4f above best %.4f at epoch %d"
+                                % (abort_set, abort_metric, watched,
+                                   float(abort_max_erosion), best_abort_metric, epoch + 1)
+                            )
             if is_main:
                 for set_name, set_metrics in validation_metrics_by_name.items():
                     logger.info(
@@ -1910,6 +1947,16 @@ def main():
                     best_selection_value, cfg, ema, model_is_ema=False,
                 )
             logger.info("Saved per-epoch checkpoint ladder: %s", epoch_path.name)
+
+        # Per-epoch abort: latest.pt + ladder are now on disk for inspection, so
+        # stop the whole job (all ranks under torchrun) and let us investigate.
+        if abort_reason is not None:
+            logger.error("ABORTING training: %s", abort_reason)
+            if is_main:
+                tqdm.write(f"  -> ABORT: {abort_reason}")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.exit(2)
 
     # -----------------------------------------------------------------------
     # Final profiling (rank 0 only)
