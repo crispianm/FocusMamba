@@ -448,10 +448,36 @@ is relatively diluted vs the local 2-env + 29%-VKITTI mix. HPC degraded-FT still
 baseline. Bumping `repeat_to_fraction` (more VKITTI) or selecting on a KITTI-domain proxy should
 recover the 0.108 — a lever to test once architecture changes begin against this validated baseline.
 
+### Why the epoch-1 sweet-spot? (degraded-erosion investigation)
+
+A dedicated investigation (`degraded_erosion_investigation/`) pinned down the cause. Across all
+runs, degraded-input depth shows a clear physical signature as training proceeds: predicted
+depth-range (`pred_depth_span`) **collapses** (≈110→14) and `boundary_f1` **halves**, while on clean
+input span stays wide and boundary_f1 *rises*. A per-epoch checkpoint ladder evaluated across a
+degradation **severity grid × 3 seeds** (small-data run that faithfully reproduces the peak) shows:
+
+- **Not an artifact.** Across 3 independent degradation seeds the metrics are nearly identical
+  (ep6 sev1.0: 0.508/0.503/0.491) → rules out a fixed-seed/severity quirk and alignment instability.
+- **Real, severity-dependent robustness loss.** Error worsens after epoch 1 at *every* severity, but
+  the magnitude scales with severity: clean +22% (0.157→0.191, span ~flat) vs full-degradation +65%
+  (0.30→0.50, span 21→9.6). The model overfits to sharp clean-structure cues; the more degradation
+  removes them, the harder the prediction collapses to a flat, edge-poor mean-depth that scale-shift
+  alignment cannot recover.
+- **Ablations.** Lower LR (5e-5→1e-5) is the dominant lever — best epoch-1 model *and* a nearly flat
+  trajectory (TartanAir essentially no erosion) with the best span retention. EMA and TGM are **not**
+  the cause (erosion persists/worsens without them). Forcing *harder* training degradation backfires
+  (span collapses to ~2), positively confirming the detail-dependence mechanism.
+
+**Implication.** The epoch-1 stop is overfitting-driven loss of degradation robustness, not a bug;
+`aligned_abs_rel` selection already early-stops correctly. A genuine fix (beyond early-stopping)
+needs to decouple predicted depth structure from input sharpness — a concrete target for the
+architecture phase: prevent range collapse under degradation (e.g. clean↔degraded
+consistency/feature alignment).
+
 ### Remaining work for paper-quality results
 - Add parameter-count reporting alongside the FPS numbers now recorded.
 - Seed averaging (≥3) and bootstrap CIs per the Scientific Validity Rules.
-- Then begin model-architecture modifications on this validated, scaled baseline.
+- Architecture modifications targeting degradation range-collapse, on this validated baseline.
 
 ## 6. Code changes made this session
 

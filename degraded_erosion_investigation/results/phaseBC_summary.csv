@@ -1,0 +1,7 @@
+run,vkitti_sev1.0_ep1,vkitti_sev1.0_ep6,erosion_from_peak
+base_small,0.3033,0.5008,0.1975
+c1_no_ema,0.3937,0.4377,0.0642
+c2_no_tgm,0.3111,0.4310,0.1199
+c3_low_lr,0.2379,0.2966,0.0587
+c4_clean_mix,0.2600,0.3564,0.0964
+c5_severe_curriculum,0.4104,0.5098,0.0994
