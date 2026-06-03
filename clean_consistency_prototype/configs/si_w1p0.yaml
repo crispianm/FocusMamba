@@ -1,0 +1,190 @@
+# Clean-consistency prototype arm: si (scale-shift-invariant) consistency, weight=1.0
+# Derived from degraded_arch_ablation/B_wdda.yaml (WDDA, 5e-5, 6ep, ladder).
+model:
+  type: video_depth_anything
+  variant: small
+  num_frames: 32
+  positional_encoding: ape
+  checkpoint_path: checkpoints/metric_video_depth_anything_vits.pth
+  is_metric: true
+  strict_checkpoint: false
+  mode: offline
+  stream_max_cache_len: 16
+  stream_reset_interval: 0
+  state_gate_enabled: false
+  prefilter_enabled: false
+  refiner_enabled: false
+  quality_conditioning:
+    enabled: false
+  aux_reconstruction:
+    enabled: false
+  degradation_conditioning:
+    enabled: false
+  pre_temporal_stage_adapter_enabled: false
+  wdda_enabled: true
+  wdda_stages:
+  - patch
+  - block0
+  - block1
+  rdyfn_enabled: false
+  c2c_distill_enabled: false
+  token_router_enabled: false
+data:
+  dataset: tartanair_v2
+  root: /mnt/DATA/DegradedDepth/data/tartanair-v2
+  train_num_frames: 8
+  val_num_frames: 8
+  image_size:
+  - 518
+  - 518
+  max_train_trajectories: null
+  max_val_trajectories: null
+  clip_stride: 8
+  frame_stride: 1
+  val_fraction: 0.1
+  seed: 42
+  difficulty: Data_easy
+  camera: lcam_front
+  max_depth: 80.0
+  envs:
+  - Slaughter
+  - NordicHarbor
+  teacher_cache_dir: null
+  extra_train_datasets:
+  - type: vkitti
+    root: /mnt/DATA/DegradedDepth/data/vkitti
+    scenes:
+    - Scene01
+    - Scene02
+    - Scene06
+    - Scene20
+    variants:
+    - clone
+    - morning
+    - overcast
+    - sunset
+    cameras:
+    - Camera_0
+    - Camera_1
+    clip_stride: 8
+    frame_stride: 1
+teachers: []
+distillation:
+  enabled: false
+  teachers: []
+  confidence_weighted: false
+degradation:
+  enabled: true
+  policy: v2_lowlight
+  clean_probability: 0.0
+  curriculum: false
+  time_mode: clip_constant
+  return_params: true
+  summary: true
+  drift:
+    enabled: false
+  events:
+    enabled: false
+  processing:
+    probability: 0.0
+  sensor:
+    probability: 0.0
+validation:
+  use_teacher_signals: false
+  primary_set: val_vkitti_degraded
+  sets:
+  - name: val_vkitti_degraded
+    type: vkitti
+    root: /mnt/DATA/DegradedDepth/data/vkitti
+    scenes:
+    - Scene18
+    variants:
+    - clone
+    cameras:
+    - Camera_0
+    degradation:
+      enabled: true
+      policy: v2_lowlight
+      clean_probability: 0.0
+      curriculum: false
+      time_mode: clip_constant
+      return_params: true
+      summary: true
+      drift:
+        enabled: false
+      events:
+        enabled: false
+      processing:
+        probability: 0.0
+      sensor:
+        probability: 0.0
+  - name: val_vkitti_clean
+    type: vkitti
+    root: /mnt/DATA/DegradedDepth/data/vkitti
+    scenes:
+    - Scene18
+    variants:
+    - clone
+    cameras:
+    - Camera_0
+    degradation:
+      enabled: false
+  - name: val_tartanair_degraded
+    degradation:
+      enabled: true
+      policy: v2_lowlight
+      clean_probability: 0.0
+      curriculum: false
+      time_mode: clip_constant
+      return_params: true
+      summary: true
+      drift:
+        enabled: false
+      events:
+        enabled: false
+      processing:
+        probability: 0.0
+      sensor:
+        probability: 0.0
+  - name: val_tartanair_clean
+    degradation:
+      enabled: false
+training:
+  max_epochs: 6
+  batch_size: 1
+  learning_rate: 5.0e-05
+  backbone_lr_multiplier: 0.3
+  weight_decay: 0.01
+  warmup_steps: 40
+  grad_clip: 1.0
+  precision: bf16
+  val_every_n_epochs: 1
+  selection_metric: aligned_abs_rel
+  ema_decay: 0.999
+  num_workers: 8
+  gradient_accumulation_steps: 4
+  compile: false
+  ddp_find_unused_parameters: true
+  skip_live_teachers: true
+  cpu_prefetch: true
+  cpu_prefetch_batches: 1
+  validate_before_train: true
+  log_dir: clean_consistency_prototype/runs/si_w1p0
+  checkpoint_dir: clean_consistency_prototype/ckpts/si_w1p0
+  log_images_every_n_steps: 500
+  log_images_max_batch: 2
+  step_log_every_n_steps: 50
+  save_every_n_epochs: 1
+loss:
+  training_target: metric
+  ssi_weight: 1.0
+  temporal_weight: 1.0
+  temporal_threshold: 0.05
+  temporal_log_space: false
+  ssi_mode: l2
+  distillation_weight: 0.0
+  metric_l1_weight: 0.0
+  metric_log_l1_weight: 0.0
+  auxiliary:
+    clean_depth_consistency_weight: 1.0
+    clean_depth_consistency_mode: si
